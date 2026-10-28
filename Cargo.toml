@@ -1,0 +1,38 @@
+[package]
+name = "mysql-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Differential MySQL table sync over QUIC with chunked hash comparison"
+license = "MIT"
+
+[[bin]]
+name = "mysql-sync"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+debug = false
+strip = true
+lto = false
+codegen-units = 16
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+mysql_async = { version = "0.36", default-features = false, features = ["minimal", "derive"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+sha2 = "0.10"
+hex = "0.4"
+anyhow = "1"
+indicatif = "0.18"
+rand = "0.9"
+log = "0.4"
+env_logger = "0.11"
+tempfile = "3"

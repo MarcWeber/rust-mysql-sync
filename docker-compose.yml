@@ -1,0 +1,39 @@
+version: "3.8"
+
+# mysql-sync Testumgebung: 2 MySQL-8-Container (Quelle + Ziel)
+#   Quelle : localhost:3306  (db_skywings, db_airwings mit Seed-Daten)
+#   Ziel   : localhost:3307
+# Start:   docker compose up -d
+# Test:    python3 test.py          (im selben Verzeichnis)
+
+services:
+  mysql-src:
+    image: mysql:8.0
+    container_name: mysqlsync-src
+    environment:
+      MYSQL_ROOT_PASSWORD: syncroot
+      MYSQL_DATABASE: db_skywings
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  mysql-dst:
+    image: mysql:8.0
+    container_name: mysqlsync-dst
+    environment:
+      MYSQL_ROOT_PASSWORD: syncroot
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
+      interval: 3s
+      timeout: 3s
+      retries: 30

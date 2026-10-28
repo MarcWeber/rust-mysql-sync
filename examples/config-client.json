@@ -1,0 +1,23 @@
+{
+  "mysql": {
+    "user": "root",
+    "password": "changeme",
+    "host": "127.0.0.1",
+    "port": 3306
+  },
+  "server": "ziel-host.example.com:4433",
+  "server_fingerprint": "sha256:HIER_DEN_FINGERPRINT_AUS_CONFIG_SERVER_EINTRAGEN",
+
+  "allow_csv": true,
+  "dump_strategies": ["select-stream", "to_file:/tmp", "mysql-e", "mysqldump"],
+  "dump_threshold": 1000,
+  "chunked": 3,
+  "concurrent_processes": 3,
+  "diff_threshold_percent": 10,
+  "disable_triggers": false,
+
+  "database_mappings": {
+    "db_alt": "db_neu"
+  },
+  "database_table_mappings": {}
+}

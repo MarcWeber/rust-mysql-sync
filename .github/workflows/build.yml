@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build glibc
+        run: cargo build --release
+      - name: Build musl (static)
+        run: |
+          export CC_x86_64_unknown_linux_musl=musl-gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          cargo build --release --target x86_64-unknown-linux-musl
+      - name: Test
+        run: cargo test --release --quiet
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp target/release/mysql-sync dist/mysql-sync-linux-x86_64-glibc
+          cp target/x86_64-unknown-linux-musl/release/mysql-sync dist/mysql-sync-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mysql-sync-linux
+          path: dist/
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mysql-sync dist/mysql-sync-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mysql-sync-${{ matrix.target }}
+          path: dist/

@@ -1,0 +1,12 @@
+# Build-Kontext für Dockerfile.cross klein halten
+target/
+bin/
+.git/
+.github/
+*.md
+examples/
+tests/
+deploy/
+docker-compose.yml
+test.py
+musl-toolchain/

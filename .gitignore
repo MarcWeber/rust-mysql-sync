@@ -1,0 +1,7 @@
+/target
+/bin
+/.test-run
+*.fingerprint
+*-cert.pem
+*-key.pem
+*.deb

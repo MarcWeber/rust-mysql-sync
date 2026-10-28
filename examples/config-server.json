@@ -1,0 +1,11 @@
+{
+  "mysql": {
+    "user": "root",
+    "password": "changeme",
+    "host": "127.0.0.1",
+    "port": 3306
+  },
+  "listen": "0.0.0.0",
+  "port": 4433,
+  "auth_token": "bitte-starkes-geheimnis-setzen"
+}

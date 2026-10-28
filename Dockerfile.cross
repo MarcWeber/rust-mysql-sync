@@ -1,0 +1,15 @@
+# Cross-Compile-Image für mysql-sync (Linux x86_64, musl static).
+# Wird von compile-linux.sh benutzt — nicht für den Produktivbetrieb gedacht.
+#
+#   docker build -f Dockerfile.cross -t mysql-sync-cross:latest .
+#
+ARG BASE=rust:1-slim-bookworm
+FROM ${BASE}
+
+# musl-gcc / musl-ar als Linker für das statische Target
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools ca-certificates file \
+ && rm -rf /var/lib/apt/lists/*
+
+# Rust-Target vorab installieren (landet im Docker-Layer-Cache)
+RUN rustup target add x86_64-unknown-linux-musl
