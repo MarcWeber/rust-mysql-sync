@@ -15,7 +15,7 @@ services:
       MYSQL_DATABASE: db_skywings
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
     ports:
-      - "3306:3306"
+      - "${MSYNC_SRC_PORT:-3306}:3306"
     volumes:
       - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
     healthcheck:
@@ -31,7 +31,7 @@ services:
       MYSQL_ROOT_PASSWORD: syncroot
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
     ports:
-      - "3307:3306"
+      - "${MSYNC_DST_PORT:-3307}:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
       interval: 3s

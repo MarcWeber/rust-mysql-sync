@@ -7,17 +7,26 @@
   },
   "server": "ziel-host.example.com:4433",
   "server_fingerprint": "sha256:HIER_DEN_FINGERPRINT_AUS_CONFIG_SERVER_EINTRAGEN",
-
+  "auth_token": "bitte-starkes-geheimnis-setzen",
   "allow_csv": true,
-  "dump_strategies": ["select-stream", "to_file:/tmp", "mysql-e", "mysqldump"],
-  "dump_threshold": 1000,
+  "dump_strategies": [
+    "select-stream",
+    "to_file:/tmp",
+    "mysql-e",
+    "mysqldump"
+  ],
+  "transfer_batch_rows": 1000,
   "chunked": 3,
   "concurrent_processes": 3,
   "diff_threshold_percent": 10,
   "disable_triggers": false,
-
   "database_mappings": {
     "db_alt": "db_neu"
   },
-  "database_table_mappings": {}
+  "database_table_mappings": {},
+  "hash_algo": "xxh3",
+  "transport": "quic",
+  "allow_plaintext": false,
+  "compression": "none",
+  "compression_level": 3
 }

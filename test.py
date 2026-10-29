@@ -16,6 +16,12 @@ Szenarien:
   D) Drift + --check 5  : Exit 1, erwartete Diff-Anzahl (49 plain / 19 binary) gemeldet
   E) --sync          : Drift behoben, wieder identisch
   F) --force --sync  : Tabelle neu erstellen + Vollkopie, wieder identisch
+  G) SQL-Dump-Modus  : allow_csv=false, binärsicher
+  H) hash_algo       : Mismatch wird abgelehnt, blake3 funktioniert
+  I) zstd            : Kompression auf beiden Seiten
+  J) TCP             : Klartext-Transport (Opt-in) + Ablehnung ohne allow_plaintext
+  K) Chunking        : Range fuer INTEGER/CHAR/BINARY, automatischer Mod-Fallback fuer
+                       DATE/Composite, select+dump, exakte Drift-Zahlen, Fehler ohne PK
 
 Exit 0 = alle Szenarien bestanden.
 """
@@ -23,6 +29,7 @@ Exit 0 = alle Szenarien bestanden.
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -124,6 +131,12 @@ def main():
     n_flights = scalar("src", "SELECT COUNT(*) FROM db_skywings.flights")
     n_payloads = scalar("src", "SELECT COUNT(*) FROM db_airwings.payloads")
     step("Seed geladen", n_flights == "5000" and n_payloads == "800", f"flights={n_flights} payloads={n_payloads}")
+    # Böse Binärdaten müssen wirklich vorhanden sein (3 Nullbytes + ungültiges UTF-8)
+    n_nullbytes = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = '000000'", "db_airwings")
+    n_badutf = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = 'FFFE80C0AF'", "db_airwings")
+    step("Binäre Giftdaten vorhanden (\\0\\0\\0, invalid UTF-8)",
+         int(n_nullbytes or 0) > 0 and int(n_badutf or 0) > 0,
+         f"nullbytes={n_nullbytes} badutf={n_badutf}")
 
     # ---------- mysql-sync Server starten ----------
     print("== mysql-sync Server ==")
@@ -156,7 +169,7 @@ def main():
             "server_fingerprint": fingerprint,
             "allow_csv": True,
             "dump_strategies": ["select-stream"],
-            "dump_threshold": 1000,
+            "transfer_batch_rows": 1000,
             "chunked": 3,
             "concurrent_processes": 3,
             "diff_threshold_percent": 10,
@@ -185,30 +198,30 @@ def main():
         ok &= step("Inhalts-Prüfsummen identisch", fs == fd, f"{fs} vs {fd}")
         step("B: sync", ok)
 
-        # ---------- C: --check ----------
-        print("== C: --check 10 (identisch) ==")
+        # ---------- C: --check (Select + Dump) ----------
+        print("== C: --check / --check-via-dump 10 (identisch) ==")
         ok = mysql_sync(cfg + ["--check", "10", "db_skywings.*,db_airwings.*"], expect_rc=0)
-        step("C: check → Exit 0", ok)
+        ok &= mysql_sync(cfg + ["--check", "10", "--check-via-dump", "db_skywings.*,db_airwings.*"], expect_rc=0)
+        step("C: check (select+dump) → Exit 0", ok)
 
-        # ---------- D: Drift + --check ----------
-        print("== D: Drift erzeugen + --check 5 ==")
+        # ---------- D: Drift + --check (Select + Dump) ----------
+        print("== D: Drift erzeugen + --check / --check-via-dump 5 ==")
         sql("dst", (HERE / "deploy/drift.sql").read_text())
-        drift_out = []
 
-        def capture_check():
-            r = subprocess.run([str(BIN), *cfg, "--check", "5", "db_skywings.*,db_airwings.*"],
+        def capture_check(extra=None):
+            r = subprocess.run([str(BIN), *cfg, "--check", "5", *([extra] if extra else []),
+                                "db_skywings.*,db_airwings.*"],
                                text=True, capture_output=True, cwd=WORK)
-            drift_out.append(r.stdout + r.stderr)
-            return r.returncode
+            return r.returncode, r.stdout + r.stderr
 
-        rc = capture_check()
-        joined = "\n".join(drift_out)
-        ok = rc == 1
-        ok &= step("--check meldet Exit 1", ok, f"rc={rc}")
-        ok &= step("49 Diffs in flights erkannt", "49" in joined)
-        ok &= step("19 Diffs in payloads erkannt", "19" in joined)
-        ok &= step("Beispiel-IDs angegeben", "Beispiele:" in joined)
-        step("D: check mit Drift", ok)
+        ok = True
+        for name, extra in (("--check", None), ("--check-via-dump", "--check-via-dump")):
+            rc, joined = capture_check(extra)
+            ok &= step(f"{name}: Exit 1", rc == 1, f"rc={rc}")
+            ok &= step(f"{name}: 49 Diffs in flights erkannt", "49" in joined)
+            ok &= step(f"{name}: 19 Diffs in payloads erkannt", "19" in joined)
+            ok &= step(f"{name}: Beispiel-IDs angegeben", "Beispiele:" in joined)
+        step("D: check mit Drift (select+dump)", ok)
 
         # ---------- E: --sync behebt Drift ----------
         print("== E: --sync (nur Differenzen) ==")
@@ -229,6 +242,55 @@ def main():
         ok &= step("Nach Force-Recreate identisch (Binary!)", f1 == f2)
         step("F: force+sync", ok)
 
+        # ---------- K: automatisches Range/Mod-Fallback-Chunking ----------
+        print("== K: Chunking (Range + automatischer Mod-Fallback) ==")
+        range_tables = "db_range.char_keys,binary_keys,date_keys,composite_keys"
+        ok = mysql_sync(cfg + ["--force-schema", range_tables])
+        ok &= step("Chunking-Tabellen auf Ziel erstellt",
+                   scalar("dst", "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='db_range'") == "4")
+        ok &= mysql_sync(cfg + ["--sync", range_tables])
+        checks = (
+            ("CHAR-PK", "SELECT SUM(CRC32(CONCAT(code,'|',label,'|',n))) FROM char_keys"),
+            ("BINARY-PK", "SELECT SUM(CRC32(CONCAT(HEX(id),'|',label,'|',n))) FROM binary_keys"),
+            ("DATE-PK (Mod-Fallback)", "SELECT SUM(CRC32(CONCAT(d,'|',COALESCE(v,-1)))) FROM date_keys"),
+            ("Composite-PK (Mod-Fallback)", "SELECT SUM(CRC32(CONCAT(a,'|',b,'|',COALESCE(v,'')))) FROM composite_keys"),
+        )
+        for label, q in checks:
+            a, b = scalar("src", q, "db_range"), scalar("dst", q, "db_range")
+            ok &= step(f"{label} Inhalt identisch", a == b and a != "0", f"{a} vs {b}")
+
+        for name, extra in (("--hash-via-select", None), ("--hash-via-dump", "--hash-via-dump")):
+            ok &= mysql_sync(cfg + (["--check", "5", *([extra] if extra else []), range_tables]),
+                             expect_rc=0, label=name)
+
+        sql("dst", (HERE / "deploy/drift-range.sql").read_text())
+        sql("dst", (HERE / "deploy/drift-fallback.sql").read_text())
+
+        def capture_range_check(extra=None):
+            r = subprocess.run([str(BIN), *cfg, "--check", "5", *([extra] if extra else []), range_tables],
+                               text=True, capture_output=True, cwd=WORK)
+            return r.returncode, r.stdout + r.stderr
+
+        for name, extra in (("select", None), ("dump", "--hash-via-dump")):
+            rc, joined = capture_range_check(extra)
+            ok &= step(f"Chunking {name}: Exit 1", rc == 1, f"rc={rc}")
+            ok &= step(f"Chunking {name}: Range je 6 Diffs",
+                       joined.count("6 Zeilen differieren") >= 2)
+            ok &= step(f"Chunking {name}: Fallback je 3 Diffs",
+                       joined.count("3 Zeilen differieren") >= 2)
+
+        ok &= mysql_sync(cfg + ["--sync", range_tables])
+        for name, extra in (("select", None), ("dump", "--hash-via-dump")):
+            ok &= mysql_sync(cfg + (["--check", "10", *([extra] if extra else []), range_tables]),
+                             expect_rc=0, label=f"Chunking sync {name}")
+
+        r = subprocess.run([str(BIN), *cfg, "--check", "3", "db_range.no_pk"],
+                           text=True, capture_output=True, cwd=WORK)
+        out = r.stdout + r.stderr
+        ok &= step("Sync ohne Primary Key wird abgelehnt",
+                   r.returncode != 0 and "keinen Primary Key" in out, f"rc={r.returncode}")
+        step("K: Chunking Range/Mod-Fallback", ok)
+
         # ---------- G: Dump-Modus (allow_csv=false) ----------
         print("== G: SQL-Dump-Modus (allow_csv=false) ==")
         dump_cfg = WORK / "config-client-dump.json"
@@ -240,6 +302,105 @@ def main():
         g2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db_airwings")
         ok &= step("Dump-Modus binärsicher", g1 == g2)
         step("G: Dump-Modus", ok)
+
+        # ---------- H: hash_algo (Mismatch + blake3) ----------
+        print("== H: hash_algo ==")
+        bad = json.loads(client_cfg.read_text())
+        bad["hash_algo"] = "md5"
+        bad_cfg = WORK / "config-client-md5.json"
+        bad_cfg.write_text(json.dumps(bad, indent=2))
+        r = subprocess.run([str(BIN), "-C", str(bad_cfg), "--check", "3", "db_skywings.*"],
+                           text=True, capture_output=True, cwd=WORK)
+        out = r.stdout + r.stderr
+        ok = step("Mismatch (md5 vs xxh3) wird abgelehnt",
+                  r.returncode != 0 and "Hash-Algorithmus weicht ab" in out,
+                  f"rc={r.returncode}")
+
+        server.terminate()
+        server.wait(timeout=5)
+        server_cfg_b = WORK / "config-server-blake3.json"
+        sc = json.loads(server_cfg.read_text())
+        sc["hash_algo"] = "blake3"
+        server_cfg_b.write_text(json.dumps(sc, indent=2))
+        log_b = open(WORK / "server-blake3.log", "w")
+        server = subprocess.Popen([str(BIN), "-C", str(server_cfg_b)], stdout=log_b, stderr=log_b)
+        fp_b = None
+        for _ in range(50):
+            f = server_cfg_b.with_suffix(".fingerprint")
+            if f.exists():
+                fp_b = f.read_text().strip()
+                break
+            time.sleep(0.2)
+        cc = json.loads(client_cfg.read_text())
+        cc["hash_algo"] = "blake3"
+        cc["server_fingerprint"] = fp_b
+        blake_cfg = WORK / "config-client-blake3.json"
+        blake_cfg.write_text(json.dumps(cc, indent=2))
+        ok &= step("Server mit blake3 gestartet", bool(fp_b))
+        ok &= mysql_sync(["-C", str(blake_cfg), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
+        step("H: hash_algo", ok)
+
+        # ---------- I: zstd compression ----------
+        print("== I: zstd compression ==")
+        server.terminate()
+        server.wait(timeout=5)
+        server_cfg_z = WORK / "config-server-zstd.json"
+        sz = json.loads(server_cfg.read_text())
+        sz["compression"] = "zstd"
+        sz["compression_level"] = 3
+        server_cfg_z.write_text(json.dumps(sz, indent=2))
+        log_z = open(WORK / "server-zstd.log", "w")
+        server = subprocess.Popen([str(BIN), "-C", str(server_cfg_z)], stdout=log_z, stderr=log_z)
+        fp_z = None
+        for _ in range(50):
+            f = server_cfg_z.with_suffix(".fingerprint")
+            if f.exists():
+                fp_z = f.read_text().strip()
+                break
+            time.sleep(0.2)
+        cz = json.loads(client_cfg.read_text())
+        cz["compression"] = "zstd"
+        cz["compression_level"] = 3
+        cz["server_fingerprint"] = fp_z
+        client_cfg_z = WORK / "config-client-zstd.json"
+        client_cfg_z.write_text(json.dumps(cz, indent=2))
+        ok = step("Server mit zstd gestartet", bool(fp_z))
+        ok &= mysql_sync(["-C", str(client_cfg_z), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
+        step("I: zstd compression", ok)
+
+        # ---------- J: plaintext TCP (opt-in) ----------
+        print("== J: plaintext TCP ==")
+        server.terminate()
+        server.wait(timeout=5)
+        server_cfg_t = WORK / "config-server-tcp.json"
+        st = json.loads(server_cfg.read_text())
+        st["transport"] = "tcp"
+        st["allow_plaintext"] = True
+        server_cfg_t.write_text(json.dumps(st, indent=2))
+        log_t = open(WORK / "server-tcp.log", "w")
+        server = subprocess.Popen([str(BIN), "-C", str(server_cfg_t)], stdout=log_t, stderr=log_t)
+        for _ in range(50):
+            try:
+                with socket.create_connection(("127.0.0.1", QUIC_PORT), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        ct = json.loads(client_cfg.read_text())
+        ct["transport"] = "tcp"
+        ct["allow_plaintext"] = True
+        client_cfg_t = WORK / "config-client-tcp.json"
+        client_cfg_t.write_text(json.dumps(ct, indent=2))
+        ok = mysql_sync(["-C", str(client_cfg_t), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
+        step("J: plaintext TCP", ok)
+
+        ct_bad = json.loads(client_cfg.read_text())
+        ct_bad["transport"] = "tcp"
+        bad_tcp_cfg = WORK / "config-client-tcp-bad.json"
+        bad_tcp_cfg.write_text(json.dumps(ct_bad, indent=2))
+        r = subprocess.run([str(BIN), "-C", str(bad_tcp_cfg), "--check", "3", "db_skywings.*"],
+                           text=True, capture_output=True, cwd=WORK)
+        step("tcp ohne allow_plaintext wird abgelehnt",
+             r.returncode != 0 and "allow_plaintext" in (r.stdout + r.stderr))
 
     finally:
         server.terminate()

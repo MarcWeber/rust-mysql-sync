@@ -1,50 +1,81 @@
-//! Wire-Protokoll über QUIC-Streams.
+//! Wire protocol over QUIC streams (or plaintext TCP).
 //!
-//! Framing:  1 Byte Tag | 4 Bytes Länge (BE) | Payload
-//!   Tag 1 = JSON-Nachricht (Request / Response)
-//!   Tag 2 = Binärdaten (CSV/SQL-Stream-Anteile)
+//! Frame: `U<len>\n<body>` or `C<len>\n<body>`
+//!   `U` = uncompressed, `C` = zstd-compressed
+//!   `<len>` = decimal byte length of the following body
+//!   `<body>` = rkyv-archived `Request` (client→server) or `Response` (server→client)
 //!
-//! Ein Bidirectional-Stream = Sequenz von Request→Response-Paaren.
-//! Bulk-Übertragung: DumpBegin/CsvBegin (JSON) → BIN-Frames → DumpEnd/CsvEnd (JSON).
+//! One bidirectional stream = sequence of request→response pairs.
+//! Bulk transfer: DumpBegin/CsvBegin → `Bulk` frames → DumpEnd/CsvEnd.
 
-use crate::config::PROTOCOL_VERSION;
+use crate::config::{Config, PROTOCOL_VERSION};
 use anyhow::{bail, Context, Result};
-use quinn::{RecvStream, SendStream};
-use serde::{Deserialize, Serialize};
+use rkyv::rancor;
+use rkyv::{Archive, Deserialize, Serialize};
+use rkyv::util::AlignedVec;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const TAG_JSON: u8 = 1;
-pub const TAG_BIN: u8 = 2;
-
-/// Größe der BIN-Frames beim CSV/Dump-Upload
+/// Size of the `Bulk` frames during CSV/dump upload.
 pub const BULK_FRAME_SIZE: usize = 256 * 1024;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+const MAX_HEADER_LEN: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    Zstd,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Framing {
+    pub max_frame: usize,
+    pub max_decompressed: usize,
+    pub compression: Compression,
+    pub level: i32,
+}
+
+impl Framing {
+    pub fn from_cfg(cfg: &Config) -> Self {
+        Self {
+            max_frame: cfg.max_frame,
+            max_decompressed: cfg.max_decompressed,
+            compression: if cfg.compression.eq_ignore_ascii_case("zstd") {
+                Compression::Zstd
+            } else {
+                Compression::None
+            },
+            level: cfg.compression_level,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct ChunkHash {
     pub bucket: String,
     pub hash: String,
     pub count: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct RowHash {
     pub bucket: String,
     pub pk: String,
     pub hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum Request {
-    /// Erster Request auf der ersten Stream-Verbindung: Auth + Version
+    /// First request: auth + version + hash algorithm.
     Hello {
         version: u32,
         token: Option<String>,
+        hash_algo: Option<String>,
     },
     DescribeCount {
         db: String,
         table: String,
     },
-    /// CREATE TABLE Statement der Quelle; Server macht DROP IF EXISTS + CREATE
+    /// CREATE TABLE statement of the source; server does DROP IF EXISTS + CREATE.
     Recreate {
         db: String,
         sql: String,
@@ -53,8 +84,7 @@ pub enum Request {
         db: String,
         table: String,
     },
-    /// Chunk- oder Zeilen-Hashes vom Server holen.
-    /// buckets = Some(filter) -> nur diese Buckets (Drill-Down, ein Scan für alle)
+    /// Fetch chunk or row hashes from the server.
     Hashes {
         db: String,
         table: String,
@@ -62,13 +92,19 @@ pub enum Request {
         chunked: u32,
         hash_of_chunk: bool,
         buckets: Option<Vec<String>>,
+        /// "select" (default) or "dump" — source of rows for hashing.
+        hash_source: Option<String>,
     },
     DumpBegin {
         db: String,
         table: String,
     },
+    /// One chunk of dump SQL / CSV bytes.
+    Bulk {
+        data: Vec<u8>,
+    },
     DumpEnd {},
-    /// CSV-Import: Spaltenreihenfolge + welche Spalten Hex-kodiert sind
+    /// CSV import: column order + which columns are hex-encoded.
     CsvBegin {
         db: String,
         table: String,
@@ -76,7 +112,7 @@ pub enum Request {
         hex_columns: Vec<String>,
     },
     CsvEnd {},
-    /// Primary Keys löschen (kanonische Form, Komponenten mit \x1f joined)
+    /// Delete primary keys (canonical form, components joined with \x1f).
     DeletePks {
         db: String,
         table: String,
@@ -92,12 +128,10 @@ pub enum Request {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum Response {
     Ok {
         message: String,
-        #[serde(default)]
         count: Option<u64>,
     },
     Err {
@@ -125,71 +159,147 @@ impl Response {
     }
 }
 
-pub async fn write_frame(w: &mut SendStream, tag: u8, data: &[u8], max_frame: usize) -> Result<()> {
-    if data.len() > max_frame {
-        bail!("Frame zu groß: {} > {} Bytes", data.len(), max_frame);
+async fn write_encoded<W>(w: &mut W, body: AlignedVec, f: &Framing) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match f.compression {
+        Compression::None => write_body(w, b'U', body.as_slice(), f).await,
+        Compression::Zstd => {
+            let compressed =
+                zstd::bulk::compress(body.as_slice(), f.level).context("zstd compress")?;
+            write_body(w, b'C', &compressed, f).await
+        }
     }
-    let mut hdr = [0u8; 5];
-    hdr[0] = tag;
-    hdr[1..].copy_from_slice(&(data.len() as u32).to_be_bytes());
-    w.write_all(&hdr).await?;
+}
+
+async fn write_body<W>(w: &mut W, flag: u8, data: &[u8], f: &Framing) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    if data.len() > f.max_frame {
+        bail!("Frame zu groß: {} > {} Bytes", data.len(), f.max_frame);
+    }
+    let hdr = format!("{}{}\n", flag as char, data.len());
+    w.write_all(hdr.as_bytes()).await?;
     if !data.is_empty() {
         w.write_all(data).await?;
     }
     Ok(())
 }
 
-pub async fn write_json(w: &mut SendStream, msg: &impl Serialize, max_frame: usize) -> Result<()> {
-    let data = serde_json::to_vec(msg)?;
-    write_frame(w, TAG_JSON, &data, max_frame).await
+pub async fn write_request<W>(w: &mut W, msg: &Request, f: &Framing) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let body = rkyv::to_bytes::<rancor::Error>(msg).context("rkyv serialize")?;
+    write_encoded(w, body, f).await
 }
 
-/// Liest einen Frame; None = Stream beendet (clean).
-pub async fn read_frame(r: &mut RecvStream, max_frame: usize) -> Result<Option<(u8, Vec<u8>)>> {
-    let mut hdr = [0u8; 5];
-    match r.read_exact(&mut hdr).await {
-        Ok(()) => {}
-        Err(quinn::ReadExactError::FinishedEarly(_)) => return Ok(None),
+pub async fn write_response<W>(w: &mut W, msg: &Response, f: &Framing) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let body = rkyv::to_bytes::<rancor::Error>(msg).context("rkyv serialize")?;
+    write_encoded(w, body, f).await
+}
+
+async fn read_body<R>(r: &mut R, f: &Framing) -> Result<Option<AlignedVec>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let first = match r.read_u8().await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
+    };
+    if first != b'U' && first != b'C' {
+        bail!("Ungültiges Frame-Flag: 0x{first:02x}");
     }
-    let tag = hdr[0];
-    let len = u32::from_be_bytes(hdr[1..].try_into().unwrap()) as usize;
-    if tag != TAG_JSON && tag != TAG_BIN {
-        bail!("Ungültiger Frame-Tag: {tag}");
+    let mut digits = Vec::with_capacity(10);
+    loop {
+        let b = r.read_u8().await.context("Stream endete im Frame-Header")?;
+        if b == b'\n' {
+            break;
+        }
+        if !b.is_ascii_digit() || digits.len() >= MAX_HEADER_LEN {
+            bail!("Ungültige Frame-Länge");
+        }
+        digits.push(b);
     }
-    if len > max_frame {
-        bail!("Frame überschreitet max_frame ({} > {})", len, max_frame);
+    if digits.is_empty() {
+        bail!("Leere Frame-Länge");
     }
-    let mut data = vec![0u8; len];
+    let len: usize = std::str::from_utf8(&digits)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .context("Frame-Länge ungültig")?;
+    if len > f.max_frame {
+        bail!("Frame überschreitet max_frame ({} > {})", len, f.max_frame);
+    }
+
+    let mut raw = AlignedVec::with_capacity(len);
+    raw.resize(len, 0);
     if len > 0 {
-        r.read_exact(&mut data)
+        r.read_exact(&mut raw[..])
             .await
             .context("Stream unerwartet beendet mitten im Frame")?;
     }
-    Ok(Some((tag, data)))
+
+    if first == b'U' {
+        return Ok(Some(raw));
+    }
+    let decompressed = zstd::bulk::decompress(&raw, f.max_decompressed)
+        .context("zstd decompress")?;
+    let mut out = AlignedVec::with_capacity(decompressed.len());
+    out.extend_from_slice(&decompressed);
+    Ok(Some(out))
 }
 
-pub async fn read_request(r: &mut RecvStream, max_frame: usize) -> Result<Option<Request>> {
-    match read_frame(r, max_frame).await? {
+pub async fn read_request<R>(r: &mut R, f: &Framing) -> Result<Option<Request>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    match read_body(r, f).await? {
         None => Ok(None),
-        Some((TAG_JSON, data)) => Ok(Some(
-            serde_json::from_slice(&data).context("Request-JSON ungültig")?,
+        Some(buf) => Ok(Some(
+            rkyv::from_bytes::<Request, rancor::Error>(&buf)
+                .context("Request-Binary ungültig")?,
         )),
-        Some((tag, _)) => bail!("Erwartete JSON-Frame, got tag={tag}"),
     }
 }
 
-/// Schreibt einen großen Blob als Serie von BIN-Frames.
-pub async fn write_bulk(w: &mut SendStream, mut data: &[u8], max_frame: usize) -> Result<()> {
+pub async fn read_response<R>(r: &mut R, f: &Framing) -> Result<Option<Response>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    match read_body(r, f).await? {
+        None => Ok(None),
+        Some(buf) => Ok(Some(
+            rkyv::from_bytes::<Response, rancor::Error>(&buf)
+                .context("Response-Binary ungültig")?,
+        )),
+    }
+}
+
+/// Writes a large blob as a series of `Bulk` frames.
+pub async fn write_bulk<W>(w: &mut W, mut data: &[u8], f: &Framing) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    if data.is_empty() {
+        write_request(w, &Request::Bulk { data: Vec::new() }, f).await?;
+        return Ok(());
+    }
     while !data.is_empty() {
         let n = data.len().min(BULK_FRAME_SIZE);
-        write_frame(w, TAG_BIN, &data[..n], max_frame).await?;
+        write_request(w, &Request::Bulk { data: data[..n].to_vec() }, f).await?;
         data = &data[n..];
     }
     Ok(())
 }
 
-/// Prüft ob die letzte Response eine finale Ok/Err ist.
+/// True if the last response is a final Ok/Err.
 pub fn is_final(resp: &Response) -> bool {
     matches!(resp, Response::Ok { .. } | Response::Err { .. })
 }

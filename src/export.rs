@@ -54,22 +54,23 @@ async fn run_strategy(
     db: String,
     table: String,
     where_clause: Option<String>,
+    order_by: Option<String>,
     tx: mpsc::Sender<RowMsg>,
 ) {
     let res = match strategy {
         Strategy::SelectStream => {
             let r = mysqlutil::new_pool(&mysql, None).and_then(|p| Ok(p));
             match r {
-                Ok(pool) => fetch_stream(&pool, &db, &table, where_clause.as_deref(), &tx).await,
+                Ok(pool) => fetch_stream(&pool, &db, &table, where_clause.as_deref(), order_by.as_deref(), &tx).await,
                 Err(e) => Err(e),
             }
         }
         Strategy::ToFile(dir) => match mysqlutil::new_pool(&mysql, None) {
-            Ok(pool) => fetch_to_file(&pool, &db, &table, where_clause.as_deref(), &dir, &tx).await,
+            Ok(pool) => fetch_to_file(&pool, &db, &table, where_clause.as_deref(), order_by.as_deref(), &dir, &tx).await,
             Err(e) => Err(e),
         },
-        Strategy::MysqlE => fetch_mysql_e(&mysql, &db, &table, where_clause.as_deref(), &tx).await,
-        Strategy::Mysqldump => fetch_mysqldump(&mysql, &db, &table, where_clause.as_deref(), &tx).await,
+        Strategy::MysqlE => fetch_mysql_e(&mysql, &db, &table, where_clause.as_deref(), order_by.as_deref(), &tx).await,
+        Strategy::Mysqldump => fetch_mysqldump(&mysql, &db, &table, where_clause.as_deref(), order_by.as_deref(), &tx).await,
     };
     if let Err(e) = res {
         let _ = tx.send(RowMsg::Err(format!("{e:#}"))).await;
@@ -83,9 +84,21 @@ pub fn spawn_fetch_with_fallback(
     db: String,
     table: String,
     where_clause: Option<String>,
+    order_by: Option<String>,
+) -> mpsc::Receiver<RowMsg> {
+    spawn_fetch_with_strategies(cfg, db, table, where_clause, order_by, cfg.strategies())
+}
+
+/// Wie spawn_fetch_with_fallback, aber mit expliziter Strategie-Reihenfolge.
+pub fn spawn_fetch_with_strategies(
+    cfg: &Config,
+    db: String,
+    table: String,
+    where_clause: Option<String>,
+    order_by: Option<String>,
+    strategies: Vec<String>,
 ) -> mpsc::Receiver<RowMsg> {
     let (tx, rx) = mpsc::channel::<RowMsg>(8);
-    let strategies = cfg.strategies();
     let mysql = cfg.mysql.clone();
     tokio::spawn(async move {
         let mut last_err: Option<String> = None;
@@ -106,6 +119,7 @@ pub fn spawn_fetch_with_fallback(
                 db.clone(),
                 table.clone(),
                 where_clause.clone(),
+                order_by.clone(),
                 itx,
             ));
             let mut got_any = false;
@@ -149,7 +163,7 @@ pub fn spawn_fetch_with_fallback(
     rx
 }
 
-async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_clause: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
     let mut conn = mysqlutil::session_conn(pool).await?;
     let mut sql = format!("SELECT * FROM {}", qualified(db, table));
     if let Some(w) = where_clause {
@@ -157,6 +171,9 @@ async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_cla
             sql.push_str(" WHERE ");
             sql.push_str(w);
         }
+    }
+    if let Some(o) = order_by {
+        sql.push_str(o);
     }
     let result = conn.query_iter(sql).await.context("SELECT fehlgeschlagen")?;
     let mut result = result;
@@ -169,7 +186,7 @@ async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_cla
     Ok(())
 }
 
-async fn fetch_to_file(pool: &mysql_async::Pool, db: &str, table: &str, where_clause: Option<&str>, dir: &str, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_to_file(pool: &mysql_async::Pool, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, dir: &str, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
     let mut conn = mysqlutil::session_conn(pool).await?;
     let fname = format!(
         "mysqlsync-{}.tsv",
@@ -177,17 +194,20 @@ async fn fetch_to_file(pool: &mysql_async::Pool, db: &str, table: &str, where_cl
     );
     let path = format!("{}/{fname}", dir.trim_end_matches('/'));
 
-    let mut sql = format!(
-        "SELECT * FROM {} INTO OUTFILE '{}' FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n'",
-        qualified(db, table),
-        path
-    );
+    let mut sql = format!("SELECT * FROM {}", qualified(db, table));
     if let Some(w) = where_clause {
         if !w.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(w);
         }
     }
+    if let Some(o) = order_by {
+        sql.push_str(o);
+    }
+    sql.push_str(&format!(
+        " INTO OUTFILE '{}' FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n'",
+        path
+    ));
     conn.query_drop(sql)
         .await
         .context("SELECT INTO OUTFILE fehlgeschlagen (FILE-Privileg / secure_file_priv?)")?;
@@ -206,13 +226,16 @@ async fn read_tsv_file(path: &str, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
     parse_tsv_lines(&buf, tx).await
 }
 
-async fn fetch_mysql_e(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_mysql_e(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
     let mut sql = format!("SELECT * FROM {}", qualified(db, table));
     if let Some(w) = where_clause {
         if !w.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(w);
         }
+    }
+    if let Some(o) = order_by {
+        sql.push_str(o);
     }
     let mut cmd = tokio::process::Command::new("mysql");
     cmd.arg("--batch")
@@ -240,18 +263,20 @@ async fn fetch_mysql_e(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Op
     parse_tsv_lines(&buf, tx).await
 }
 
-async fn fetch_mysqldump(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_mysqldump(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
     if where_clause.is_some() {
         log::debug!(
             "[{db}.{table}] mysqldump: WHERE wird clientseitig gefiltert (Dump der ganzen Tabelle)"
         );
     }
+    let _ = order_by;
     let mut cmd = tokio::process::Command::new("mysqldump");
     cmd.arg("--no-create-info")
         .arg("--skip-triggers")
         .arg("--skip-lock-tables")
         .arg("--single-transaction")
         .arg("--skip-extended-insert") // ein INSERT pro Zeile = einfaches, stromfähiges Parsing
+        .arg("--order-by-primary")
         .arg("--compact")
         .arg("-h")
         .arg(&mysql.host)

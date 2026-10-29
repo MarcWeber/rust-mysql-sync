@@ -1,245 +1,390 @@
-# mysql-sync
+[English](README.md) | [Deutsch](README.DE.md)
 
-**Differentieller MySQL-Tabellen-Sync über QUIC** — ein statisches Rust-Binary, das
-Tabellen zwischen zwei MySQL/MariaDB-Servern per gechunkter Hash-Vergleiche
-abgleicht und nur die tatsächlichen Differenzen überträgt.
+# mysql-sync(1)
+
+## NAME
+
+mysql-sync — differentially synchronize MySQL tables over QUIC (or plaintext TCP).
+
+## SYNOPSIS
 
 ```
-QUELLE                                      ZIEL
-./mysql-sync -C config-client.json  ──QUIC──▶  ./mysql-sync -C config-server.json
-   --sync db_skywings.*                          (MySQL root auf Ziel-DB)
-   --force --sync ...
-   --check 10 ...
+mysql-sync -C CONFIG [--force-schema|--force|--sync|--check N] [OPTIONS] [SELECTOR]
+mysql-sync -C -  < config.json
 ```
 
-## Warum QUIC?
+`-C -` (or `--config -`) reads the JSON config from **stdin**.
 
-QUIC (Crate `quinn`, TLS 1.3) multiplexiert **viele unabhängige Streams über eine
-einzige Verbindung**. mysql-sync öffnet **pro Tabelle einen eigenen Stream** —
-`concurrent-processes` Tabellen laufen parallel, ohne Head-of-Line-Blocking und
-ohne dass jede Verbindung neu authentifizieren muss. TLS ist in QUIC Pflicht:
-der Server generiert beim ersten Start ein Self-signed-Zertifikat und legt den
-SHA-256-Fingerprint ab; der Client **pinnt** ihn (`server_fingerprint`).
+## DESCRIPTION
 
-## So funktioniert der Abgleich
+Compares source (client) and target (server) via bucket and row hashes and
+transfers only differing rows. Transport is QUIC/TLS 1.3 with certificate
+pinning. **Client and server must use the same `hash_algo`** (the Hello
+handshake aborts otherwise), but `--hash-via-select` always uses MySQL `MD5`.
 
-1. `describe/count` von lokaler und entfernter Tabelle
-2. Schema-Vergleich: bei Abweichung → mit `--force`/`--force-schema` DROP+CREATE, sonst Fehler
-3. **Chunk-Hashes**: Zeilen werden per Primary Key in `10^chunked` Buckets
-   („letzte N Zeichen" bzw. bei numerischen Keys die Modulo-Klasse `ABS(pk) % 10^N`)
-   gruppiert. Beide Seiten berechnen je Bucket einen Blake3-Hash → nur
-   differierende Buckets werden betrachtet.
-4. Ist der Diff-Anteil > `diff-threshold-percent` → **Vollkopie** (Truncate + alle Zeilen).
-5. Sonst **Drill-Down**: Zeilen-Hashes nur für die differierenden Buckets
-   (je ein Scan pro Seite) →
-   - Zeilen lokal vorhanden, remote fehlen/abweichen → **sende_csv** (oder sende_dump)
-   - Zeilen remote vorhanden, lokal fehlen → **DeletePks**
-6. Buckets > `dump-threshold` Zeilen werden komplett kopiert statt zeilenweise gediffed
-   („immer 1000 auf einmal", minimiert Sync-Daten).
+`SELECTOR` = `A.B` — `A` = DB list or `*`, `B` = table list or `*`.
+Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`.
 
-Die Fortschrittsanzeige nutzt genau diese Counts: Buckets gesamt/differierend,
-Zeilen zu senden/löschen.
-
-## Installation
-
-Binaries in `bin/`:
-
-| Datei | für |
+| Mode | Effect |
 |---|---|
-| `mysql-sync-linux-x86_64` | jedes AMD64/Intel-64-Linux, **statisch gelinkt (musl)** — keine Abhängigkeiten |
-| `mysql-sync-linux-x86_64-glibc` | Ubuntu/Debian 20.04+ (dynamisch, kleinere Datei) |
+| `--force-schema [SEL]` | Create/align schema and databases only |
+| `--force [SEL]` | Recreate the target table (data loss) |
+| `--sync [SEL]` | Differential sync (INSERT/UPDATE/DELETE) |
+| `--check N [SEL]` | Diff report + N sample IDs only; no writes |
+
+| Option | Meaning |
+|---|---|
+| `-C, --config FILE` | JSON config (required); `-` = stdin |
+| `--hash-via-select` | Grouped MD5 fingerprints computed in MySQL (default) |
+| `--hash-via-dump` | Diff hashes via export/parser (alias: `--check-via-dump`) |
+| `--no-progress` | No progress bars (cron/CI) |
+| `--log-level LVL` | `error|warn|info|debug|trace` |
+
+## HASHING — RECOMMENDATION
+
+`--hash-via-select` (default) computes bucket fingerprints inside MySQL. One
+`GROUP BY` query per table returns `bucket`, `COUNT(*)` and an MD5 group hash:
+MySQL builds a null-safe, length-prefixed fingerprint per row, sums both 64-bit
+MD5 halves per bucket, then hashes the aggregate. Only buckets with a different
+hash/count trigger row hashes; only rows with a different PK/hash are exported
+and sent.
+
+`--hash-via-dump` streams rows through the export/parser path and hashes them
+in Rust with `hash_algo` (xxh3 by default). Use it when that exact export/parser
+path must be exercised or special cases force `mysqldump`.
+
+- `hash_algo` controls dump/export mode only. Select mode always uses MySQL
+  `MD5`, because MySQL has no built-in xxh3/blake3. Client and server still need
+  the same `hash_algo` because the Hello handshake validates it.
+- `--hash-via-select` avoids serializing/parsing rows, but MySQL `MD5` is slower
+  per row than Rust xxh3. Measure both paths for your workload.
+- `xxh3` is not cryptographic, but perfectly sufficient for drift detection
+  and the fastest algorithm in dump mode.
+- Choose `blake3` only when cryptographic collision resistance is required
+  (e.g. an untrusted source). About 1.5× slower than xxh3.
+- `xxh64`, `md5`, `sha256` are primarily for compatibility; not faster than
+  xxh3 in dump mode.
+
+**Test environment (measurement 2026-10-28, current SQL-select implementation):**
+Apple M1 Ultra (20 cores, 64 GB), macOS, release build (`opt-level=2`).
+Client and server run natively on the host, MySQL 8.0 in Docker
+(`docker-compose.yml`, source `:3306`, target `:3317`). Dataset: synthetic
+table `db_bench.big` with **100,000 rows** (id, VARCHAR MD5 string, INT,
+DATETIME), `chunked=3`, `--check 0`, median of 5 runs (full comparison
+including network and both sides).
+
+| Scenario | select (SQL MD5) | dump/export (Rust xxh3) |
+|---|---:|---:|
+| clean (0 diffs) | 876 ms | **251 ms** |
+| 10% of rows differ (10% of buckets) | 977 ms | **296 ms** |
+| target empty (100% diff) | 679 ms | **146 ms** |
+
+The dump path wins here, but not because CSV is cheap: this benchmark uses
+`select-stream`, so MySQL sends native rows to the Rust process and xxh3 hashes
+them. No CSV is written for `--check`; CSV is used only when `--sync` actually
+transfers changed rows (and binary columns force the SQL dump path). The cost
+difference is MySQL `MD5` plus per-row SQL canonicalization versus Rust `xxh3`.
+
+A small diff does not automatically favor SQL select: the group phase still
+hashes every row on both sides. The diff percentage mainly affects the later
+row-hash and transfer phases. SQL select can win when shipping row bytes is
+expensive (very wide rows/BLOBs, remote source, slow link), because MySQL
+returns only grouped fingerprints. The numbers are indicative — reproduce them
+on your own hardware with `--check`.
+
+**Reproducing the benchmark** (test data is generated, not shipped):
 
 ```bash
-chmod +x mysql-sync-linux-x86_64
-cp mysql-sync-linux-x86_64 mysql-sync
+# 1) create the 100k-row table on the source
+docker compose exec -T mysql-src mysql -uroot -psyncroot -e "
+CREATE DATABASE IF NOT EXISTS db_bench;
+CREATE TABLE db_bench.big (id INT NOT NULL AUTO_INCREMENT, a VARCHAR(64) NOT NULL,
+  b INT NOT NULL, c DATETIME NOT NULL, PRIMARY KEY(id)) ENGINE=InnoDB;
+INSERT INTO db_bench.big (a,b,c)
+SELECT CONCAT('row-',n,'-',MD5(n)), n%1000, DATE_ADD('2024-01-01', INTERVAL n SECOND)
+FROM (SELECT a.N + b.N*10 + c.N*100 + d.N*1000 + e.N*10000 + 1 AS n
+      FROM (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c,
+           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d,
+           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e) s
+WHERE n <= 100000;"
+
+# 2) fill the target and time both data paths (5× each)
+mysql-sync -C .test-run/config-client.json --force --sync db_bench.big
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
+
+# 3) repeat with ~10% differing rows on the target
+docker compose exec -T mysql-dst mysql -uroot -psyncroot -e \
+  "UPDATE db_bench.big SET a=CONCAT(a,'-x') WHERE id <= 10000"
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
+
+# 4) repeat with an empty target (100% diff)
+docker compose exec -T mysql-dst mysql -uroot -psyncroot -e "TRUNCATE db_bench.big"
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
 ```
 
-## Quickstart mit Docker (Test)
+All algorithms are compiled in by default (`blake3`, `xxhash`, `md5`, `sha2`).
+Minimal build: `cargo build --no-default-features --features xxhash`.
 
-```bash
-docker compose up -d          # 2 MySQL-8-Container (Quelle :3306, Ziel :3307)
-python3 test.py               # seedet, startet Server, spielt --force/--sync/--check durch
-```
+## SOURCE SAFETY & EXPORT SIDE EFFECTS
 
-`test.py` führt 7 Szenarien aus (Schema-Force, differentieller Sync, Drift-Detektion
-mit exakten Zeilenanzahlen, Reparatur, Force-Recreate, SQL-Dump-Modus) und prüft
-u. a. **BLOB-Prüfsummen** (Binärsicherheit: `\0`, `\n`, `\t`, `0xFF` in Daten).
-Ohne Docker: `MSYNC_LOCAL=1 MSYNC_SRC_PORT=… MSYNC_DST_PORT=… python3 test.py`
-gegen zwei laufende Instanzen.
+The client reads source tables only: it issues `SELECT`/`SHOW` queries and never
+executes `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `LOAD DATA`, or DDL against the
+source. All writes are protocol requests executed by the server on the target.
 
-## CLI
+`dump_strategies` controls how source rows are fetched:
 
-```
-./mysql-sync -C config-server.json                       # Server-Modus
-./mysql-sync -C config-client.json --sync A.B            # Inhalte abgleichen
-./mysql-sync -C config-client.json --force A.B           # nur Schema erzwingen
-./mysql-sync -C config-client.json --force --sync A.B    # Recreate + Abgleich
-./mysql-sync -C config-client.json --force-schema A      # Schema für ganze DBs
-./mysql-sync -C config-client.json --check 10 A.B        # Diff-Report + 10 Beispiel-IDs
-```
+| Strategy | Source access | Requirements / side effects |
+|---|---|---|
+| `select-stream` | streaming `SELECT` | None. Default and fastest. |
+| `to_file[:DIR]` | `SELECT ... INTO OUTFILE` | Requires `FILE` privilege and a permitted `secure_file_priv` path on the MySQL host. Writes a temporary TSV on the source host, then reads and removes it. **Slow for large tables**: the complete result is written to disk and read back instead of streaming. A crash or remote-host path problem can leave the file behind. |
+| `mysql-e` | external `mysql --batch -e "SELECT ..."` | Requires the `mysql` CLI on the client host. `SELECT`-only; no table or file writes. Uses `host`/`port`; `mysql.socket` is ignored. |
+| `mysqldump` | `mysqldump --skip-lock-tables --single-transaction --skip-triggers` | Read-only. `INSERT` statements are parsed, never executed locally. Automatically preferred first for binary columns. |
 
-**Selector `A.B`**: `A` = DB-Liste (kommasepariert) oder `*`, `B` = Tabellen-Liste
-oder `*`. Beispiele aus dem Spezialfall-Set:
-
-```
---sync db_skywings,db_airwings.*        # beide DBs, alle Tabellen
---sync db_skywings.*,db_airwings.*      # identische Bedeutung
---force-schema db_skywings,db_airwings  # nur Schema
---check 10 db_skywings.*                # 10 Beispiel-IDs je Tabelle
-```
-
-**Exit-Codes**: `sync/force`: 0 = ok, 1 = Fehler · `check`: 0 = identisch,
-1 = Unterschiede gefunden, 2 = Fehler. Nützlich für Cron-Monitoring:
-
-```bash
-mysql-sync -C config-client.json --check 10 "*" || alert "DB-Drift!"
-```
-
-Weitere Optionen: `--no-progress` (für Cron/CI), `--log-level debug|trace`.
-
-## Konfiguration
-
-`config-server.json` (Ziel):
+Fallback only happens if a strategy fails before producing any row. To avoid the
+`to_file` side effect entirely, use `mysql-e` directly:
 
 ```json
-{
-  "mysql":  { "user": "root", "password": "…", "host": "127.0.0.1", "port": 3306 },
-  "listen": "0.0.0.0",
-  "port": 4433,
-  "auth_token": "optional-gemeinsames-geheimnis"
-}
+{ "dump_strategies": ["mysql-e", "mysqldump"] }
 ```
 
-Beim ersten Start erzeugt der Server `config-server-cert.pem` / `-key.pem` und
-`config-server.fingerprint` (SHA-256) neben der Config und druckt den Fingerprint.
+For strict protection, give the client a source account with only read
+privileges (`SELECT`/`SHOW`; add `FILE` only if `to_file` is required). The
+server must use a separate writable account for the target. If the server config
+points at the source instance, its writes would modify the source.
 
-`config-client.json` (Quelle):
+## CHUNK MODES
+
+The chunk mode is selected automatically per table from the primary-key metadata;
+there is no `chunk_mode` config key. `chunked` controls the bucket width/suffix.
+
+- **Range** is used for exactly one supported PK column: INTEGER, CHAR/VARCHAR, or
+  BINARY/VARBINARY (without prefix index). Numeric PKs use
+  `floor(pk / 10^chunked) * 10^chunked` (`chunked=3` → 1,000-value ranges);
+  CHAR/BINARY keys remove the last `chunked` characters/bytes. Every chunk
+  SELECT/export is ordered by PK.
+- **Mod** is chosen automatically as the fallback for composite PKs and other
+  single-column types (DATE/TIME, DECIMAL, FLOAT/DOUBLE, ENUM/SET, BIT,
+  TEXT/BLOB prefix keys, …). It uses modulo/suffix buckets: the last `chunked`
+  characters of the canonical PK component, or `ABS(pk) % 10^N` for numeric
+  components. Composite keys bucket by their last component. Date keys use the
+  date-only form.
+- Mod buckets are not contiguous, so they generally cannot use PK range
+  predicates and may scan the table.
+
+Range chunks can be large: a single changed row changes the whole chunk hash.
+The row-count threshold heuristic therefore only applies to mod; range mode
+always drills down to exact row hashes after a chunk mismatch.
+
+## CONFIG
+
+`config-server.json` (target):
 
 ```json
 {
   "mysql": { "user": "root", "password": "…", "host": "127.0.0.1", "port": 3306 },
-  "server": "ziel.example.com:4433",
-  "server_fingerprint": "sha256:FC7A65…(aus config-server.fingerprint)",
-
-  "allow_csv": true,
-  "dump_strategies": ["select-stream", "to_file:/tmp", "mysql-e", "mysqldump"],
-  "dump_threshold": 1000,
-  "chunked": 3,
-  "concurrent_processes": 3,
-  "diff_threshold_percent": 10,
-  "disable_triggers": false,
-
-  "database_mappings":       { "db": "target_db" },
-  "database_table_mappings": { "db.table": "target_db.target_table" }
+  "listen": "0.0.0.0",
+  "port": 4433,
+  "auth_token": "optional-shared-secret",
+  "hash_algo": "xxh3",
+  "transport": "quic",
+  "compression": "none",
+  "compression_level": 3
 }
 ```
 
-Alle Keys funktionieren auch mit Bindestrich (`dump-threshold`, `concurrent-processes`,
-`diff-threshold-percent`, `database_mappings`, …) — gemischt erlaubt.
+`config-client.json` (source):
 
-### Konfig-Referenz
+```json
+{
+  "mysql": { "user": "root", "password": "…", "host": "127.0.0.1", "port": 3306 },
+  "server": "target-host.example.com:4433",
+  "server_fingerprint": "sha256:…",
+  "auth_token": "same-secret-as-server",
+  "hash_algo": "xxh3",
+  "transport": "quic",
+  "compression": "none",
+  "compression_level": 3,
+  "allow_csv": true,
+  "dump_strategies": ["select-stream"],
+  "transfer_batch_rows": 1000,
+  "chunked": 4,
+  "concurrent_processes": 3,
+  "diff_threshold_percent": 10,
+  "disable_triggers": false,
+  "database_mappings": { "db_old": "db_new" }
+}
+```
 
-| Key | Default | Bedeutung |
-|---|---|---|
-| `mysql` | – | DB-Zugang: Quelle (Client) bzw. Ziel (Server); `socket` statt host/port möglich |
-| `server` | – | Client: Ziel-`host:port` (ohne Port → `port`/4433) |
-| `listen` / `port` | `0.0.0.0` / `4433` | Server-Bind |
-| `allow_csv` | `true` | `false` = SQL-REPLACE-Dumps statt CSV-Stream |
-| `dump_strategies` | `["select-stream"]` | Export-Reihenfolge mit Fallback, siehe unten |
-| `dump_threshold` | `1000` | Bucket-Größe ab der ganz kopiert wird; auch REPLACE-Batchgröße |
-| `chunked` | `3` | Bucket-Exponent: `10^N` Buckets (N = 1–6) |
-| `concurrent_processes` | `3` | Parallele Tabellen-Tasks (je 1 QUIC-Stream) |
-| `diff_threshold_percent` | `10` | Ab X % differierender Buckets: Vollkopie statt Drill-Down |
-| `disable_triggers` | `false` | Vor Import Trigger droppen, danach wiederherstellen |
-| `server_fingerprint` | – | Client: erwartetes Server-Zertifikat (`sha256:…`) |
-| `auth_token` | – | Beidseitig gleich → Hello-Handshake prüft es |
-| `tls_cert` / `tls_key` | – | Server: eigene PEMs statt Self-signed |
-| `connect_timeout_secs` | `30` | QUIC-Handshake-Timeout |
-| `max_frame` | `8388608` | Max. Framgröße (DoS-Grenze) |
+**Password/auth:** `auth_token` must be **identical** on client and server.
+The client sends it in the first request (`Hello`) over the encrypted QUIC/TLS
+connection; the server compares it and otherwise replies with
+`Auth-Token ungültig`. If no `auth_token` is set on the server, no token is
+checked. Always set it in production — together with `server_fingerprint`
+(pinning). Secrets can be passed via stdin: `-C -`.
 
-### Dump-Strategien (Export der lokalen Zeilen)
+Other keys: `transport` (`quic`/`tcp`), `allow_plaintext`, `compression`
+(`none`/`zstd`), `compression_level` (1–22), `max_frame`, `max_decompressed`,
+`allow_csv` (`false` = SQL REPLACE dumps), `dump_strategies` (ordered with
+fallback), `transfer_batch_rows` (alias `dump_threshold`), `chunked` (1–6), `concurrent_processes`,
+`diff_threshold_percent`, `disable_triggers`, `database_mappings`,
+`database_table_mappings`. Chunk mode is automatic and is not a config key.
 
-| Name | Weg | Anmerkung |
-|---|---|---|
-| `select-stream` | in-process Streaming-SELECT (mysql_async) | Default, immer verfügbar, binärsicher, kein Shell-Zugriff nötig |
-| `to_file:DIR` | `SELECT … INTO OUTFILE` auf MySQL-Host, Datei wird gelesen | schnellster Server-seitiger Export; braucht `FILE`-Privileg, `secure_file_priv` und lokale Dateisystem-Zugriff; MySQL muss auf demselben Host laufen |
-| `mysql-e` | `mysql --batch -e "SELECT …" \|` | TSV-Pipe; `\r` in Daten nicht escapbar (MySQL-Client-Limit) |
-| `mysqldump` | Dump parsen (INSERT-Statements) | für Trigger-/Binärfälle; WHERE-Filter clientseitig |
+On first server start, the certificate and `<config>.fingerprint` are created
+next to the config; pin the fingerprint in the client as
+`"server_fingerprint": "sha256:…"`. With `-C -` (stdin), the server writes the
+TLS files as `config-server-*.pem` / `config-server.fingerprint` into the
+working directory.
 
-Bei Fallback gilt: Nur wenn eine Strategie **null** Zeilen liefert (z. B. `OUTFILE`
-verweigert), wird die nächste probiert. Ein Abbruch mitten im Stream kann nicht
-sicher wiederholt werden und bricht den Task ab.
+## TRANSPORT, ENCRYPTION & COMPRESSION
 
-**Trigger:** `mysqldump` führt Trigger aus (Dumps laufen als Statements). Mit
-`disable_triggers: true` deaktiviert mysql-sync auf dem **Ziel** die Trigger der
-Tabelle (Snapshot → DROP) während des Imports und legt sie danach wieder an.
+- **Default `transport: "quic"`**: QUIC with TLS 1.3, always encrypted. There is
+  no switch to disable encryption on QUIC; use `server_fingerprint` pinning and
+  `auth_token`.
+- **`transport: "tcp"` is plaintext** and only allowed together with
+  `"allow_plaintext": true` on both sides. The process logs a loud warning. Use
+  it only inside a tunnel that already provides confidentiality.
+- **Compression**: `"compression": "none"` (default) or `"zstd"`. With `zstd`,
+  every frame is compressed — no size threshold, no heuristics —
+  `compression_level` 1–22 (default 3). Frames are self-describing, so each
+  side may choose its own setting.
+- **Wire format v3**: `U<len>\n<body>` (uncompressed) or `C<len>\n<body>`
+  (zstd), `<body>` = rkyv-serialized `Request`/`Response`; ALPN
+  `mysql-sync/3`. Client and server must be built from the same version.
 
-## Sicherheit
+## TRUST MODEL
 
-- QUIC erzwingt **TLS 1.3**; Cipher-Suites via rustls/ring.
-- **Pinning**: Client prüft den SHA-256 des Server-Zertifikats. Ohne Pinning:
-  TOFU mit Warnung (für Produktion pinnen!).
-- `auth_token`: erster Request pro Verbindung muss ein gültiges Hello bringen.
-- Identifier werden backtick-gequoted; Dump-Statements laufen durch eine
-  Allowlist (`INSERT/REPLACE/DELETE/UPDATE/SET/TRUNCATE`).
-- `max_frame` begrenzt Frames; der Dump-Buffer ist auf 2 GB gedeckelt.
+After a successful `Hello` (protocol version + `auth_token`), the peer's wire
+bytes are considered correct. rkyv decoding still checks structural validity so
+malformed frames become clean errors instead of undefined behavior, but this is
+**not a security boundary**: a correctly authenticated peer can cause damage
+anyway by sending **correctly formatted but semantically wrong SQL** (e.g.
+`SendeDump` with `DROP TABLE`). Integrity/confidentiality come from QUIC/TLS and
+the token, not from payload validation. Only `Hello` is parsed before token
+verification.
 
-## Build & Cross-Compile
-
-**Ohne lokale Toolchain (empfohlen)** — nur Docker nötig, erzeugt das statisch
-gelinkte musl-Binary (`bin/mysql-sync-linux-x86_64`):
+## EXAMPLES
 
 ```bash
-./compile-linux.sh              # musl static (empfohlen)
-./compile-linux.sh --glibc      # zusätzlich glibc-Binary
-./compile-linux.sh --clean      # Build-Caches (Named Volumes) löschen
+mysql-sync -C config-server.json
+mysql-sync -C config-client.json --force-schema db1,db2
+mysql-sync -C config-client.json --force --sync db1.*,db2.*
+mysql-sync -C config-client.json --check 10 "db1.*" || alert "DB drift!"
+mysql-sync -C config-client.json --check 10 --hash-via-dump "db1.t1"
+
+# config from stdin (e.g. from a secret store)
+cat config-client.json | mysql-sync -C - --check 10 "db1.*"
 ```
 
-Das Skript baut intern das Cross-Image (`Dockerfile.cross`: rust:1-slim +
-musl-tools + `rustup target add x86_64-unknown-linux-musl`) und kompiliert in
-einem Container; Cargo-Registry und Build-Artefakte liegen in Docker-Named-
-Volumes, wiederholte Builds sind daher inkrementell. Alternative Basis via
-`--image rust:1` oder `RUST_IMAGE=... ./compile-linux.sh`; Podman via
-`DOCKER=podman ./compile-linux.sh`.
+`--check-via-select` / `--check-via-dump` remain valid aliases for
+`--hash-via-select` / `--hash-via-dump`.
 
-**Lokal (ohne Docker)** — benötigt installierte Rust-Toolchain:
+## EXIT STATUS
+
+`--force*`/`--sync`: `0` = ok, `1` = error.  
+`--check`: `0` = identical, `1` = differences, `2` = error.
+
+## TESTING
 
 ```bash
-cargo build --release                                  # glibc-Binary
-rustup target add x86_64-unknown-linux-musl
-CC_x86_64_unknown_linux_musl=musl-gcc \
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-  cargo build --release --target x86_64-unknown-linux-musl   # statisch
-./build.sh                                             # beides + bin/ befüllen
+MSYNC_DST_PORT=3317 docker compose up -d
+MSYNC_DST_PORT=3317 python3 test.py
 ```
 
-`.github/workflows/build.yml` baut glibc + musl (und optional macOS) in CI und
-hängt die Binaries als Release-Artefakte an.
+`test.py` covers 11 scenarios (schema, differential sync, drift with exact row
+counts, repair, force-recreate, SQL dump, select-/dump-based hashing, hash
+mismatch + blake3, zstd compression, plaintext TCP, automatic range chunking for
+numeric/CHAR/BINARY PKs, mod fallback for DATE/composite PKs, and rejection of
+tables without a PK) including binary poison
+data (`\0\0\0`, invalid UTF-8).
+Without Docker: `MSYNC_LOCAL=1 MSYNC_SRC_PORT=… MSYNC_DST_PORT=… python3 test.py`.
 
-## Architektur
+## ALTERNATIVES
 
-```
-src/
-├── main.rs       CLI (clap): Server-/Client-Dispatch
-├── config.rs     JSON-Config (Dash-/Underscore-Aliase, Toleranz)
-├── proto.rs      QUIC-Framing (1B Tag + u32 BE Len), Request/Response-Enum
-├── hash.rs       Kanonische Zeilen-Kodierung → Blake3, TSV-Dialekt, Buckets
-├── mysqlutil.rs  Connections, Schema-Infos, PKs, Streaming-Scans, WHERE-Builder
-├── selector.rs   A.B-Selektor + DB/Tabellen-Mappings
-├── tls.rs        Self-signed-Gen (rcgen), Fingerprint-Pinning (rustls)
-├── server.rs     QUIC-Listener, State-Machine (Normal/Dump/Csv), Hash-API
-├── import.rs     TSV-Batcher → REPLACE-Import, Dump-Ausführung, Trigger
-├── export.rs     4 Export-Strategien mit Fallback (RowMsg-Kanal)
-├── sync.rs       Diff-Engine: force / sync / check, Drill-Down, Vollkopie
-├── client.rs     Handshake, Task-Enumeration, Semaphore, Summary, Exit-Codes
-└── progress.rs   indicatif-Balken je Tabelle (Phasen + Counts)
-```
+### pt-table-sync (Percona Toolkit, Perl)
 
-## Bekannte Grenzen
+Documentation: <https://docs.percona.com/percona-toolkit/pt-table-sync.html> ·
+Source: <https://github.com/percona/percona-toolkit> ·
+Single-file download: <https://www.percona.com/get/pt-table-sync>
 
-- Tabellen brauchen einen **Primary Key** (sonst Fehler/Hinweis).
-- Zero-Dates (`0000-00-00`) und `BIT`-Spalten sind nicht im Fokus.
-- Float-Rundung: Hashes basieren auf der Textdarstellung der DB — beide Seiten
-  sollten dieselbe MariaDB/MySQL-Hauptversion haben.
-- Beide Seiten sollten dieselbe mysql-sync-Version laufen lassen (Protokoll v1).
-- `mysql-e`-Strategie: MySQLs `--batch` escapet `\r` nicht.
+`pt-table-sync` is a Perl utility shipped with Percona Toolkit. It connects
+directly to one or more MySQL DSNs, finds row differences with chunk/nibble/
+group-by/stream algorithms, and can either print the repair SQL or execute
+`INSERT`/`REPLACE`/`UPDATE`/`DELETE` statements on a destination.
+
+Connection model: `pt-table-sync` is a Perl process with network reachability
+to both MySQL endpoints. It opens ordinary MySQL client connections to the
+source and destination; MySQL itself does not connect to MySQL. No `FEDERATED`
+engine, database link, or Unix `root` account is involved. The MySQL accounts
+must allow connections from the host running `pt-table-sync` and need `SELECT`
+on the source and `INSERT`/`UPDATE`/`DELETE`/`REPLACE` on the target.
+Replication-related options (`--sync-to-source`, `--replicate`) may additionally
+require `SUPER` or `REPLICATION CLIENT`. Using the MySQL `root` account is
+normally unnecessary and not recommended.
+
+Differences from mysql-sync:
+
+- Direct MySQL connections from the `pt-table-sync` process to both endpoints,
+  instead of mysql-sync's client/server QUIC transport. It relies on MySQL's own
+  connection security; mysql-sync provides QUIC/TLS, fingerprint pinning,
+  authentication, and optional zstd.
+- Replication-aware. It supports one-way and bidirectional synchronization,
+  `--sync-to-source` repair, and reusing `pt-table-checksum --replicate` results.
+  mysql-sync is topology-agnostic, strictly one-way source → target, and does
+  not manage replication or binlogs.
+- It does not synchronize schemas, indexes, or other schema objects. mysql-sync
+  can align the schema with `--force-schema`.
+- It can use GroupBy/Stream algorithms for tables without a suitable index;
+  mysql-sync requires a primary key and rejects tables without one.
+- It can run bidirectional sync; mysql-sync intentionally cannot.
+- Both support reporting versus execution: `--dry-run`/`--print` there,
+  `--check` here. mysql-sync computes MD5 group hashes in MySQL for select mode
+  and hashes in Rust with xxh3/blake3/etc. for dump mode; pt-table-sync uses
+  MySQL-side checksums and its own chunking algorithms.
+
+Use pt-table-sync when you need replication-aware repair, bidirectional sync,
+or a direct DB-to-DB Perl utility. Use mysql-sync when you want an isolated
+source reader, an authenticated client/server path, one-way target updates, and
+schema alignment.
+
+### data-diff (Datafold, Python)
+
+Documentation: <https://data-diff.readthedocs.io/> ·
+Source: <https://github.com/datafold/data-diff>
+
+`data-diff` is a Python CLI and library for comparing tables within or across
+SQL databases. Its cross-database mode uses divide-and-conquer checksums to find
+differing rows efficiently and can output differing rows plus statistics.
+
+Differences from mysql-sync:
+
+- It is a diff tool, not a synchronizer. It reports differences but does not
+  perform synchronization writes; mysql-sync performs the repair.
+- It supports many SQL databases and heterogeneous cross-database comparisons;
+  mysql-sync currently targets MySQL only.
+- It segments by a configured key/update column. mysql-sync derives automatic
+  range/mod chunks from the primary key and supports select- and dump-based
+  hashing.
+- It has no schema synchronization or trigger handling. mysql-sync provides
+  `--force-schema` and optional trigger suspension.
+- data-diff is useful for auditing heterogeneous estates; mysql-sync is for
+  applying a one-way MySQL repair with an explicit target server.
+
+> Note: Datafold announced that it stopped active development of the open-source
+> data-diff project in May 2024. Check its maintenance status before adopting it
+> for new production use.
+
+## SEE ALSO
+
+Source: `src/sync.rs` (diff engine), `src/sqlhash.rs` (SQL group/row hashes),
+`src/hash.rs` (Rust hashing/buckets), `src/export.rs` (export strategies),
+`src/server.rs` (target side).

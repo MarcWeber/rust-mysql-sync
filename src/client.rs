@@ -5,12 +5,10 @@
 //! jeder Task nutzt einen eigenen QUIC-Stream (Multiplexing).
 
 use crate::config::Config;
-use crate::proto::{self, Request, Response};
 use crate::selector::{map_remote, Selector};
-use crate::sync::{self, Mode, TableResult, TableTask};
-use crate::tls;
+use crate::sync::{self, HashVia, Mode, TableResult, TableTask};
 use crate::mysqlutil;
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -22,6 +20,8 @@ pub struct ClientArgs {
     pub check: Option<u32>,
     pub selector: Option<String>,
     pub no_progress: bool,
+    pub hash_via_select: bool,
+    pub hash_via_dump: bool,
 }
 
 struct PlannedTask {
@@ -29,64 +29,17 @@ struct PlannedTask {
     force: bool,
     mode: Mode,
     check_examples: u32,
+    hash_via: HashVia,
 }
 
 pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
     let cfg = args.cfg;
 
-    // ---- QUIC-Verbindung ----
-    let server_addr = cfg.server_addr().await?;
-    let verifier = tls::PinVerifier::new(&cfg)?;
-    let provider = tls::ring_provider();
-    let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![crate::config::ALPN.to_vec()];
-    let quinn_client = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-            .context("QUIC-TLS-Konfiguration")?,
-    ));
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(quinn_client);
-
-    log::info!("Verbinde mit {server_addr} …");
-    let connect = endpoint.connect(server_addr, "mysql-sync")?;
-    let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(cfg.connect_timeout_secs.max(1)),
-        connect,
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Connect-Timeout nach {}s", cfg.connect_timeout_secs))?
-    .context("QUIC-Handshake fehlgeschlagen")?;
-    log::info!("Verbindung hergestellt ({})", conn.remote_address());
+    // ---- Transport (QUIC/TLS oder Klartext-TCP) ----
+    let session = Arc::new(crate::transport::Session::connect(&cfg).await?);
 
     // ---- Lokales MySQL ----
     let pool = mysqlutil::new_pool(&cfg.mysql, None)?;
-
-    // ---- Hello/Auth ----
-    {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        proto::write_json(
-            &mut send,
-            &Request::Hello { version: proto::version(), token: cfg.auth_token.clone() },
-            cfg.max_frame,
-        )
-        .await?;
-        send.finish()?;
-        match proto::read_frame(&mut recv, cfg.max_frame).await? {
-            Some((proto::TAG_JSON, data)) => {
-                let resp: Response = serde_json::from_slice(&data)?;
-                match resp {
-                    Response::Ok { .. } => log::debug!("Server-Handshake ok"),
-                    Response::Err { message } => bail!("Server lehnt ab: {message}"),
-                    _ => bail!("Unerwartete Handshake-Antwort"),
-                }
-            }
-            _ => bail!("Keine Handshake-Antwort"),
-        }
-    }
 
     // ---- Task-Enumeration ----
     let mut local_conn = mysqlutil::session_conn(&pool).await?;
@@ -107,6 +60,7 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
         seen: &mut std::collections::HashSet<(String, String, u8)>,
         local_conn: &mut mysql_async::Conn,
         check_examples: u32,
+        hash_via: HashVia,
     ) -> Result<()> {
         let sel = Selector::parse(selector_str)?;
         for db in dbs {
@@ -133,30 +87,33 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
                     force,
                     mode,
                     check_examples,
+                    hash_via,
                 });
             }
         }
         Ok(())
     }
 
+    let hash_via = if args.hash_via_dump { HashVia::Dump } else { HashVia::Select };
+
     // Reihenfolge: force-schema → (force+sync gemerged) → sync → check
     if args.force_schema.is_some() {
-        add_plan(true, args.force_schema.as_deref(), Mode::Force, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples).await?;
+        add_plan(true, args.force_schema.as_deref(), Mode::Force, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
     }
     if args.force.is_some() && args.sync.is_some() {
         // --force --sync: EIN Task (Recreate + differentieller Abgleich in Sequence)
         let sel = args.sync.as_deref().or(args.force.as_deref());
-        add_plan(true, sel, Mode::Sync, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples).await?;
+        add_plan(true, sel, Mode::Sync, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
     } else {
         if args.force.is_some() {
-            add_plan(true, args.force.as_deref(), Mode::Force, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples).await?;
+            add_plan(true, args.force.as_deref(), Mode::Force, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
         }
         if args.sync.is_some() {
-            add_plan(false, args.sync.as_deref(), Mode::Sync, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples).await?;
+            add_plan(false, args.sync.as_deref(), Mode::Sync, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
         }
     }
     if args.check.is_some() {
-        add_plan(false, args.selector.as_deref(), Mode::Check, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples).await?;
+        add_plan(false, args.selector.as_deref(), Mode::Check, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
     }
 
     if planned.is_empty() {
@@ -177,19 +134,20 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
     for p in planned {
         let permit = semaphore.clone().acquire_owned().await?;
         let cfg = cfg_arc.clone();
-        let conn = conn.clone();
+        let session = session.clone();
         let pool = pool.clone();
         handles.push(tokio::spawn(async move {
             let progress = crate::progress::Progress::new(!no_progress);
             let res = sync::run_table_task(
                 (*cfg).clone(),
-                conn,
+                session,
                 pool,
                 p.task,
                 p.force,
                 p.mode,
                 p.check_examples,
                 progress,
+                p.hash_via,
             )
             .await;
             drop(permit);
@@ -213,7 +171,7 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
             }),
         }
     }
-    endpoint.close(0u32.into(), b"done");
+    session.close();
 
     // ---- Summary ----
     let ok_count = results.iter().filter(|r| r.ok).count();

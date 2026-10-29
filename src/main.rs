@@ -12,8 +12,10 @@ mod progress;
 mod proto;
 mod selector;
 mod server;
+mod sqlhash;
 mod sync;
 mod tls;
+mod transport;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -28,7 +30,7 @@ use std::process::ExitCode;
     after_help = "Beispiele:\n  Server:  ./mysql-sync -C config-server.json\n  Client:  ./mysql-sync -C config-client.json --sync db_skywings.*\n           ./mysql-sync -C config-client.json --force --sync db_skywings.*\n           ./mysql-sync -C config-client.json --force-schema db_skywings,db_airwings\n           ./mysql-sync -C config-client.json --check 10 db_skywings.*\n\nSelector A.B: A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
-    /// Pfad zur JSON-Konfigurationsdatei
+    /// Pfad zur JSON-Konfigurationsdatei ("-" liest die Config von stdin)
     #[arg(short = 'C', long = "config")]
     config: PathBuf,
 
@@ -58,6 +60,14 @@ struct Cli {
     /// Log-Level (error|warn|info|debug|trace)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Diff-/Check-Hashes als gruppierte MD5-Aggregate in MySQL berechnen (Default)
+    #[arg(long, alias = "check-via-select")]
+    hash_via_select: bool,
+
+    /// Diff-/Check-Hashes über Export/Parser berechnen (transfer_all-Strategien)
+    #[arg(long, alias = "check-via-dump")]
+    hash_via_dump: bool,
 }
 
 #[tokio::main]
@@ -89,10 +99,12 @@ async fn main() -> ExitCode {
             check: cli.check,
             selector: cli.selector,
             no_progress: cli.no_progress,
+            hash_via_select: cli.hash_via_select,
+            hash_via_dump: cli.hash_via_dump,
         })
         .await
     } else {
-        server::run(cfg).await
+        server::run(cfg, &cli.config).await
     };
 
     match result {

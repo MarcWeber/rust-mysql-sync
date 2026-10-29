@@ -90,30 +90,98 @@ pub async fn table_count(conn: &mut Conn, db: &str, table: &str) -> Result<u64> 
     Ok(c)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkKind {
+    Int,
+    UInt,
+    Char,
+    Binary,
+    /// Not supported by range chunking (DATE, DECIMAL, UUID-as-char is still Char, ...).
+    Unsupported,
+}
+
+impl PkKind {
+    pub fn is_range_supported(self) -> bool {
+        matches!(self, PkKind::Int | PkKind::UInt | PkKind::Char | PkKind::Binary)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PkCol {
     pub name: String,
     pub numeric: bool,
+    pub kind: PkKind,
+    pub column_type: String,
+    /// Prefix length for indexed TEXT/BLOB PKs (0 = full column).
+    pub sub_part: u64,
+}
+
+impl PkCol {
+    pub fn is_range_supported(&self) -> bool {
+        self.kind.is_range_supported() && self.sub_part == 0
+    }
 }
 
 /// Primary-Key-Spalten (in Ordinal-Reihenfolge) + Typ-Info.
 pub async fn pk_columns(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<PkCol>> {
-    let q = format!(
-        "SELECT k.COLUMN_NAME, c.DATA_TYPE \
-         FROM information_schema.KEY_COLUMN_USAGE k \
+    let q = "SELECT s.COLUMN_NAME, c.DATA_TYPE, c.COLUMN_TYPE, COALESCE(s.SUB_PART, 0) \
+         FROM information_schema.STATISTICS s \
          JOIN information_schema.COLUMNS c \
-           ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME \
-         WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.CONSTRAINT_NAME = 'PRIMARY' \
-         ORDER BY k.ORDINAL_POSITION"
-    );
-    let rows: Vec<(String, String)> = conn.exec(q, (db, table)).await?;
+           ON c.TABLE_SCHEMA = s.TABLE_SCHEMA AND c.TABLE_NAME = s.TABLE_NAME AND c.COLUMN_NAME = s.COLUMN_NAME \
+         WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME = ? AND s.INDEX_NAME = 'PRIMARY' \
+         ORDER BY s.SEQ_IN_INDEX";
+    let rows: Vec<(String, String, String, u64)> = conn.exec(q, (db, table)).await?;
     Ok(rows
         .into_iter()
-        .map(|(name, dt)| PkCol {
-            numeric: NUMERIC_TYPES.contains(&dt.to_lowercase().as_str()),
-            name,
+        .map(|(name, dt, column_type, sub_part)| {
+            let dt = dt.to_lowercase();
+            let kind = match dt.as_str() {
+                "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "year" => {
+                    if column_type.to_lowercase().contains("unsigned") {
+                        PkKind::UInt
+                    } else {
+                        PkKind::Int
+                    }
+                }
+                "char" | "varchar" => PkKind::Char,
+                "binary" | "varbinary" => PkKind::Binary,
+                _ => PkKind::Unsupported,
+            };
+            PkCol {
+                numeric: NUMERIC_TYPES.contains(&dt.as_str()),
+                name,
+                kind,
+                column_type,
+                sub_part,
+            }
         })
         .collect())
+}
+
+/// Range-Chunking braucht genau eine PK-Spalte mit einem unterstuetzten Typ.
+pub fn validate_range_pk(pks: &[PkCol], db: &str, table: &str) -> Result<()> {
+    if pks.is_empty() {
+        bail!("{db}.{table} hat keinen Primary Key — Range-Chunking nicht moeglich");
+    }
+    if pks.len() != 1 {
+        let cols: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
+        bail!(
+            "{db}.{table}: Range-Chunking unterstuetzt nur einen einspaltigen Primary Key, \
+             gefunden: {cols:?}. Setze \"chunk_mode\": \"mod\" fuer den alten Modus."
+        );
+    }
+    let p = &pks[0];
+    if !p.is_range_supported() {
+        bail!(
+            "{db}.{table}.{}: Range-Chunking unterstuetzt nur INTEGER, CHAR/VARCHAR und \
+             BINARY/VARBINARY Primary Keys (Typ: {}, SUB_PART: {}). \
+             Setze \"chunk_mode\": \"mod\" fuer den alten Modus.",
+            p.name,
+            p.column_type,
+            p.sub_part
+        );
+    }
+    Ok(())
 }
 
 /// Spalten, die binär sind und hex-kodiert übertragen werden.
@@ -177,7 +245,7 @@ where
     Ok(())
 }
 
-/// WHERE-Klausel für eine Menge von Buckets (Drill-Down, ein Scan für alle).
+/// WHERE-Klausel für eine Menge von Buckets (alter Modus, Drill-Down).
 pub fn bucket_where(pks: &[PkCol], chunked: u32, buckets: &[String]) -> Result<String> {
     if pks.is_empty() {
         bail!("Tabelle hat keinen Primary Key — Bucket-Abfrage unmöglich");
@@ -195,15 +263,137 @@ pub fn bucket_where(pks: &[PkCol], chunked: u32, buckets: &[String]) -> Result<S
         }
         Ok(format!("({})", vals.join(" OR ")))
     } else {
+        let ct = last.column_type.to_ascii_lowercase();
+        let expr = if ct == "date" {
+            format!("DATE_FORMAT({col}, '%Y-%m-%d')")
+        } else if ct.starts_with("datetime") || ct.starts_with("timestamp") {
+            format!("DATE_FORMAT({col}, '%Y-%m-%d %H:%i:%s.%f')")
+        } else {
+            col.clone()
+        };
         let mut quoted = Vec::with_capacity(buckets.len());
         let mut buf = Vec::new();
         for b in buckets {
             buf.clear();
             crate::hash::sql_quote(b.as_bytes(), &mut buf);
-            quoted.push(format!("RIGHT({col}, {chunked}) = {}", String::from_utf8_lossy(&buf)));
+            quoted.push(format!("RIGHT({expr}, {chunked}) = {}", String::from_utf8_lossy(&buf)));
         }
         Ok(format!("({})", quoted.join(" OR ")))
     }
+}
+
+/// WHERE-Klausel für Range-Chunks. Numerische Keys sind der untere Rand,
+/// Char-Keys ein Prefix, Binary-Keys Hex-Bytes.
+pub fn chunk_where(
+    pks: &[PkCol],
+    mode: crate::hash::ChunkMode,
+    chunked: u32,
+    keys: &[String],
+) -> Result<String> {
+    if mode == crate::hash::ChunkMode::Mod {
+        return bucket_where(pks, chunked, keys);
+    }
+    validate_range_pk(pks, "", "")?;
+    let pk = &pks[0];
+    let col = quote_ident(&pk.name);
+    if keys.is_empty() {
+        return Ok("FALSE".to_string());
+    }
+    let mut vals: Vec<String> = Vec::with_capacity(keys.len());
+    match pk.kind {
+        PkKind::Int | PkKind::UInt => {
+            let width = 10i128.pow(chunked.min(6) as u32);
+            for k in keys {
+                if !crate::hash::is_valid_int_literal(k) {
+                    bail!("Ungültiger numerischer Chunk-Key: {k}");
+                }
+                let low = k.parse::<i128>().map_err(|_| anyhow::anyhow!("Chunk-Key zu groß: {k}"))?;
+                let high = low + width;
+                vals.push(format!("({col} >= {low} AND {col} < {high})"));
+            }
+        }
+        PkKind::Char => {
+            let trim = chunked as usize;
+            for k in keys {
+                if k.is_empty() {
+                    vals.push(format!("(CHAR_LENGTH({col}) <= {trim})"));
+                    continue;
+                }
+                let mut escaped = String::with_capacity(k.len() + 8);
+                for c in k.chars() {
+                    match c {
+                        '\\' | '%' | '_' => {
+                            escaped.push('\\');
+                            escaped.push(c);
+                        }
+                        _ => escaped.push(c),
+                    }
+                }
+                escaped.push('%');
+                let mut buf = Vec::new();
+                crate::hash::sql_quote(escaped.as_bytes(), &mut buf);
+                let lit = String::from_utf8_lossy(&buf);
+                let group_len = k.chars().count() + trim;
+                vals.push(format!(
+                    "({col} LIKE {lit} ESCAPE '\\\\' AND CHAR_LENGTH({col}) = {group_len})"
+                ));
+            }
+        }
+        PkKind::Binary => {
+            let trim = chunked as usize;
+            for k in keys {
+                if k.is_empty() {
+                    vals.push(format!("(OCTET_LENGTH({col}) <= {trim})"));
+                    continue;
+                }
+                let prefix = hex::decode(k)
+                    .map_err(|_| anyhow::anyhow!("Ungültiger Binary-Chunk-Key: {k}"))?;
+                let group_len = prefix.len() + trim;
+                let mut cond = format!("{col} >= 0x{}", hex::encode_upper(&prefix));
+                if let Some(next) = next_binary_prefix(&prefix) {
+                    cond.push_str(&format!(" AND {col} < 0x{}", hex::encode_upper(&next)));
+                }
+                cond.push_str(&format!(" AND OCTET_LENGTH({col}) = {group_len}"));
+                vals.push(format!("({cond})"));
+            }
+        }
+        PkKind::Unsupported => bail!("PK-Typ wird von Range-Chunking nicht unterstuetzt"),
+    }
+    Ok(format!("({})", vals.join(" OR ")))
+}
+
+/// Naechster lexikographischer Byte-Prefix (exklusive Obergrenze).
+fn next_binary_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    while let Some(last) = out.last_mut() {
+        if *last != 0xFF {
+            *last += 1;
+            return Some(out);
+        }
+        out.pop();
+    }
+    None
+}
+
+/// SQL-Literal einer kanonischen PK-Komponente.
+fn pk_component_literal(pk: &PkCol, part: &str, out: &mut Vec<u8>) -> Result<()> {
+    match pk.kind {
+        PkKind::Binary => {
+            if !part.chars().all(|c| c.is_ascii_hexdigit()) || part.len() % 2 != 0 {
+                bail!("BINARY-PK ist nicht hex-kodiert: {part:?}");
+            }
+            out.extend_from_slice(b"0x");
+            out.extend_from_slice(part.as_bytes());
+        }
+        _ if pk.numeric => {
+            if !crate::hash::is_valid_int_literal(part) {
+                bail!("PK ist numerisch, aber Wert nicht: {part}");
+            }
+            out.extend_from_slice(part.as_bytes());
+        }
+        _ => crate::hash::sql_quote(part.as_bytes(), out),
+    }
+    Ok(())
 }
 
 /// WHERE-Klausel für konkrete PK-Werte (kanonische Strings) — zum Zeilen-Nachladen.
@@ -220,14 +410,7 @@ pub fn pk_in_where(pks: &[PkCol], canonical_pks: &[String]) -> Result<String> {
         let mut items = Vec::with_capacity(canonical_pks.len());
         for cp in canonical_pks {
             buf.clear();
-            if pks[0].numeric {
-                if !crate::hash::is_valid_int_literal(cp) {
-                    bail!("PK ist numerisch, aber Wert nicht: {cp}");
-                }
-                buf.extend_from_slice(cp.as_bytes());
-            } else {
-                crate::hash::sql_quote(cp.as_bytes(), &mut buf);
-            }
+            pk_component_literal(&pks[0], cp, &mut buf)?;
             items.push(String::from_utf8_lossy(&buf).to_string());
         }
         Ok(format!("{col} IN ({})", items.join(", ")))
@@ -242,14 +425,7 @@ pub fn pk_in_where(pks: &[PkCol], canonical_pks: &[String]) -> Result<String> {
             let mut vals = Vec::with_capacity(parts.len());
             for (i, part) in parts.iter().enumerate() {
                 buf.clear();
-                if pks[i].numeric {
-                    if !crate::hash::is_valid_int_literal(part) {
-                        bail!("PK ist numerisch, aber Wert nicht: {part}");
-                    }
-                    buf.extend_from_slice(part.as_bytes());
-                } else {
-                    crate::hash::sql_quote(part.as_bytes(), &mut buf);
-                }
+                pk_component_literal(&pks[i], part, &mut buf)?;
                 vals.push(String::from_utf8_lossy(&buf).to_string());
             }
             tuples.push(format!("({})", vals.join(",")));
@@ -272,14 +448,7 @@ pub fn pk_gt_where(pks: &[PkCol], last_canonical: &str) -> Result<String> {
     let mut vals = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
         buf.clear();
-        if pks[i].numeric {
-            if !crate::hash::is_valid_int_literal(part) {
-                bail!("PK ist numerisch, aber Wert nicht: {part}");
-            }
-            buf.extend_from_slice(part.as_bytes());
-        } else {
-            crate::hash::sql_quote(part.as_bytes(), &mut buf);
-        }
+        pk_component_literal(&pks[i], part, &mut buf)?;
         vals.push(String::from_utf8_lossy(&buf).to_string());
     }
     let cols: Vec<String> = pks.iter().map(|p| quote_ident(&p.name)).collect();
@@ -287,8 +456,8 @@ pub fn pk_gt_where(pks: &[PkCol], last_canonical: &str) -> Result<String> {
 }
 
 /// Kanonischer PK-String eines Zeilenwerts via PK-Metadaten.
-pub fn pk_of_row(values: &[Value], pk_indexes: &[usize]) -> String {
-    crate::hash::pk_canonical(values, pk_indexes)
+pub fn pk_of_row(values: &[Value], pk_indexes: &[usize], pks: &[PkCol]) -> String {
+    crate::hash::pk_canonical(values, pk_indexes, pks)
 }
 
 /// SHOW CREATE TABLE normalisieren (für Schema-Vergleich).

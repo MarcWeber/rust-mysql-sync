@@ -16,6 +16,13 @@ strip = true
 lto = false
 codegen-units = 16
 
+[features]
+default = ["blake3", "xxhash", "md5", "sha2"]
+blake3 = ["dep:blake3"]
+xxhash = ["dep:xxhash-rust"]
+md5 = ["dep:md-5"]
+sha2 = ["dep:sha2"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -27,8 +34,13 @@ mysql_async = { version = "0.36", default-features = false, features = ["minimal
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-blake3 = "1"
-sha2 = "0.10"
+rkyv = { version = "0.8", features = ["bytecheck"] }
+zstd = "0.13"
+blake3 = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+xxhash-rust = { version = "0.8", features = ["xxh3", "xxh64"], optional = true }
+digest = "0.10"
 hex = "0.4"
 anyhow = "1"
 indicatif = "0.18"
