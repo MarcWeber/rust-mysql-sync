@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Value;
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,9 +33,19 @@ pub enum RowMsg {
     Done,
 }
 
+#[derive(Debug)]
+pub enum RawMsg {
+    Line(Vec<u8>),
+    Err(String),
+    Done,
+}
+
 pub fn parse_strategy(s: &str) -> Result<Strategy> {
     let t = s.trim().to_lowercase();
-    if let Some(dir) = t.strip_prefix("to_file:").or_else(|| t.strip_prefix("to-file:")) {
+    if let Some(dir) = t
+        .strip_prefix("to_file:")
+        .or_else(|| t.strip_prefix("to-file:"))
+    {
         return Ok(Strategy::ToFile(dir.to_string()));
     }
     match t.as_str() {
@@ -61,16 +71,57 @@ async fn run_strategy(
         Strategy::SelectStream => {
             let r = mysqlutil::new_pool(&mysql, None).and_then(|p| Ok(p));
             match r {
-                Ok(pool) => fetch_stream(&pool, &db, &table, where_clause.as_deref(), order_by.as_deref(), &tx).await,
+                Ok(pool) => {
+                    fetch_stream(
+                        &pool,
+                        &db,
+                        &table,
+                        where_clause.as_deref(),
+                        order_by.as_deref(),
+                        &tx,
+                    )
+                    .await
+                }
                 Err(e) => Err(e),
             }
         }
         Strategy::ToFile(dir) => match mysqlutil::new_pool(&mysql, None) {
-            Ok(pool) => fetch_to_file(&pool, &db, &table, where_clause.as_deref(), order_by.as_deref(), &dir, &tx).await,
+            Ok(pool) => {
+                fetch_to_file(
+                    &pool,
+                    &db,
+                    &table,
+                    where_clause.as_deref(),
+                    order_by.as_deref(),
+                    &dir,
+                    &tx,
+                )
+                .await
+            }
             Err(e) => Err(e),
         },
-        Strategy::MysqlE => fetch_mysql_e(&mysql, &db, &table, where_clause.as_deref(), order_by.as_deref(), &tx).await,
-        Strategy::Mysqldump => fetch_mysqldump(&mysql, &db, &table, where_clause.as_deref(), order_by.as_deref(), &tx).await,
+        Strategy::MysqlE => {
+            fetch_mysql_e(
+                &mysql,
+                &db,
+                &table,
+                where_clause.as_deref(),
+                order_by.as_deref(),
+                &tx,
+            )
+            .await
+        }
+        Strategy::Mysqldump => {
+            fetch_mysqldump(
+                &mysql,
+                &db,
+                &table,
+                where_clause.as_deref(),
+                order_by.as_deref(),
+                &tx,
+            )
+            .await
+        }
     };
     if let Err(e) = res {
         let _ = tx.send(RowMsg::Err(format!("{e:#}"))).await;
@@ -157,13 +208,22 @@ pub fn spawn_fetch_with_strategies(
             log::warn!("[{db}.{table}] Strategie {strat:?} lieferte nichts — Fallback …");
         }
         let _ = tx
-            .send(RowMsg::Err(last_err.unwrap_or_else(|| "Keine Export-Strategie verfügbar".into())))
+            .send(RowMsg::Err(
+                last_err.unwrap_or_else(|| "Keine Export-Strategie verfügbar".into()),
+            ))
             .await;
     });
     rx
 }
 
-async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_stream(
+    pool: &mysql_async::Pool,
+    db: &str,
+    table: &str,
+    where_clause: Option<&str>,
+    order_by: Option<&str>,
+    tx: &mpsc::Sender<RowMsg>,
+) -> Result<()> {
     let mut conn = mysqlutil::session_conn(pool).await?;
     let mut sql = format!("SELECT * FROM {}", qualified(db, table));
     if let Some(w) = where_clause {
@@ -175,7 +235,10 @@ async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_cla
     if let Some(o) = order_by {
         sql.push_str(o);
     }
-    let result = conn.query_iter(sql).await.context("SELECT fehlgeschlagen")?;
+    let result = conn
+        .query_iter(sql)
+        .await
+        .context("SELECT fehlgeschlagen")?;
     let mut result = result;
     while let Some(row) = result.next().await.context("Zeilen-Lesen fehlgeschlagen")? {
         let values: Vec<Value> = row.unwrap();
@@ -186,11 +249,21 @@ async fn fetch_stream(pool: &mysql_async::Pool, db: &str, table: &str, where_cla
     Ok(())
 }
 
-async fn fetch_to_file(pool: &mysql_async::Pool, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, dir: &str, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_to_file(
+    pool: &mysql_async::Pool,
+    db: &str,
+    table: &str,
+    where_clause: Option<&str>,
+    order_by: Option<&str>,
+    dir: &str,
+    tx: &mpsc::Sender<RowMsg>,
+) -> Result<()> {
     let mut conn = mysqlutil::session_conn(pool).await?;
     let fname = format!(
         "mysqlsync-{}.tsv",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
     );
     let path = format!("{}/{fname}", dir.trim_end_matches('/'));
 
@@ -226,7 +299,14 @@ async fn read_tsv_file(path: &str, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
     parse_tsv_lines(&buf, tx).await
 }
 
-async fn fetch_mysql_e(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_mysql_e(
+    mysql: &MysqlCfg,
+    db: &str,
+    table: &str,
+    where_clause: Option<&str>,
+    order_by: Option<&str>,
+    tx: &mpsc::Sender<RowMsg>,
+) -> Result<()> {
     let mut sql = format!("SELECT * FROM {}", qualified(db, table));
     if let Some(w) = where_clause {
         if !w.is_empty() {
@@ -252,7 +332,9 @@ async fn fetch_mysql_e(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Op
     cmd.arg(db).arg("-e").arg(&sql);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().context("mysql-Client nicht gefunden (mysql-e Strategie)")?;
+    let mut child = cmd
+        .spawn()
+        .context("mysql-Client nicht gefunden (mysql-e Strategie)")?;
     let mut stdout = child.stdout.take().context("kein stdout")?;
     let mut buf = Vec::new();
     stdout.read_to_end(&mut buf).await?;
@@ -263,7 +345,14 @@ async fn fetch_mysql_e(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Op
     parse_tsv_lines(&buf, tx).await
 }
 
-async fn fetch_mysqldump(mysql: &MysqlCfg, db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>, tx: &mpsc::Sender<RowMsg>) -> Result<()> {
+async fn fetch_mysqldump(
+    mysql: &MysqlCfg,
+    db: &str,
+    table: &str,
+    where_clause: Option<&str>,
+    order_by: Option<&str>,
+    tx: &mpsc::Sender<RowMsg>,
+) -> Result<()> {
     if where_clause.is_some() {
         log::debug!(
             "[{db}.{table}] mysqldump: WHERE wird clientseitig gefiltert (Dump der ganzen Tabelle)"
@@ -359,7 +448,10 @@ fn parse_insert_values(stmt: &str) -> Result<Option<Vec<Value>>> {
     let pos = lower.find("values").context("INSERT ohne VALUES")?;
     let rest = trimmed[pos + 6..].trim();
     let rest = rest.strip_prefix('(').context("VALUES ohne (")?;
-    let rest = rest.strip_suffix(");").or_else(|| rest.strip_suffix(')')).unwrap_or(rest);
+    let rest = rest
+        .strip_suffix(");")
+        .or_else(|| rest.strip_suffix(')'))
+        .unwrap_or(rest);
 
     let mut values = Vec::new();
     let bytes = rest.as_bytes();
@@ -460,7 +552,13 @@ fn parse_sql_value(s: &str, i: usize) -> Result<(Value, usize)> {
 }
 
 /// Zeilen als SQL-Dump (REPLACE INTO) serialisieren — für allow_csv=false.
-pub fn rows_to_replace_sql(db: &str, table: &str, columns: &[String], rows: &[Vec<Value>], hex_indexes: &[usize]) -> Vec<u8> {
+pub fn rows_to_replace_sql(
+    db: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Value>],
+    hex_indexes: &[usize],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(rows.len() * 64);
     for row in rows {
         out.extend_from_slice(b"REPLACE INTO ");
@@ -478,4 +576,124 @@ pub fn rows_to_replace_sql(db: &str, table: &str, columns: &[String], rows: &[Ve
         out.extend_from_slice(b");\n");
     }
     out
+}
+
+/// Start a streaming `mysql --batch` scan that emits one raw TSV line per row.
+/// The line bytes are exactly what `mysql --batch --skip-column-names` writes
+/// (without the trailing newline), so hashing the line is stable as long as the
+/// charset/profile and mysql client behavior match on both sides.
+pub fn spawn_raw_tsv(
+    cfg: &Config,
+    db: String,
+    table: String,
+    where_clause: Option<String>,
+    order_by: Option<String>,
+) -> mpsc::Receiver<RawMsg> {
+    let (tx, rx) = mpsc::channel::<RawMsg>(64);
+    let mysql = cfg.mysql.clone();
+    tokio::spawn(async move {
+        if let Err(e) = fetch_raw_tsv(
+            &mysql,
+            &db,
+            &table,
+            where_clause.as_deref(),
+            order_by.as_deref(),
+            &tx,
+        )
+        .await
+        {
+            let _ = tx.send(RawMsg::Err(format!("{e:#}"))).await;
+        }
+        let _ = tx.send(RawMsg::Done).await;
+    });
+    rx
+}
+
+async fn fetch_raw_tsv(
+    mysql: &MysqlCfg,
+    db: &str,
+    table: &str,
+    where_clause: Option<&str>,
+    order_by: Option<&str>,
+    tx: &mpsc::Sender<RawMsg>,
+) -> Result<()> {
+    let mut sql = format!("SELECT * FROM {}", qualified(db, table));
+    if let Some(w) = where_clause {
+        if !w.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(w);
+        }
+    }
+    if let Some(o) = order_by {
+        sql.push_str(o);
+    }
+
+    let mut cmd = tokio::process::Command::new("mysql");
+    cmd.arg("--batch")
+        .arg("--quick")
+        .arg("--skip-column-names")
+        .arg("--default-character-set=utf8mb4")
+        .arg("-h")
+        .arg(&mysql.host)
+        .arg("-P")
+        .arg(mysql.port.to_string())
+        .arg("-u")
+        .arg(&mysql.user);
+    if let Some(sock) = &mysql.socket {
+        cmd.arg("--socket").arg(sock);
+    }
+    if !mysql.password.is_empty() {
+        cmd.arg(format!("-p{}", mysql.password));
+    }
+    cmd.arg(db).arg("-e").arg(&sql);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .context("mysql-Client nicht gefunden (raw-tsv)")?;
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().context("kein stdout")?);
+    let mut stderr = child.stderr.take().context("kein stderr")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let mut line = Vec::with_capacity(1024);
+    loop {
+        line.clear();
+        let n = stdout
+            .read_until(b'\n', &mut line)
+            .await
+            .context("TSV-Stream lesen fehlgeschlagen")?;
+        if n == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        if tx
+            .send(RawMsg::Line(std::mem::take(&mut line)))
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+            return Ok(());
+        }
+    }
+    let status = child.wait().await?;
+    let err = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        bail!(
+            "mysql -e raw-tsv fehlgeschlagen (Exit {status}): {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+    Ok(())
 }

@@ -17,21 +17,47 @@ use crate::progress::Progress;
 use crate::proto::{self, ChunkHash, Framing, Request, Response};
 use crate::sqlhash;
 use crate::transport::{RecvHalf, SendHalf};
+use crate::{hash_binary, hash_tsv};
 use anyhow::{bail, Context, Result};
 use mysql_async::{Conn, Value};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HashVia {
     Select,
     Dump,
+    RawBinary,
+    RawTsv,
+}
+
+impl HashVia {
+    fn is_raw(self) -> bool {
+        matches!(self, HashVia::RawBinary | HashVia::RawTsv)
+    }
 }
 
 fn hash_via_source(via: HashVia) -> Option<String> {
     match via {
         HashVia::Select => None,
         HashVia::Dump => Some("dump".to_string()),
+        HashVia::RawBinary => Some("raw_binary".to_string()),
+        HashVia::RawTsv => Some("raw_tsv".to_string()),
+    }
+}
+
+async fn fetch_server_profile(
+    send: &mut SendHalf,
+    recv: &mut RecvHalf,
+    f: &Framing,
+) -> Result<proto::MysqlProfile> {
+    proto::write_request(send, &Request::MysqlVersion {}, f).await?;
+    match read_response(recv, f).await? {
+        Response::MysqlVersion { profile, .. } => Ok(profile),
+        Response::Err { message } => {
+            bail!("MySQL-Version/Profil abrufen fehlgeschlagen: {message}")
+        }
+        _ => bail!("Unerwartete Antwort auf MysqlVersion"),
     }
 }
 
@@ -75,7 +101,19 @@ pub async fn run_table_task(
     hash_via: HashVia,
 ) -> TableResult {
     let label = format!("{}.{}", task.local_db, task.local_table);
-    match run_inner(&cfg, &session, &pool, &task, do_force, mode, check_examples, &progress, hash_via).await {
+    match run_inner(
+        &cfg,
+        &session,
+        &pool,
+        &task,
+        do_force,
+        mode,
+        check_examples,
+        &progress,
+        hash_via,
+    )
+    .await
+    {
         Ok((sent, deleted, differ, examples)) => TableResult {
             label,
             ok: true,
@@ -128,17 +166,31 @@ async fn run_inner(
     // ---- 1. Schema & Counts ----
     bar.phase("Schema/Counts");
     let mut local_conn = mysqlutil::session_conn(pool).await?;
-    let local_pks: Vec<PkCol> = mysqlutil::pk_columns(&mut local_conn, &task.local_db, &task.local_table).await?;
+    let local_pks: Vec<PkCol> =
+        mysqlutil::pk_columns(&mut local_conn, &task.local_db, &task.local_table).await?;
     if local_pks.is_empty() {
         bail!("{label} hat keinen Primary Key — Sync nicht möglich");
     }
     let chunk_mode = hash::chunk_mode_for_pk(&local_pks);
     let pk_names: Vec<String> = local_pks.iter().map(|p| p.name.clone()).collect();
-    let local_info = mysqlutil::table_info(&mut local_conn, &task.local_db, &task.local_table).await?;
+    let local_info =
+        mysqlutil::table_info(&mut local_conn, &task.local_db, &task.local_table).await?;
 
-    proto::write_request(&mut send, &Request::DescribeCount { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+    proto::write_request(
+        &mut send,
+        &Request::DescribeCount {
+            db: task.remote_db.clone(),
+            table: task.remote_table.clone(),
+        },
+        &f,
+    )
+    .await?;
     let remote_info = match read_response(&mut recv, &f).await? {
-        Response::SchemaInfo { create_sql, columns, count } => Some((create_sql, columns, count)),
+        Response::SchemaInfo {
+            create_sql,
+            columns,
+            count,
+        } => Some((create_sql, columns, count)),
         Response::Err { message }
             if message.contains("nicht gefunden")
                 || message.contains("doesn't exist")
@@ -150,19 +202,74 @@ async fn run_inner(
         _ => bail!("Unerwartete Antwort auf DescribeCount"),
     };
 
+    // ---- Raw-Hash-Gate: exact MySQL representation profile must match ----
+    let raw_profile = if hash_via.is_raw() {
+        let local_profile = mysqlutil::mysql_profile(&mut local_conn).await?;
+        let remote_profile = fetch_server_profile(&mut send, &mut recv, &f).await?;
+        if let Some(diff) = local_profile.difference(&remote_profile) {
+            bail!(
+                "{label}: Raw-Hashing abgelehnt — MySQL-Profil weicht ab: {diff}. \
+                 Nutze --hash-via-select oder --hash-via-dump."
+            );
+        }
+        if hash_via == HashVia::RawTsv {
+            let binary = mysqlutil::binary_column_indexes(
+                &mut local_conn,
+                &task.local_db,
+                &task.local_table,
+            )
+            .await?;
+            if !binary.is_empty() {
+                bail!(
+                    "{label}: raw-tsv unterstützt keine binären Spalten (Indizes {binary:?}); \
+                     nutze raw-binary, select oder dump."
+                );
+            }
+        }
+        Some(local_profile)
+    } else {
+        None
+    };
+    let schema_hash = if hash_via.is_raw() {
+        Some(hash::hash_bytes(
+            mysqlutil::normalize_schema(&local_info.create_sql).as_bytes(),
+            cfg.hash_algo(),
+        ))
+    } else {
+        None
+    };
+
     // ---- 2. Force / Schema-Abgleich ----
     if do_force {
         bar.phase("Force-Schema");
         match &remote_info {
             None => {
-                proto::write_request(&mut send, &Request::Recreate { db: task.remote_db.clone(), sql: local_info.create_sql.clone() }, &f).await?;
+                proto::write_request(
+                    &mut send,
+                    &Request::Recreate {
+                        db: task.remote_db.clone(),
+                        sql: local_info.create_sql.clone(),
+                    },
+                    &f,
+                )
+                .await?;
                 expect_ok(&mut recv, &f, "Recreate").await?;
                 log::info!("[{label}] Tabelle auf Ziel erstellt");
             }
             Some((remote_create, _, _)) => {
-                if mysqlutil::normalize_schema(&local_info.create_sql) != mysqlutil::normalize_schema(remote_create) {
+                if mysqlutil::normalize_schema(&local_info.create_sql)
+                    != mysqlutil::normalize_schema(remote_create)
+                {
                     log::warn!("[{label}] Schema weicht ab — Tabelle wird neu erstellt (Daten gehen verloren!)");
-                    proto::write_request(&mut send, &Request::Recreate { db: task.remote_db.clone(), sql: local_info.create_sql.clone() }, &f).await?;
+                    proto::write_request(
+                        &mut send,
+                        &Request::Recreate {
+                            db: task.remote_db.clone(),
+                            sql: local_info.create_sql.clone(),
+                        },
+                        &f,
+                    )
+                    .await?;
                     expect_ok(&mut recv, &f, "Recreate").await?;
                 } else {
                     log::debug!("[{label}] Schema identisch — kein Recreate");
@@ -172,9 +279,32 @@ async fn run_inner(
     }
 
     if mode == Mode::Check {
+        if hash_via.is_raw() {
+            match &remote_info {
+                Some((remote_create, _, _)) => {
+                    if mysqlutil::normalize_schema(&local_info.create_sql)
+                        != mysqlutil::normalize_schema(remote_create)
+                    {
+                        bail!("{label}: Raw-Hashing abgelehnt — Schemas unterscheiden sich");
+                    }
+                }
+                None => bail!("{label}: Zieltabelle fehlt — Raw-Hashing nicht möglich"),
+            }
+        }
         // Nur vergleichen: Chunk- und Zeilen-Diffs ohne Schreibzugriffe
         let stats = diff_and_report(
-            cfg, &mut send, &mut recv, &mut local_conn, &local_pks, &local_info, task, check_examples, &bar, hash_via,
+            cfg,
+            &mut send,
+            &mut recv,
+            &mut local_conn,
+            &local_pks,
+            &local_info,
+            task,
+            check_examples,
+            &bar,
+            hash_via,
+            raw_profile,
+            schema_hash,
         )
         .await?;
         bar.done(&format!("{} Zeilen differieren", stats.0));
@@ -191,9 +321,21 @@ async fn run_inner(
     let remote_info2 = match &remote_info {
         Some(_) if !do_force => remote_info.clone(),
         _ => {
-            proto::write_request(&mut send, &Request::DescribeCount { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+            proto::write_request(
+                &mut send,
+                &Request::DescribeCount {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
             match read_response(&mut recv, &f).await? {
-                Response::SchemaInfo { create_sql, columns, count } => Some((create_sql, columns, count)),
+                Response::SchemaInfo {
+                    create_sql,
+                    columns,
+                    count,
+                } => Some((create_sql, columns, count)),
                 Response::Err { message } => bail!("{message}"),
                 _ => bail!("Unerwartete Antwort"),
             }
@@ -203,16 +345,31 @@ async fn run_inner(
         Some(x) => x,
         None => bail!("{label}: Zieltabelle fehlt und kein --force — Abbruch"),
     };
-    if mysqlutil::normalize_schema(&local_info.create_sql) != mysqlutil::normalize_schema(&remote_create) {
+    if mysqlutil::normalize_schema(&local_info.create_sql)
+        != mysqlutil::normalize_schema(&remote_create)
+    {
         bail!("{label}: Schemas unterscheiden sich — mit --force/--force-schema Schema abgleichen");
     }
 
-    let hex_indexes = mysqlutil::binary_column_indexes(&mut local_conn, &task.local_db, &task.local_table).await?;
+    let hex_indexes =
+        mysqlutil::binary_column_indexes(&mut local_conn, &task.local_db, &task.local_table)
+            .await?;
 
     // Vollkopie-Kurzschluss: Ziel leer → alles senden
     if remote_count == 0 && local_info.count > 0 {
         bar.set_total(local_info.count, "Vollkopie (Ziel leer)");
-        let sent = transfer_all_rows(cfg, &mut send, &mut recv, &mut local_conn, task, &hex_indexes, &local_info.columns, None, &bar).await?;
+        let sent = transfer_all_rows(
+            cfg,
+            &mut send,
+            &mut recv,
+            &mut local_conn,
+            task,
+            &hex_indexes,
+            &local_info.columns,
+            None,
+            &bar,
+        )
+        .await?;
         bar.done(&format!("{sent} Zeilen gesendet"));
         return Ok((sent, 0, Some(local_info.count), vec![]));
     }
@@ -221,10 +378,55 @@ async fn run_inner(
     bar.set_total(local_info.count, "Lokale Chunk-Hashes");
     let local_chunks = match hash_via {
         HashVia::Select => {
-            compute_chunk_hashes(&mut local_conn, &task.local_db, &task.local_table, &local_pks, chunk_mode, cfg.chunked, Some(&bar)).await?
+            compute_chunk_hashes(
+                &mut local_conn,
+                &task.local_db,
+                &task.local_table,
+                &local_pks,
+                chunk_mode,
+                cfg.chunked,
+                Some(&bar),
+            )
+            .await?
         }
         HashVia::Dump => {
-            compute_chunk_hashes_via_export(cfg, &mut local_conn, task, &local_pks, &pk_names, chunk_mode, cfg.chunked, Some(&bar)).await?
+            compute_chunk_hashes_via_export(
+                cfg,
+                &mut local_conn,
+                task,
+                &local_pks,
+                &pk_names,
+                chunk_mode,
+                cfg.chunked,
+                Some(&bar),
+            )
+            .await?
+        }
+        HashVia::RawBinary => {
+            compute_chunk_hashes_raw_binary(
+                &mut local_conn,
+                task,
+                &local_pks,
+                &pk_names,
+                chunk_mode,
+                cfg.chunked,
+                cfg.hash_algo(),
+                Some(&bar),
+            )
+            .await?
+        }
+        HashVia::RawTsv => {
+            compute_chunk_hashes_raw_tsv(
+                cfg,
+                &mut local_conn,
+                task,
+                &local_pks,
+                &pk_names,
+                chunk_mode,
+                cfg.chunked,
+                Some(&bar),
+            )
+            .await?
         }
     };
 
@@ -240,6 +442,8 @@ async fn run_inner(
             hash_of_chunk: true,
             buckets: None,
             hash_source: hash_via_source(hash_via),
+            profile: raw_profile.clone(),
+            schema_hash: schema_hash.clone(),
         },
         &f,
     )
@@ -259,7 +463,10 @@ async fn run_inner(
             _ => bail!("Unerwartete Antwort auf Hashes"),
         }
     }
-    bar.done(&format!("{} Buckets verglichen", local_chunks.len().max(remote_chunks.len())));
+    bar.done(&format!(
+        "{} Buckets verglichen",
+        local_chunks.len().max(remote_chunks.len())
+    ));
 
     // Differierende Buckets
     let mut diff_buckets: Vec<String> = Vec::new();
@@ -315,14 +522,49 @@ async fn run_inner(
         log::info!("[{label}] Über Threshold — Vollkopie (Truncate + alle Zeilen)");
         bar.phase("Vollkopie");
         if cfg.disable_triggers {
-            proto::write_request(&mut send, &Request::DisableTriggers { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+            proto::write_request(
+                &mut send,
+                &Request::DisableTriggers {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
             expect_ok(&mut recv, &f, "DisableTriggers").await?;
         }
-        proto::write_request(&mut send, &Request::Truncate { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+        proto::write_request(
+            &mut send,
+            &Request::Truncate {
+                db: task.remote_db.clone(),
+                table: task.remote_table.clone(),
+            },
+            &f,
+        )
+        .await?;
         expect_ok(&mut recv, &f, "Truncate").await?;
-        let sent = transfer_all_rows(cfg, &mut send, &mut recv, &mut local_conn, task, &hex_indexes, &local_info.columns, None, &bar).await?;
+        let sent = transfer_all_rows(
+            cfg,
+            &mut send,
+            &mut recv,
+            &mut local_conn,
+            task,
+            &hex_indexes,
+            &local_info.columns,
+            None,
+            &bar,
+        )
+        .await?;
         if cfg.disable_triggers {
-            proto::write_request(&mut send, &Request::RestoreTriggers { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+            proto::write_request(
+                &mut send,
+                &Request::RestoreTriggers {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
             expect_ok(&mut recv, &f, "RestoreTriggers").await?;
         }
         bar.done(&format!("Vollkopie: {sent} Zeilen"));
@@ -333,10 +575,59 @@ async fn run_inner(
     bar.phase("Drill-Down (Zeilen-Hashes)");
     let local_rows = match hash_via {
         HashVia::Select => {
-            compute_row_hashes(&mut local_conn, &task.local_db, &task.local_table, &local_pks, chunk_mode, cfg.chunked, &diff_buckets, Some(&bar)).await?
+            compute_row_hashes(
+                &mut local_conn,
+                &task.local_db,
+                &task.local_table,
+                &local_pks,
+                chunk_mode,
+                cfg.chunked,
+                &diff_buckets,
+                Some(&bar),
+            )
+            .await?
         }
         HashVia::Dump => {
-            compute_row_hashes_via_export(cfg, &mut local_conn, task, &local_pks, &pk_names, chunk_mode, cfg.chunked, &diff_buckets, Some(&bar)).await?
+            compute_row_hashes_via_export(
+                cfg,
+                &mut local_conn,
+                task,
+                &local_pks,
+                &pk_names,
+                chunk_mode,
+                cfg.chunked,
+                &diff_buckets,
+                Some(&bar),
+            )
+            .await?
+        }
+        HashVia::RawBinary => {
+            compute_row_hashes_raw_binary(
+                &mut local_conn,
+                task,
+                &local_pks,
+                &pk_names,
+                chunk_mode,
+                cfg.chunked,
+                &diff_buckets,
+                cfg.hash_algo(),
+                Some(&bar),
+            )
+            .await?
+        }
+        HashVia::RawTsv => {
+            compute_row_hashes_raw_tsv(
+                cfg,
+                &mut local_conn,
+                task,
+                &local_pks,
+                &pk_names,
+                chunk_mode,
+                cfg.chunked,
+                &diff_buckets,
+                Some(&bar),
+            )
+            .await?
         }
     };
 
@@ -350,6 +641,8 @@ async fn run_inner(
             hash_of_chunk: false,
             buckets: Some(diff_buckets.clone()),
             hash_source: hash_via_source(hash_via),
+            profile: raw_profile.clone(),
+            schema_hash: schema_hash.clone(),
         },
         &f,
     )
@@ -389,7 +682,11 @@ async fn run_inner(
     }
 
     let examples: Vec<String> = {
-        let mut ex: Vec<String> = to_send.iter().take(check_examples as usize).cloned().collect();
+        let mut ex: Vec<String> = to_send
+            .iter()
+            .take(check_examples as usize)
+            .cloned()
+            .collect();
         for pk in to_delete.iter() {
             if ex.len() >= check_examples as usize {
                 break;
@@ -412,15 +709,39 @@ async fn run_inner(
 
     if !to_send.is_empty() {
         if cfg.disable_triggers {
-            proto::write_request(&mut send, &Request::DisableTriggers { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+            proto::write_request(
+                &mut send,
+                &Request::DisableTriggers {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
             expect_ok(&mut recv, &f, "DisableTriggers").await?;
         }
-        sent_total = send_changed_rows(cfg, &mut send, &mut recv, &mut local_conn, task, &local_pks, &hex_indexes, &local_info.columns, &to_send, &bar).await?;
+        sent_total = send_changed_rows(
+            cfg,
+            &mut send,
+            &mut recv,
+            &mut local_conn,
+            task,
+            &local_pks,
+            &hex_indexes,
+            &local_info.columns,
+            &to_send,
+            &bar,
+        )
+        .await?;
         if !to_delete.is_empty() {
             for chunk in to_delete.chunks(1000) {
                 proto::write_request(
                     &mut send,
-                    &Request::DeletePks { db: task.remote_db.clone(), table: task.remote_table.clone(), pks: chunk.to_vec() },
+                    &Request::DeletePks {
+                        db: task.remote_db.clone(),
+                        table: task.remote_table.clone(),
+                        pks: chunk.to_vec(),
+                    },
                     &f,
                 )
                 .await?;
@@ -430,14 +751,26 @@ async fn run_inner(
             }
         }
         if cfg.disable_triggers {
-            proto::write_request(&mut send, &Request::RestoreTriggers { db: task.remote_db.clone(), table: task.remote_table.clone() }, &f).await?;
+            proto::write_request(
+                &mut send,
+                &Request::RestoreTriggers {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
             expect_ok(&mut recv, &f, "RestoreTriggers").await?;
         }
     } else if !to_delete.is_empty() {
         for chunk in to_delete.chunks(1000) {
             proto::write_request(
                 &mut send,
-                &Request::DeletePks { db: task.remote_db.clone(), table: task.remote_table.clone(), pks: chunk.to_vec() },
+                &Request::DeletePks {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                    pks: chunk.to_vec(),
+                },
                 &f,
             )
             .await?;
@@ -448,7 +781,12 @@ async fn run_inner(
     }
 
     bar.done(&format!("{sent_total} gesendet, {deleted_total} gelöscht"));
-    Ok((sent_total, deleted_total, Some(to_send.len() as u64 + to_delete.len() as u64), examples))
+    Ok((
+        sent_total,
+        deleted_total,
+        Some(to_send.len() as u64 + to_delete.len() as u64),
+        examples,
+    ))
 }
 
 async fn read_response(recv: &mut RecvHalf, f: &Framing) -> Result<Response> {
@@ -484,7 +822,9 @@ fn push_row_hash_to_bucket(
     bucket: String,
     rh: &str,
 ) {
-    let e = acc.entry(bucket).or_insert_with(|| (hash::RowHasher::new(algo), 0));
+    let e = acc
+        .entry(bucket)
+        .or_insert_with(|| (hash::RowHasher::new(algo), 0));
     match hex::decode(rh) {
         Ok(bytes) => e.0.update(&bytes),
         Err(_) => e.0.update(rh.as_bytes()),
@@ -492,9 +832,7 @@ fn push_row_hash_to_bucket(
     e.1 += 1;
 }
 
-fn finish_chunks(
-    acc: HashMap<String, (hash::RowHasher, u64)>,
-) -> HashMap<String, (u64, String)> {
+fn finish_chunks(acc: HashMap<String, (hash::RowHasher, u64)>) -> HashMap<String, (u64, String)> {
     acc.into_iter()
         .map(|(b, (h, c))| {
             let final_hash = hash::finalize_chunk(&b, c, h);
@@ -629,6 +967,126 @@ async fn compute_row_hashes_via_export(
     Ok(out)
 }
 
+async fn compute_chunk_hashes_raw_binary(
+    conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    pk_names: &[String],
+    mode: ChunkMode,
+    chunked: u32,
+    algo: hash::HashAlgo,
+    bar: Option<&crate::progress::TableBar>,
+) -> Result<HashMap<String, (u64, String)>> {
+    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
+    let pk_indexes = pk_indexes_for(&names, pk_names)?;
+    hash_binary::chunk_hashes(
+        conn,
+        &task.local_db,
+        &task.local_table,
+        pks,
+        &pk_indexes,
+        mode,
+        chunked,
+        algo,
+        || {
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+        },
+    )
+    .await
+}
+
+async fn compute_row_hashes_raw_binary(
+    conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    pk_names: &[String],
+    mode: ChunkMode,
+    chunked: u32,
+    buckets: &[String],
+    algo: hash::HashAlgo,
+    bar: Option<&crate::progress::TableBar>,
+) -> Result<HashMap<String, String>> {
+    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
+    let pk_indexes = pk_indexes_for(&names, pk_names)?;
+    let items = hash_binary::row_hashes(
+        conn,
+        &task.local_db,
+        &task.local_table,
+        pks,
+        &pk_indexes,
+        mode,
+        chunked,
+        buckets,
+        algo,
+    )
+    .await?;
+    if let Some(b) = bar {
+        b.inc(items.len() as u64);
+    }
+    Ok(items.into_iter().map(|r| (r.pk, r.hash)).collect())
+}
+
+async fn compute_chunk_hashes_raw_tsv(
+    cfg: &Config,
+    conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    pk_names: &[String],
+    mode: ChunkMode,
+    chunked: u32,
+    bar: Option<&crate::progress::TableBar>,
+) -> Result<HashMap<String, (u64, String)>> {
+    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
+    let pk_indexes = pk_indexes_for(&names, pk_names)?;
+    hash_tsv::chunk_hashes(
+        cfg,
+        &task.local_db,
+        &task.local_table,
+        pks,
+        &pk_indexes,
+        mode,
+        chunked,
+        || {
+            if let Some(b) = bar {
+                b.inc(1);
+            }
+        },
+    )
+    .await
+}
+
+async fn compute_row_hashes_raw_tsv(
+    cfg: &Config,
+    conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    pk_names: &[String],
+    mode: ChunkMode,
+    chunked: u32,
+    buckets: &[String],
+    bar: Option<&crate::progress::TableBar>,
+) -> Result<HashMap<String, String>> {
+    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
+    let pk_indexes = pk_indexes_for(&names, pk_names)?;
+    let items = hash_tsv::row_hashes(
+        cfg,
+        &task.local_db,
+        &task.local_table,
+        pks,
+        &pk_indexes,
+        mode,
+        chunked,
+        buckets,
+    )
+    .await?;
+    if let Some(b) = bar {
+        b.inc(items.len() as u64);
+    }
+    Ok(items.into_iter().map(|r| (r.pk, r.hash)).collect())
+}
+
 /// Wenn die Tabelle binäre Spalten hat, wird CSV/TSV vermieden und mysqldump
 /// bevorzugt (hex/bit-sicher). Sonst möglichst Parser-Strategien (kein
 /// select-stream), damit der Transfer-Pfad wirklich getestet wird.
@@ -680,9 +1138,31 @@ async fn transfer_all_rows(
     // Binäre Spalten niemals über CSV/TSV übertragen — immer SQL-Dump-Pfad.
     let use_csv = cfg.allow_csv && hex_indexes.is_empty();
     if use_csv {
-        send_rows_csv(cfg, send, recv, local_conn, task, hex_indexes, columns, where_clause, bar).await
+        send_rows_csv(
+            cfg,
+            send,
+            recv,
+            local_conn,
+            task,
+            hex_indexes,
+            columns,
+            where_clause,
+            bar,
+        )
+        .await
     } else {
-        send_rows_dump(cfg, send, recv, local_conn, task, hex_indexes, columns, where_clause, bar).await
+        send_rows_dump(
+            cfg,
+            send,
+            recv,
+            local_conn,
+            task,
+            hex_indexes,
+            columns,
+            where_clause,
+            bar,
+        )
+        .await
     }
 }
 
@@ -755,7 +1235,11 @@ async fn send_rows_csv(
     match read_response(recv, &f).await? {
         Response::Ok { count: Some(n), .. } => {
             if n != count {
-                log::warn!("[{}.{}] Server importierte {n} Zeilen, Client erzeugte {count}", task.local_db, task.local_table);
+                log::warn!(
+                    "[{}.{}] Server importierte {n} Zeilen, Client erzeugte {count}",
+                    task.local_db,
+                    task.local_table
+                );
             }
         }
         Response::Ok { .. } => {}
@@ -781,7 +1265,10 @@ async fn send_rows_dump(
     let f = Framing::from_cfg(cfg);
     proto::write_request(
         send,
-        &Request::DumpBegin { db: task.remote_db.clone(), table: task.remote_table.clone() },
+        &Request::DumpBegin {
+            db: task.remote_db.clone(),
+            table: task.remote_table.clone(),
+        },
         &f,
     )
     .await?;
@@ -802,7 +1289,13 @@ async fn send_rows_dump(
             RowMsg::Row(values) => {
                 batch.push(values);
                 if batch.len() >= cfg.transfer_batch_rows.max(1) {
-                    let sql = export::rows_to_replace_sql(&task.remote_db, &task.remote_table, columns, &batch, hex_indexes);
+                    let sql = export::rows_to_replace_sql(
+                        &task.remote_db,
+                        &task.remote_table,
+                        columns,
+                        &batch,
+                        hex_indexes,
+                    );
                     proto::write_bulk(send, &sql, &f).await?;
                     count += batch.len() as u64;
                     bar.inc(batch.len() as u64);
@@ -821,7 +1314,13 @@ async fn send_rows_dump(
         bail!("Export fehlgeschlagen: {e}");
     }
     if !batch.is_empty() {
-        let sql = export::rows_to_replace_sql(&task.remote_db, &task.remote_table, columns, &batch, hex_indexes);
+        let sql = export::rows_to_replace_sql(
+            &task.remote_db,
+            &task.remote_table,
+            columns,
+            &batch,
+            hex_indexes,
+        );
         proto::write_bulk(send, &sql, &f).await?;
         count += batch.len() as u64;
         bar.inc(batch.len() as u64);
@@ -853,7 +1352,18 @@ async fn send_changed_rows(
     let mut sent = 0u64;
     for pk_chunk in to_send.chunks(cfg.transfer_batch_rows.max(1)) {
         let where_clause = mysqlutil::pk_in_where(pks, pk_chunk)?;
-        sent += transfer_all_rows(cfg, send, recv, local_conn, task, hex_indexes, columns, Some(&where_clause), bar).await?;
+        sent += transfer_all_rows(
+            cfg,
+            send,
+            recv,
+            local_conn,
+            task,
+            hex_indexes,
+            columns,
+            Some(&where_clause),
+            bar,
+        )
+        .await?;
     }
     Ok(sent)
 }
@@ -878,6 +1388,8 @@ async fn diff_and_report(
     check_examples: u32,
     bar: &crate::progress::TableBar,
     hash_via: HashVia,
+    raw_profile: Option<proto::MysqlProfile>,
+    schema_hash: Option<String>,
 ) -> Result<(u64, Vec<String>)> {
     let f = Framing::from_cfg(cfg);
     let pk_names: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
@@ -885,8 +1397,57 @@ async fn diff_and_report(
     let mode = hash::chunk_mode_for_pk(pks);
 
     let local_chunks = match hash_via {
-        HashVia::Select => compute_chunk_hashes(local_conn, &task.local_db, &task.local_table, pks, mode, chunked, Some(bar)).await?,
-        HashVia::Dump => compute_chunk_hashes_via_export(cfg, local_conn, task, pks, &pk_names, mode, chunked, Some(bar)).await?,
+        HashVia::Select => {
+            compute_chunk_hashes(
+                local_conn,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                mode,
+                chunked,
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::Dump => {
+            compute_chunk_hashes_via_export(
+                cfg,
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawBinary => {
+            compute_chunk_hashes_raw_binary(
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                cfg.hash_algo(),
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawTsv => {
+            compute_chunk_hashes_raw_tsv(
+                cfg,
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                Some(bar),
+            )
+            .await?
+        }
     };
 
     proto::write_request(
@@ -899,6 +1460,8 @@ async fn diff_and_report(
             hash_of_chunk: true,
             buckets: None,
             hash_source: hash_via_source(hash_via),
+            profile: raw_profile.clone(),
+            schema_hash: schema_hash.clone(),
         },
         &f,
     )
@@ -943,7 +1506,12 @@ async fn diff_and_report(
     let total_buckets = local_chunks.len().max(remote_chunks.len()).max(1) as u64;
     let est: u64 = diff_buckets
         .iter()
-        .map(|b| local_chunks.get(b).map(|(c, _)| *c).unwrap_or(remote_chunks.get(b).map(|r| r.count).unwrap_or(0)))
+        .map(|b| {
+            local_chunks
+                .get(b)
+                .map(|(c, _)| *c)
+                .unwrap_or(remote_chunks.get(b).map(|r| r.count).unwrap_or(0))
+        })
         .sum();
     let total_rows = local_info.count.max(1) as f64;
     let diff_pct = est as f64 * 100.0 / total_rows;
@@ -955,13 +1523,68 @@ async fn diff_and_report(
             diff_buckets.len(),
             tbl = task.local_table
         );
-        let examples = (0..check_examples.min(est as u32)).map(|i| format!("?#{i}")).collect();
+        let examples = (0..check_examples.min(est as u32))
+            .map(|i| format!("?#{i}"))
+            .collect();
         return Ok((est, examples));
     }
 
     let local_rows = match hash_via {
-        HashVia::Select => compute_row_hashes(local_conn, &task.local_db, &task.local_table, pks, mode, chunked, &diff_buckets, Some(bar)).await?,
-        HashVia::Dump => compute_row_hashes_via_export(cfg, local_conn, task, pks, &pk_names, mode, chunked, &diff_buckets, Some(bar)).await?,
+        HashVia::Select => {
+            compute_row_hashes(
+                local_conn,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                mode,
+                chunked,
+                &diff_buckets,
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::Dump => {
+            compute_row_hashes_via_export(
+                cfg,
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                &diff_buckets,
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawBinary => {
+            compute_row_hashes_raw_binary(
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                &diff_buckets,
+                cfg.hash_algo(),
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawTsv => {
+            compute_row_hashes_raw_tsv(
+                cfg,
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                &diff_buckets,
+                Some(bar),
+            )
+            .await?
+        }
     };
     proto::write_request(
         send,
@@ -973,6 +1596,8 @@ async fn diff_and_report(
             hash_of_chunk: false,
             buckets: Some(diff_buckets.clone()),
             hash_source: hash_via_source(hash_via),
+            profile: raw_profile.clone(),
+            schema_hash: schema_hash.clone(),
         },
         &f,
     )

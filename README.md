@@ -37,6 +37,8 @@ Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`.
 | `-C, --config FILE` | JSON config (required); `-` = stdin |
 | `--hash-via-select` | Grouped MD5 fingerprints computed in MySQL (default) |
 | `--hash-via-dump` | Diff hashes via export/parser (alias: `--check-via-dump`) |
+| `--hash-via-raw-binary` | Hash raw MySQL binary-protocol rows (alias: `--check-via-raw-binary`) |
+| `--hash-via-raw-tsv` | Hash raw `mysql --batch` TSV lines (alias: `--check-via-raw-tsv`) |
 | `--no-progress` | No progress bars (cron/CI) |
 | `--log-level LVL` | `error|warn|info|debug|trace` |
 
@@ -53,7 +55,27 @@ and sent.
 in Rust with `hash_algo` (xxh3 by default). Use it when that exact export/parser
 path must be exercised or special cases force `mysqldump`.
 
-- `hash_algo` controls dump/export mode only. Select mode always uses MySQL
+`--hash-via-raw-binary` reads prepared-statement result rows through a patched
+`mysql_async` `next_raw()` accessor and hashes the native binary row packet
+directly. It decodes only PK fields, and only when a differing bucket must be
+drilled down. This is the fastest path for clean scans and small diffs.
+
+`--hash-via-raw-tsv` starts `mysql --batch --quick --skip-column-names
+--default-character-set=utf8mb4` on each side and hashes each escaped output
+line. It avoids a second Rust row parser, but depends on an external `mysql`
+CLI and is slower than raw-binary.
+
+Raw modes are **fail-closed**:
+
+- The full session/server representation profile must match exactly: `VERSION()`,
+  `@@version_comment`, `@@version_compile_os`, `@@version_compile_machine`,
+  `character_set_client/connection/results`, `collation_connection`,
+  `time_zone`, and `sql_mode`. A mismatch is rejected; use select or dump.
+- The normalized schema hash must also match on both sides.
+- `raw-tsv` additionally rejects tables with binary columns and requires the
+  same `mysql` client behavior/version on both hosts. It does not fall back.
+
+- `hash_algo` controls dump/raw mode only. Select mode always uses MySQL
   `MD5`, because MySQL has no built-in xxh3/blake3. Client and server still need
   the same `hash_algo` because the Hello handshake validates it.
 - `--hash-via-select` avoids serializing/parsing rows, but MySQL `MD5` is slower
@@ -65,7 +87,7 @@ path must be exercised or special cases force `mysqldump`.
 - `xxh64`, `md5`, `sha256` are primarily for compatibility; not faster than
   xxh3 in dump mode.
 
-**Test environment (measurement 2026-10-28, current SQL-select implementation):**
+**Test environment (measurement 2026-10-29, all hash paths):**
 Apple M1 Ultra (20 cores, 64 GB), macOS, release build (`opt-level=2`).
 Client and server run natively on the host, MySQL 8.0 in Docker
 (`docker-compose.yml`, source `:3306`, target `:3317`). Dataset: synthetic
@@ -73,24 +95,23 @@ table `db_bench.big` with **100,000 rows** (id, VARCHAR MD5 string, INT,
 DATETIME), `chunked=3`, `--check 0`, median of 5 runs (full comparison
 including network and both sides).
 
-| Scenario | select (SQL MD5) | dump/export (Rust xxh3) |
-|---|---:|---:|
-| clean (0 diffs) | 876 ms | **251 ms** |
-| 10% of rows differ (10% of buckets) | 977 ms | **296 ms** |
-| target empty (100% diff) | 679 ms | **146 ms** |
+| Scenario | select (SQL MD5) | dump (Rust xxh3) | raw-binary | raw-tsv |
+|---|---:|---:|---:|---:|
+| clean (0 diffs) | 867 ms | 258 ms | **142 ms** | 555 ms |
+| 10% of rows differ (10% of buckets) | 980 ms | 303 ms | **164 ms** | 961 ms |
+| target empty (100% diff) | 679 ms | **147 ms** | 301 ms | 1096 ms |
 
-The dump path wins here, but not because CSV is cheap: this benchmark uses
-`select-stream`, so MySQL sends native rows to the Rust process and xxh3 hashes
-them. No CSV is written for `--check`; CSV is used only when `--sync` actually
-transfers changed rows (and binary columns force the SQL dump path). The cost
-difference is MySQL `MD5` plus per-row SQL canonicalization versus Rust `xxh3`.
+The dump path is fast because `select-stream` sends native rows to the Rust
+process and xxh3 hashes them. No CSV is written for `--check`; CSV is used only
+when `--sync` actually transfers changed rows (and binary columns force the SQL
+dump path). Raw-binary avoids building `Vec<Value>` and hashing text: it hashes
+the binary protocol packet directly and decodes only the PK fields it needs.
 
-A small diff does not automatically favor SQL select: the group phase still
-hashes every row on both sides. The diff percentage mainly affects the later
-row-hash and transfer phases. SQL select can win when shipping row bytes is
-expensive (very wide rows/BLOBs, remote source, slow link), because MySQL
-returns only grouped fingerprints. The numbers are indicative — reproduce them
-on your own hardware with `--check`.
+When the target is empty, every bucket differs, so the check performs a second
+row-hash pass over all rows. Raw-binary pays for two full scans, while select's
+row-hash query stays inside MySQL; raw-tsv additionally pays for the external
+`mysql` process and TSV escaping/unescaping per row. The numbers are
+indicative — reproduce them on your own hardware with `--check`.
 
 **Reproducing the benchmark** (test data is generated, not shipped):
 
@@ -119,17 +140,23 @@ WHERE n <= 100000;"
 mysql-sync -C .test-run/config-client.json --force --sync db_bench.big
 for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
 for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-binary db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-tsv db_bench.big; done
 
 # 3) repeat with ~10% differing rows on the target
 docker compose exec -T mysql-dst mysql -uroot -psyncroot -e \
   "UPDATE db_bench.big SET a=CONCAT(a,'-x') WHERE id <= 10000"
 for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
 for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-binary db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-tsv db_bench.big; done
 
 # 4) repeat with an empty target (100% diff)
 docker compose exec -T mysql-dst mysql -uroot -psyncroot -e "TRUNCATE db_bench.big"
 for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
 for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-binary db_bench.big; done
+for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-tsv db_bench.big; done
 ```
 
 All algorithms are compiled in by default (`blake3`, `xxhash`, `md5`, `sha2`).
@@ -257,9 +284,9 @@ working directory.
   every frame is compressed — no size threshold, no heuristics —
   `compression_level` 1–22 (default 3). Frames are self-describing, so each
   side may choose its own setting.
-- **Wire format v3**: `U<len>\n<body>` (uncompressed) or `C<len>\n<body>`
+- **Wire format v4**: `U<len>\n<body>` (uncompressed) or `C<len>\n<body>`
   (zstd), `<body>` = rkyv-serialized `Request`/`Response`; ALPN
-  `mysql-sync/3`. Client and server must be built from the same version.
+  `mysql-sync/4`. Client and server must be built from the same version.
 
 ## TRUST MODEL
 
@@ -285,8 +312,12 @@ mysql-sync -C config-client.json --check 10 --hash-via-dump "db1.t1"
 cat config-client.json | mysql-sync -C - --check 10 "db1.*"
 ```
 
-`--check-via-select` / `--check-via-dump` remain valid aliases for
-`--hash-via-select` / `--hash-via-dump`.
+`--check-via-select`, `--check-via-dump`, `--check-via-raw-binary`, and
+`--check-via-raw-tsv` remain valid aliases for their `--hash-via-*` forms.
+
+For `--sync`, put the selector directly after the flag (or after `--check N`).
+`--sync` accepts an optional selector; if another option sits between `--sync`
+and the selector, the default selector `*` is used.
 
 ## EXIT STATUS
 
@@ -300,12 +331,15 @@ MSYNC_DST_PORT=3317 docker compose up -d
 MSYNC_DST_PORT=3317 python3 test.py
 ```
 
-`test.py` covers 11 scenarios (schema, differential sync, drift with exact row
-counts, repair, force-recreate, SQL dump, select-/dump-based hashing, hash
-mismatch + blake3, zstd compression, plaintext TCP, automatic range chunking for
-numeric/CHAR/BINARY PKs, mod fallback for DATE/composite PKs, and rejection of
-tables without a PK) including binary poison
-data (`\0\0\0`, invalid UTF-8).
+`test.py` covers scenarios A–L with 69 checks: schema, differential sync, drift
+with exact row counts, repair, force-recreate, SQL dump, select/dump/raw-binary/
+raw-tsv hashing (clean, drift, sync, and chunked range/mod fallback), raw profile
+gating, raw-tsv rejection of binary columns, hash mismatch + blake3, zstd
+compression, plaintext TCP, automatic range chunking for numeric/CHAR/BINARY
+PKs, mod fallback for DATE/composite PKs, and rejection of tables without a PK
+— including binary poison data (`\0\0\0`, invalid UTF-8). Docker mode installs
+a temporary `mysql` wrapper in `.test-run/bin` so raw-tsv can scan through the
+containers.
 Without Docker: `MSYNC_LOCAL=1 MSYNC_SRC_PORT=… MSYNC_DST_PORT=… python3 test.py`.
 
 ## ALTERNATIVES
@@ -386,5 +420,6 @@ Differences from mysql-sync:
 ## SEE ALSO
 
 Source: `src/sync.rs` (diff engine), `src/sqlhash.rs` (SQL group/row hashes),
-`src/hash.rs` (Rust hashing/buckets), `src/export.rs` (export strategies),
-`src/server.rs` (target side).
+`src/hash.rs` (Rust hashing/buckets), `src/hash_binary.rs` (raw binary rows),
+`src/hash_tsv.rs` (raw TSV lines), `src/export.rs` (export strategies),
+`src/server.rs` (target side), `vendor/mysql_async` (patched `next_raw()`).

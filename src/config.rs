@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub const DEFAULT_QUIC_PORT: u16 = 4433;
-pub const PROTOCOL_VERSION: u32 = 3;
-pub const ALPN: &[u8] = b"mysql-sync/3";
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const ALPN: &[u8] = b"mysql-sync/4";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MysqlCfg {
@@ -76,7 +76,11 @@ where
     }
     match V::deserialize(deserializer)? {
         V::N(n) => Ok(n),
-        V::S(s) => s.trim().trim_end_matches('%').parse().map_err(serde::de::Error::custom),
+        V::S(s) => s
+            .trim()
+            .trim_end_matches('%')
+            .parse()
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -96,7 +100,12 @@ pub struct Config {
     pub dump_strategies: Vec<String>,
 
     /// Hash-Algorithmus für Chunk/Row-Hashes: xxh3, xxh64, blake3, md5, sha256 (default xxh3)
-    #[serde(default = "d_hash_algo", alias = "hash_algorithm", alias = "hash-algo", alias = "hash")]
+    #[serde(
+        default = "d_hash_algo",
+        alias = "hash_algorithm",
+        alias = "hash-algo",
+        alias = "hash"
+    )]
     pub hash_algo: String,
 
     /// MySQL-Verbindung (Quelle beim Client, Ziel beim Server)
@@ -117,7 +126,11 @@ pub struct Config {
 
     /// Zeilen pro Batch beim SQL-REPLACE-Transfer (kein Diff-Kurzschluss).
     /// Alter Name `dump_threshold` wird als Alias akzeptiert.
-    #[serde(default = "d_transfer_batch_rows", alias = "dump_batch_rows", alias = "dump_threshold")]
+    #[serde(
+        default = "d_transfer_batch_rows",
+        alias = "dump_batch_rows",
+        alias = "dump_threshold"
+    )]
     pub transfer_batch_rows: usize,
 
     /// Chunking-Groesse (1–6). Der Modus wird automatisch aus dem PK-Typ
@@ -132,7 +145,11 @@ pub struct Config {
     pub concurrent_processes: usize,
 
     /// Ab diesem Prozentanteil differierender Buckets: Vollkopie statt Drill-Down
-    #[serde(default = "d_percent10", alias = "diff_threshold_percent", deserialize_with = "de_percent")]
+    #[serde(
+        default = "d_percent10",
+        alias = "diff_threshold_percent",
+        deserialize_with = "de_percent"
+    )]
     pub diff_threshold_percent: f64,
 
     /// Zielseitige Umbenennung von Datenbanken: "db" -> "target_db"
@@ -210,7 +227,10 @@ impl Config {
             .clone()
             .context("Client-Config braucht \"server\": \"host:port\"")?;
         let addr = if let Some((h, p)) = raw.rsplit_once(':') {
-            format!("{h}:{}", p.parse::<u16>().context("Port im server-Feld ungültig")?)
+            format!(
+                "{h}:{}",
+                p.parse::<u16>().context("Port im server-Feld ungültig")?
+            )
         } else {
             format!("{raw}:{}", self.quic_port.unwrap_or(DEFAULT_QUIC_PORT))
         };
@@ -224,8 +244,7 @@ impl Config {
 
     pub fn listen_addr(&self) -> Result<std::net::SocketAddr> {
         let host = self.listen.clone().unwrap_or_else(|| "0.0.0.0".into());
-        Ok(format!("{}:{}", host, self.quic_port.unwrap_or(DEFAULT_QUIC_PORT))
-            .parse()?)
+        Ok(format!("{}:{}", host, self.quic_port.unwrap_or(DEFAULT_QUIC_PORT)).parse()?)
     }
 }
 

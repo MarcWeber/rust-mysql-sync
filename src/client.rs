@@ -5,9 +5,9 @@
 //! jeder Task nutzt einen eigenen QUIC-Stream (Multiplexing).
 
 use crate::config::Config;
+use crate::mysqlutil;
 use crate::selector::{map_remote, Selector};
 use crate::sync::{self, HashVia, Mode, TableResult, TableTask};
-use crate::mysqlutil;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -22,6 +22,8 @@ pub struct ClientArgs {
     pub no_progress: bool,
     pub hash_via_select: bool,
     pub hash_via_dump: bool,
+    pub hash_via_raw_binary: bool,
+    pub hash_via_raw_tsv: bool,
 }
 
 struct PlannedTask {
@@ -46,7 +48,8 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
     let dbs = mysqlutil::list_databases(&mut local_conn).await?;
 
     let mut planned: Vec<PlannedTask> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String, u8)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(String, String, u8)> =
+        std::collections::HashSet::new();
 
     let check_examples = args.check.unwrap_or(10);
 
@@ -76,7 +79,12 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
                 if !seen.insert((db.clone(), table.clone(), tag)) {
                     continue;
                 }
-                let (rdb, rtable) = map_remote(db, &table, &cfg.database_mappings, &cfg.database_table_mappings);
+                let (rdb, rtable) = map_remote(
+                    db,
+                    &table,
+                    &cfg.database_mappings,
+                    &cfg.database_table_mappings,
+                );
                 planned.push(PlannedTask {
                     task: TableTask {
                         local_db: db.clone(),
@@ -94,26 +102,94 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
         Ok(())
     }
 
-    let hash_via = if args.hash_via_dump { HashVia::Dump } else { HashVia::Select };
+    let hash_via = if args.hash_via_raw_tsv {
+        HashVia::RawTsv
+    } else if args.hash_via_raw_binary {
+        HashVia::RawBinary
+    } else if args.hash_via_dump {
+        HashVia::Dump
+    } else {
+        HashVia::Select
+    };
 
     // Reihenfolge: force-schema → (force+sync gemerged) → sync → check
     if args.force_schema.is_some() {
-        add_plan(true, args.force_schema.as_deref(), Mode::Force, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
+        add_plan(
+            true,
+            args.force_schema.as_deref(),
+            Mode::Force,
+            &dbs,
+            &cfg,
+            &mut planned,
+            &mut seen,
+            &mut local_conn,
+            check_examples,
+            hash_via,
+        )
+        .await?;
     }
     if args.force.is_some() && args.sync.is_some() {
         // --force --sync: EIN Task (Recreate + differentieller Abgleich in Sequence)
         let sel = args.sync.as_deref().or(args.force.as_deref());
-        add_plan(true, sel, Mode::Sync, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
+        add_plan(
+            true,
+            sel,
+            Mode::Sync,
+            &dbs,
+            &cfg,
+            &mut planned,
+            &mut seen,
+            &mut local_conn,
+            check_examples,
+            hash_via,
+        )
+        .await?;
     } else {
         if args.force.is_some() {
-            add_plan(true, args.force.as_deref(), Mode::Force, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
+            add_plan(
+                true,
+                args.force.as_deref(),
+                Mode::Force,
+                &dbs,
+                &cfg,
+                &mut planned,
+                &mut seen,
+                &mut local_conn,
+                check_examples,
+                hash_via,
+            )
+            .await?;
         }
         if args.sync.is_some() {
-            add_plan(false, args.sync.as_deref(), Mode::Sync, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
+            add_plan(
+                false,
+                args.sync.as_deref(),
+                Mode::Sync,
+                &dbs,
+                &cfg,
+                &mut planned,
+                &mut seen,
+                &mut local_conn,
+                check_examples,
+                hash_via,
+            )
+            .await?;
         }
     }
     if args.check.is_some() {
-        add_plan(false, args.selector.as_deref(), Mode::Check, &dbs, &cfg, &mut planned, &mut seen, &mut local_conn, check_examples, hash_via).await?;
+        add_plan(
+            false,
+            args.selector.as_deref(),
+            Mode::Check,
+            &dbs,
+            &cfg,
+            &mut planned,
+            &mut seen,
+            &mut local_conn,
+            check_examples,
+            hash_via,
+        )
+        .await?;
     }
 
     if planned.is_empty() {
@@ -195,7 +271,10 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
         return Ok(std::process::ExitCode::from(1));
     }
     // check: 0 = identisch, 1 = Unterschiede gefunden
-    if results.iter().any(|r| r.ok && r.mode == Mode::Check && r.differ_count.unwrap_or(0) > 0) {
+    if results
+        .iter()
+        .any(|r| r.ok && r.mode == Mode::Check && r.differ_count.unwrap_or(0) > 0)
+    {
         return Ok(std::process::ExitCode::from(1));
     }
     Ok(std::process::ExitCode::SUCCESS)

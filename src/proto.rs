@@ -11,8 +11,8 @@
 use crate::config::{Config, PROTOCOL_VERSION};
 use anyhow::{bail, Context, Result};
 use rkyv::rancor;
-use rkyv::{Archive, Deserialize, Serialize};
 use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Size of the `Bulk` frames during CSV/dump upload.
@@ -63,6 +63,50 @@ pub struct RowHash {
     pub hash: String,
 }
 
+/// Representation profile that must match exactly before raw row hashing is
+/// allowed. Raw fast paths hash bytes from the MySQL wire protocol, so any
+/// difference here can silently change the hashed representation.
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
+pub struct MysqlProfile {
+    pub version: String,
+    pub version_comment: String,
+    pub version_compile_os: String,
+    pub version_compile_machine: String,
+    pub character_set_client: String,
+    pub character_set_connection: String,
+    pub character_set_results: String,
+    pub collation_connection: String,
+    pub time_zone: String,
+    pub sql_mode: String,
+}
+
+impl MysqlProfile {
+    pub fn difference(&self, other: &MysqlProfile) -> Option<String> {
+        let mut diffs = Vec::new();
+        macro_rules! check {
+            ($field:ident, $name:literal) => {
+                if self.$field != other.$field {
+                    diffs.push(format!(
+                        "{}: client={:?}, server={:?}",
+                        $name, self.$field, other.$field
+                    ));
+                }
+            };
+        }
+        check!(version, "VERSION()");
+        check!(version_comment, "@@version_comment");
+        check!(version_compile_os, "@@version_compile_os");
+        check!(version_compile_machine, "@@version_compile_machine");
+        check!(character_set_client, "character_set_client");
+        check!(character_set_connection, "character_set_connection");
+        check!(character_set_results, "character_set_results");
+        check!(collation_connection, "collation_connection");
+        check!(time_zone, "time_zone");
+        check!(sql_mode, "sql_mode");
+        (!diffs.is_empty()).then(|| diffs.join("; "))
+    }
+}
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum Request {
     /// First request: auth + version + hash algorithm.
@@ -71,6 +115,8 @@ pub enum Request {
         token: Option<String>,
         hash_algo: Option<String>,
     },
+    /// Server MySQL version/profile. Used to gate byte-oriented raw hashing.
+    MysqlVersion {},
     DescribeCount {
         db: String,
         table: String,
@@ -92,8 +138,12 @@ pub enum Request {
         chunked: u32,
         hash_of_chunk: bool,
         buckets: Option<Vec<String>>,
-        /// "select" (default) or "dump" — source of rows for hashing.
+        /// "select" (default), "dump", "raw_binary" or "raw_tsv".
         hash_source: Option<String>,
+        /// Required for raw sources: exact client-side MySQL representation profile.
+        profile: Option<MysqlProfile>,
+        /// Required for raw sources: hash of normalized SHOW CREATE TABLE.
+        schema_hash: Option<String>,
     },
     DumpBegin {
         db: String,
@@ -142,6 +192,10 @@ pub enum Response {
         columns: Vec<String>,
         count: u64,
     },
+    MysqlVersion {
+        version: String,
+        profile: MysqlProfile,
+    },
     ChunkHashes {
         items: Vec<ChunkHash>,
     },
@@ -152,10 +206,15 @@ pub enum Response {
 
 impl Response {
     pub fn ok(msg: impl Into<String>) -> Response {
-        Response::Ok { message: msg.into(), count: None }
+        Response::Ok {
+            message: msg.into(),
+            count: None,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Response {
-        Response::Err { message: msg.into() }
+        Response::Err {
+            message: msg.into(),
+        }
     }
 }
 
@@ -249,8 +308,8 @@ where
     if first == b'U' {
         return Ok(Some(raw));
     }
-    let decompressed = zstd::bulk::decompress(&raw, f.max_decompressed)
-        .context("zstd decompress")?;
+    let decompressed =
+        zstd::bulk::decompress(&raw, f.max_decompressed).context("zstd decompress")?;
     let mut out = AlignedVec::with_capacity(decompressed.len());
     out.extend_from_slice(&decompressed);
     Ok(Some(out))
@@ -263,8 +322,7 @@ where
     match read_body(r, f).await? {
         None => Ok(None),
         Some(buf) => Ok(Some(
-            rkyv::from_bytes::<Request, rancor::Error>(&buf)
-                .context("Request-Binary ungültig")?,
+            rkyv::from_bytes::<Request, rancor::Error>(&buf).context("Request-Binary ungültig")?,
         )),
     }
 }
@@ -293,7 +351,14 @@ where
     }
     while !data.is_empty() {
         let n = data.len().min(BULK_FRAME_SIZE);
-        write_request(w, &Request::Bulk { data: data[..n].to_vec() }, f).await?;
+        write_request(
+            w,
+            &Request::Bulk {
+                data: data[..n].to_vec(),
+            },
+            f,
+        )
+        .await?;
         data = &data[n..];
     }
     Ok(())

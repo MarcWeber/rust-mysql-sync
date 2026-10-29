@@ -31,6 +31,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal", "derive"] }
+mysql_common = { version = "0.35", default-features = false }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,3 +49,6 @@ rand = "0.9"
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"
+
+[patch.crates-io]
+mysql_async = { path = "vendor/mysql_async" }

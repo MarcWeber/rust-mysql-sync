@@ -1040,6 +1040,7 @@ dependencies = [
  "log",
  "md-5",
  "mysql_async",
+ "mysql_common",
  "quinn",
  "rand 0.9.5",
  "rcgen",
@@ -1058,8 +1059,6 @@ dependencies = [
 [[package]]
 name = "mysql_async"
 version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1d9585dc9058886ff3a1f48a23024dd1d054264dee7c5ae0e4bd640c953bee5"
 dependencies = [
  "bytes",
  "crossbeam-queue",

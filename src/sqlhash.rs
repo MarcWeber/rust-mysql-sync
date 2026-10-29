@@ -40,7 +40,9 @@ fn date_expr(col: &str, column_type: &str) -> Option<String> {
     if ct == "date" {
         Some(format!("RIGHT(DATE_FORMAT({col}, '%Y-%m-%d'), {{N}})"))
     } else if ct.starts_with("datetime") || ct.starts_with("timestamp") {
-        Some(format!("RIGHT(DATE_FORMAT({col}, '%Y-%m-%d %H:%i:%s.%f'), {{N}})"))
+        Some(format!(
+            "RIGHT(DATE_FORMAT({col}, '%Y-%m-%d %H:%i:%s.%f'), {{N}})"
+        ))
     } else {
         None
     }
@@ -74,8 +76,16 @@ pub fn bucket_expr(pks: &[PkCol], mode: ChunkMode, chunked: u32) -> Result<Strin
             let col = mysqlutil::quote_ident(&pk.name);
             match pk.kind {
                 PkKind::Int | PkKind::UInt => {
-                    let ty = if pk.kind == PkKind::UInt { "UNSIGNED" } else { "SIGNED" };
-                    Ok(format!("CAST(CAST(FLOOR({col} / {}) * {} AS {ty}) AS CHAR)", width(n), width(n)))
+                    let ty = if pk.kind == PkKind::UInt {
+                        "UNSIGNED"
+                    } else {
+                        "SIGNED"
+                    };
+                    Ok(format!(
+                        "CAST(CAST(FLOOR({col} / {}) * {} AS {ty}) AS CHAR)",
+                        width(n),
+                        width(n)
+                    ))
                 }
                 PkKind::Char => Ok(text_expr(&format!(
                     "LEFT({col}, GREATEST(CHAR_LENGTH({col}) - {n}, 0))"
@@ -94,7 +104,10 @@ pub fn bucket_expr(pks: &[PkCol], mode: ChunkMode, chunked: u32) -> Result<Strin
             if pk.numeric {
                 Ok(numeric_mod_expr(&col, n))
             } else if pk.column_type.eq_ignore_ascii_case("time") {
-                Ok(text_expr(&format!("RIGHT({}, {n})", time_component_expr(&col))))
+                Ok(text_expr(&format!(
+                    "RIGHT({}, {n})",
+                    time_component_expr(&col)
+                )))
             } else if let Some(expr) = date_expr(&col, &pk.column_type) {
                 Ok(text_expr(&expr.replace("{N}", &n.to_string())))
             } else {
@@ -201,9 +214,16 @@ pub async fn chunk_hashes(
     let columns = mysqlutil::column_names(conn, db, table).await?;
     let sql = group_query(db, table, pks, &columns, mode, chunked)?;
     log::debug!("SQL group hashes: {sql}");
-    let mut result = conn.query_iter(&sql).await.context("SQL-Gruppen-Hashes fehlgeschlagen")?;
+    let mut result = conn
+        .query_iter(&sql)
+        .await
+        .context("SQL-Gruppen-Hashes fehlgeschlagen")?;
     let mut out = HashMap::new();
-    while let Some(row) = result.next().await.context("Fehler beim Lesen der Gruppen-Hashes")? {
+    while let Some(row) = result
+        .next()
+        .await
+        .context("Fehler beim Lesen der Gruppen-Hashes")?
+    {
         let (bucket, count, hash): (String, u64, String) = mysql_async::from_row(row);
         out.insert(bucket, (count, hash));
     }
@@ -222,9 +242,16 @@ pub async fn row_hashes(
     let columns = mysqlutil::column_names(conn, db, table).await?;
     let sql = row_query(db, table, pks, &columns, mode, chunked, buckets)?;
     log::debug!("SQL row hashes: {sql}");
-    let mut result = conn.query_iter(&sql).await.context("SQL-Zeilen-Hashes fehlgeschlagen")?;
+    let mut result = conn
+        .query_iter(&sql)
+        .await
+        .context("SQL-Zeilen-Hashes fehlgeschlagen")?;
     let mut out = Vec::new();
-    while let Some(row) = result.next().await.context("Fehler beim Lesen der Zeilen-Hashes")? {
+    while let Some(row) = result
+        .next()
+        .await
+        .context("Fehler beim Lesen der Zeilen-Hashes")?
+    {
         let (pk, bucket, hash): (String, String, String) = mysql_async::from_row(row);
         out.push(SqlRowHash { bucket, pk, hash });
     }

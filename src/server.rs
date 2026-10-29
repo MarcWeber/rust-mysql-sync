@@ -8,6 +8,8 @@
 use crate::config::Config;
 use crate::export;
 use crate::hash;
+use crate::hash_binary;
+use crate::hash_tsv;
 use crate::import::{self, TsvBatcher};
 use crate::mysqlutil::{self, qualified};
 use crate::proto::{self, Framing, Request, Response};
@@ -26,6 +28,30 @@ use tokio::net::TcpListener;
 const MAX_BUCKETS_PER_BATCH: usize = 512;
 const MAX_ROWHASHES_PER_BATCH: usize = 1024;
 const MAX_DUMP_BUFFER: u64 = 2 * 1024 * 1024 * 1024; // 2 GB Guard
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashSource {
+    Select,
+    Dump,
+    RawBinary,
+    RawTsv,
+}
+
+impl HashSource {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("select").to_ascii_lowercase().as_str() {
+            "" | "select" => Ok(HashSource::Select),
+            "dump" => Ok(HashSource::Dump),
+            "raw_binary" | "raw-binary" | "binary" => Ok(HashSource::RawBinary),
+            "raw_tsv" | "raw-tsv" | "tsv" => Ok(HashSource::RawTsv),
+            other => anyhow::bail!("Unbekannte hash_source: {other}"),
+        }
+    }
+
+    fn is_raw(self) -> bool {
+        matches!(self, HashSource::RawBinary | HashSource::RawTsv)
+    }
+}
 
 pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::process::ExitCode> {
     // Bei Config von stdin gibt es keinen Dateinamen; Zertifikate landen dann
@@ -81,12 +107,13 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
         .context("TLS-Zertifikat/Key ungültig")?;
     server_crypto.alpn_protocols = vec![crate::config::ALPN.to_vec()];
 
-    let quinn_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut quinn_cfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .context("QUIC-TLS-Konfiguration")?,
     ));
-    let endpoint =
-        quinn::Endpoint::server(quinn_cfg, addr).with_context(|| format!("QUIC-Listener auf {addr}"))?;
+    quinn_cfg.transport_config(Arc::new(crate::transport::quic_transport()?));
+    let endpoint = quinn::Endpoint::server(quinn_cfg, addr)
+        .with_context(|| format!("QUIC-Listener auf {addr}"))?;
 
     eprintln!("mysql-sync Server lauscht auf {addr} (quic/tls)");
     eprintln!("TLS-Fingerprint: {fingerprint}");
@@ -139,8 +166,18 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>) -> Result<
 
 enum Mode {
     Normal,
-    Dump { db: String, table: String, buf: Vec<u8> },
-    Csv { db: String, table: String, batcher: TsvBatcher, counter: u64, err: Option<String> },
+    Dump {
+        db: String,
+        table: String,
+        buf: Vec<u8>,
+    },
+    Csv {
+        db: String,
+        table: String,
+        batcher: TsvBatcher,
+        counter: u64,
+        err: Option<String>,
+    },
 }
 
 async fn handle_stream(
@@ -183,13 +220,20 @@ async fn handle_stream(
                     }
                     _ => {
                         let _ = (db, table);
-                        send_response(&mut send, Response::err("Erwartet Bulk/DumpEnd"), &f).await?;
+                        send_response(&mut send, Response::err("Erwartet Bulk/DumpEnd"), &f)
+                            .await?;
                         mode = Mode::Normal;
                     }
                 }
                 continue;
             }
-            Mode::Csv { db, table, batcher, counter, err } => {
+            Mode::Csv {
+                db,
+                table,
+                batcher,
+                counter,
+                err,
+            } => {
                 match req {
                     Request::Bulk { data } => {
                         if err.is_none() {
@@ -198,7 +242,15 @@ async fn handle_stream(
                                     if !rows.is_empty() {
                                         match mysqlutil::session_conn(&state.pool).await {
                                             Ok(mut conn) => {
-                                                match import::import_rows(&mut conn, db, table, &batcher.columns, rows).await {
+                                                match import::import_rows(
+                                                    &mut conn,
+                                                    db,
+                                                    table,
+                                                    &batcher.columns,
+                                                    rows,
+                                                )
+                                                .await
+                                                {
                                                     Ok(n) => *counter += n,
                                                     Err(e) => *err = Some(format!("{e:#}")),
                                                 }
@@ -218,10 +270,21 @@ async fn handle_stream(
                         } else {
                             let rows = batcher.finish()?;
                             match mysqlutil::session_conn(&state.pool).await {
-                                Ok(mut conn) => match import::import_rows(&mut conn, db, table, &batcher.columns, rows).await {
+                                Ok(mut conn) => match import::import_rows(
+                                    &mut conn,
+                                    db,
+                                    table,
+                                    &batcher.columns,
+                                    rows,
+                                )
+                                .await
+                                {
                                     Ok(n) => {
                                         *counter += n;
-                                        Response::Ok { message: "csv imported".into(), count: Some(*counter) }
+                                        Response::Ok {
+                                            message: "csv imported".into(),
+                                            count: Some(*counter),
+                                        }
                                     }
                                     Err(e) => Response::err(format!("{e:#}")),
                                 },
@@ -250,28 +313,51 @@ async fn handle_stream(
 
         let is_hello = matches!(req, Request::Hello { .. });
         if !is_hello && !hello_done.load(Ordering::SeqCst) {
-            send_response(&mut send, Response::err("Erster Request muss Hello sein (Auth)"), &f).await?;
+            send_response(
+                &mut send,
+                Response::err("Erster Request muss Hello sein (Auth)"),
+                &f,
+            )
+            .await?;
             return Ok(());
         }
 
         let resp = match req {
-            Request::Hello { version, token, hash_algo } => {
+            Request::Hello {
+                version,
+                token,
+                hash_algo,
+            } => {
                 let r = handle_hello(state.as_ref(), version, &token, hash_algo.as_deref()).await;
                 if matches!(r, Response::Ok { .. }) {
                     hello_done.store(true, Ordering::SeqCst);
                 }
                 r
             }
+            Request::MysqlVersion {} => handle_mysql_version(state.as_ref()).await,
             Request::DescribeCount { db, table } => {
                 handle_describe_count(state.as_ref(), &db, &table).await
             }
-            Request::Recreate { db, sql } => {
-                handle_recreate(state.as_ref(), &db, &sql).await
-            }
-            Request::Truncate { db, table } => {
-                handle_truncate(state.as_ref(), &db, &table).await
-            }
-            Request::Hashes { db, table, primary_keys, chunked, hash_of_chunk, buckets, hash_source } => {
+            Request::Recreate { db, sql } => handle_recreate(state.as_ref(), &db, &sql).await,
+            Request::Truncate { db, table } => handle_truncate(state.as_ref(), &db, &table).await,
+            Request::Hashes {
+                db,
+                table,
+                primary_keys,
+                chunked,
+                hash_of_chunk,
+                buckets,
+                hash_source,
+                profile,
+                schema_hash,
+            } => {
+                let source = match HashSource::parse(hash_source.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        send_response(&mut send, Response::err(format!("{e:#}")), &f).await?;
+                        return Ok(());
+                    }
+                };
                 // Streaming: writes all responses including the final one itself
                 if let Err(e) = do_hashes(
                     state.as_ref(),
@@ -281,7 +367,9 @@ async fn handle_stream(
                     chunked,
                     hash_of_chunk,
                     buckets,
-                    hash_source.as_deref() == Some("dump"),
+                    source,
+                    profile,
+                    schema_hash,
                     &mut send,
                     &f,
                 )
@@ -293,17 +381,35 @@ async fn handle_stream(
                 continue;
             }
             Request::DumpBegin { db, table } => {
-                mode = Mode::Dump { db, table, buf: Vec::new() };
+                mode = Mode::Dump {
+                    db,
+                    table,
+                    buf: Vec::new(),
+                };
                 continue;
             }
-            Request::CsvBegin { db, table, columns, hex_columns } => {
-                mode = Mode::Csv { db, table, batcher: TsvBatcher::new(columns, &hex_columns), counter: 0, err: None };
+            Request::CsvBegin {
+                db,
+                table,
+                columns,
+                hex_columns,
+            } => {
+                mode = Mode::Csv {
+                    db,
+                    table,
+                    batcher: TsvBatcher::new(columns, &hex_columns),
+                    counter: 0,
+                    err: None,
+                };
                 continue;
             }
             Request::DeletePks { db, table, pks } => {
                 match mysqlutil::session_conn(&state.pool).await {
                     Ok(mut conn) => match import::delete_pks(&mut conn, &db, &table, &pks).await {
-                        Ok(n) => Response::Ok { message: format!("deleted {n}"), count: Some(n) },
+                        Ok(n) => Response::Ok {
+                            message: format!("deleted {n}"),
+                            count: Some(n),
+                        },
                         Err(e) => Response::err(format!("{e:#}")),
                     },
                     Err(e) => Response::err(format!("{e:#}")),
@@ -311,18 +417,22 @@ async fn handle_stream(
             }
             Request::DisableTriggers { db, table } => {
                 match mysqlutil::session_conn(&state.pool).await {
-                    Ok(mut conn) => match import::snapshot_and_drop_triggers(&mut conn, &db, &table).await {
-                        Ok(defs) => {
-                            trigger_backup.insert((db.clone(), table.clone()), defs);
-                            Response::ok("triggers disabled")
+                    Ok(mut conn) => {
+                        match import::snapshot_and_drop_triggers(&mut conn, &db, &table).await {
+                            Ok(defs) => {
+                                trigger_backup.insert((db.clone(), table.clone()), defs);
+                                Response::ok("triggers disabled")
+                            }
+                            Err(e) => Response::err(format!("{e:#}")),
                         }
-                        Err(e) => Response::err(format!("{e:#}")),
-                    },
+                    }
                     Err(e) => Response::err(format!("{e:#}")),
                 }
             }
             Request::RestoreTriggers { db, table } => {
-                let defs = trigger_backup.remove(&(db.clone(), table.clone())).unwrap_or_default();
+                let defs = trigger_backup
+                    .remove(&(db.clone(), table.clone()))
+                    .unwrap_or_default();
                 match mysqlutil::session_conn(&state.pool).await {
                     Ok(mut conn) => match import::restore_triggers(&mut conn, &db, &defs).await {
                         Ok(()) => Response::ok("triggers restored"),
@@ -346,7 +456,10 @@ async fn handle_stream(
 
 fn buf_len_guard(buf: &Vec<u8>) -> Result<()> {
     if buf.len() as u64 > MAX_DUMP_BUFFER {
-        anyhow::bail!("Dump-Buffer überschritten ({} Bytes Limit)", MAX_DUMP_BUFFER);
+        anyhow::bail!(
+            "Dump-Buffer überschritten ({} Bytes Limit)",
+            MAX_DUMP_BUFFER
+        );
     }
     Ok(())
 }
@@ -399,6 +512,19 @@ async fn handle_describe_count(state: &ServerState, db: &str, table: &str) -> Re
     }
 }
 
+async fn handle_mysql_version(state: &ServerState) -> Response {
+    match mysqlutil::session_conn(&state.pool).await {
+        Ok(mut conn) => match mysqlutil::mysql_profile(&mut conn).await {
+            Ok(profile) => Response::MysqlVersion {
+                version: profile.version.clone(),
+                profile,
+            },
+            Err(e) => Response::err(format!("{e:#}")),
+        },
+        Err(e) => Response::err(format!("{e:#}")),
+    }
+}
+
 async fn handle_recreate(state: &ServerState, db: &str, sql: &str) -> Response {
     match mysqlutil::session_conn(&state.pool).await {
         Ok(mut conn) => {
@@ -414,10 +540,15 @@ async fn handle_recreate(state: &ServerState, db: &str, sql: &str) -> Response {
                 ))
                 .await
                 .context("CREATE DATABASE fehlgeschlagen")?;
-                conn.query_drop(format!("DROP TABLE IF EXISTS {}", qualified(db, &target_table)))
+                conn.query_drop(format!(
+                    "DROP TABLE IF EXISTS {}",
+                    qualified(db, &target_table)
+                ))
+                .await
+                .context("DROP TABLE fehlgeschlagen")?;
+                conn.query_drop(qualified_sql)
                     .await
-                    .context("DROP TABLE fehlgeschlagen")?;
-                conn.query_drop(qualified_sql).await.context("CREATE TABLE fehlgeschlagen")?;
+                    .context("CREATE TABLE fehlgeschlagen")?;
                 Ok(())
             }
             .await;
@@ -434,16 +565,25 @@ async fn handle_recreate(state: &ServerState, db: &str, sql: &str) -> Response {
 ///   "CREATE TABLE `t` (…)" → "CREATE TABLE `db`.`t` (…)"
 fn rewrite_create_table(sql: &str, db: &str, table: &str) -> String {
     let lower = sql.to_lowercase();
-    let Some(pos) = lower.find("table") else { return sql.to_string() };
+    let Some(pos) = lower.find("table") else {
+        return sql.to_string();
+    };
     let rest = sql[pos + 5..].trim_start();
     let rest = if rest.to_lowercase().starts_with("if not exists") {
         rest[13..].trim_start()
     } else {
         rest
     };
-    let Some(paren) = rest.find('(') else { return sql.to_string() };
+    let Some(paren) = rest.find('(') else {
+        return sql.to_string();
+    };
     // Kopf ("CREATE ") + "TABLE " + qualifizierter Name + Spaltenteil ab "("
-    format!("{}TABLE {}{}", &sql[..pos], qualified(db, table), &rest[paren..])
+    format!(
+        "{}TABLE {}{}",
+        &sql[..pos],
+        qualified(db, table),
+        &rest[paren..]
+    )
 }
 
 /// Tabellennamen aus einem CREATE TABLE Statement extrahieren
@@ -458,7 +598,10 @@ fn table_name_of_create(sql: &str) -> String {
         } else {
             rest
         };
-        let token: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != '(').collect();
+        let token: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
         return token.trim_matches('`').to_string();
     }
     String::new()
@@ -468,9 +611,13 @@ async fn handle_truncate(state: &ServerState, db: &str, table: &str) -> Response
     match mysqlutil::session_conn(&state.pool).await {
         Ok(mut conn) => {
             let r: Result<()> = async {
-                if let Err(e) = conn.query_drop(format!("TRUNCATE TABLE {}", qualified(db, table))).await {
+                if let Err(e) = conn
+                    .query_drop(format!("TRUNCATE TABLE {}", qualified(db, table)))
+                    .await
+                {
                     log::warn!("TRUNCATE fehlgeschlagen ({e}) — versuche DELETE FROM");
-                    conn.query_drop(format!("DELETE FROM {}", qualified(db, table))).await?;
+                    conn.query_drop(format!("DELETE FROM {}", qualified(db, table)))
+                        .await?;
                 }
                 Ok(())
             }
@@ -486,7 +633,11 @@ async fn handle_truncate(state: &ServerState, db: &str, table: &str) -> Response
 
 /// Wie check_export_strategies auf Client-Seite: binäre Spalten → mysqldump,
 /// sonst möglichst Parser-Strategien.
-async fn server_export_strategies(state: &ServerState, db: &str, table: &str) -> Result<Vec<String>> {
+async fn server_export_strategies(
+    state: &ServerState,
+    db: &str,
+    table: &str,
+) -> Result<Vec<String>> {
     let mut conn = mysqlutil::session_conn(&state.pool).await?;
     let configured = state.cfg.strategies();
     let bin = mysqlutil::binary_column_indexes(&mut conn, db, table).await?;
@@ -551,14 +702,21 @@ async fn do_hashes(
     chunked: u32,
     hash_of_chunk: bool,
     buckets: Option<Vec<String>>,
-    use_dump: bool,
+    source: HashSource,
+    profile: Option<proto::MysqlProfile>,
+    schema_hash: Option<String>,
     send: &mut SendHalf,
     f: &Framing,
 ) -> Result<()> {
     let mut conn = mysqlutil::session_conn(&state.pool).await?;
     let pk_meta = mysqlutil::pk_columns(&mut conn, db, table).await?;
     if pk_meta.is_empty() {
-        send_response(send, Response::err(format!("{db}.{table} hat keinen Primary Key")), f).await?;
+        send_response(
+            send,
+            Response::err(format!("{db}.{table} hat keinen Primary Key")),
+            f,
+        )
+        .await?;
         return Ok(());
     }
     let server_pks: Vec<String> = pk_meta.iter().map(|p| p.name.clone()).collect();
@@ -574,6 +732,62 @@ async fn do_hashes(
         return Ok(());
     }
     let mode = hash::chunk_mode_for_pk(&pk_meta);
+
+    if source.is_raw() {
+        let client_profile = match profile {
+            Some(p) => p,
+            None => {
+                send_response(
+                    send,
+                    Response::err("Raw-Hashing braucht ein MySQL-Profil"),
+                    f,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let server_profile = mysqlutil::mysql_profile(&mut conn).await?;
+        if let Some(diff) = client_profile.difference(&server_profile) {
+            send_response(
+                send,
+                Response::err(format!(
+                    "Raw-Hashing abgelehnt — MySQL-Profil weicht ab: {diff}"
+                )),
+                f,
+            )
+            .await?;
+            return Ok(());
+        }
+        let target_schema = hash::hash_bytes(
+            mysqlutil::normalize_schema(&mysqlutil::create_sql(&mut conn, db, table).await?)
+                .as_bytes(),
+            state.cfg.hash_algo(),
+        );
+        if schema_hash.as_deref() != Some(target_schema.as_str()) {
+            send_response(
+                send,
+                Response::err("Raw-Hashing abgelehnt — Schema-Hash weicht ab"),
+                f,
+            )
+            .await?;
+            return Ok(());
+        }
+        if source == HashSource::RawTsv {
+            let binary = mysqlutil::binary_column_indexes(&mut conn, db, table).await?;
+            if !binary.is_empty() {
+                send_response(
+                    send,
+                    Response::err(format!(
+                        "raw-tsv unterstützt keine binären Spalten (Indizes {binary:?})"
+                    )),
+                    f,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
     let names = mysqlutil::column_names(&mut conn, db, table).await?;
     let mut pk_indexes = Vec::new();
     for pk in &primary_keys {
@@ -590,20 +804,129 @@ async fn do_hashes(
     let chunked_c = chunked.clamp(1, 6);
 
     if hash_of_chunk {
-        if !use_dump {
-            let acc = sqlhash::chunk_hashes(&mut conn, db, table, &pk_meta, mode, chunked_c).await?;
+        if source == HashSource::RawBinary {
+            let acc = hash_binary::chunk_hashes(
+                &mut conn,
+                db,
+                table,
+                &pk_meta,
+                &pk_indexes,
+                mode,
+                chunked_c,
+                state.cfg.hash_algo(),
+                || {},
+            )
+            .await?;
             let mut items: Vec<proto::ChunkHash> = acc
                 .into_iter()
                 .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
-                .map(|(bucket, (count, hash))| proto::ChunkHash { bucket, hash, count })
+                .map(|(bucket, (count, hash))| proto::ChunkHash {
+                    bucket,
+                    hash,
+                    count,
+                })
+                .collect();
+            items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+            let total = items.len();
+            for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
+                proto::write_response(
+                    send,
+                    &Response::ChunkHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
+            }
+            send_response(
+                send,
+                Response::Ok {
+                    message: format!("{total} buckets"),
+                    count: Some(total as u64),
+                },
+                f,
+            )
+            .await?;
+            return Ok(());
+        }
+        if source == HashSource::RawTsv {
+            let acc = hash_tsv::chunk_hashes(
+                &state.cfg,
+                db,
+                table,
+                &pk_meta,
+                &pk_indexes,
+                mode,
+                chunked_c,
+                || {},
+            )
+            .await?;
+            let mut items: Vec<proto::ChunkHash> = acc
+                .into_iter()
+                .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
+                .map(|(bucket, (count, hash))| proto::ChunkHash {
+                    bucket,
+                    hash,
+                    count,
+                })
+                .collect();
+            items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+            let total = items.len();
+            for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
+                proto::write_response(
+                    send,
+                    &Response::ChunkHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
+            }
+            send_response(
+                send,
+                Response::Ok {
+                    message: format!("{total} buckets"),
+                    count: Some(total as u64),
+                },
+                f,
+            )
+            .await?;
+            return Ok(());
+        }
+        if source != HashSource::Dump {
+            let acc =
+                sqlhash::chunk_hashes(&mut conn, db, table, &pk_meta, mode, chunked_c).await?;
+            let mut items: Vec<proto::ChunkHash> = acc
+                .into_iter()
+                .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
+                .map(|(bucket, (count, hash))| proto::ChunkHash {
+                    bucket,
+                    hash,
+                    count,
+                })
                 .collect();
             items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
             log::info!("[{db}.{table}] {} SQL-Bucket-Hashes berechnet", items.len());
             let total = items.len();
             for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
-                proto::write_response(send, &Response::ChunkHashes { items: chunk.to_vec() }, f).await?;
+                proto::write_response(
+                    send,
+                    &Response::ChunkHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
             }
-            send_response(send, Response::Ok { message: format!("{total} buckets"), count: Some(total as u64) }, f).await?;
+            send_response(
+                send,
+                Response::Ok {
+                    message: format!("{total} buckets"),
+                    count: Some(total as u64),
+                },
+                f,
+            )
+            .await?;
             return Ok(());
         }
         // Ein Scan über die Tabelle; pro Bucket Hasher + Count.
@@ -611,22 +934,25 @@ async fn do_hashes(
         let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
         let mut row_err: Option<anyhow::Error> = None;
         let mut add_row = |values: &[Value]| {
-            let bucket = match hash::chunk_key_for_row(values, &pk_indexes, &pk_meta, mode, chunked_c) {
-                Ok(b) => b,
-                Err(e) => {
-                    row_err = Some(e);
-                    return;
-                }
-            };
+            let bucket =
+                match hash::chunk_key_for_row(values, &pk_indexes, &pk_meta, mode, chunked_c) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        row_err = Some(e);
+                        return;
+                    }
+                };
             let rh = hash::row_hash(values, algo);
-            let e = acc.entry(bucket).or_insert_with(|| (hash::RowHasher::new(algo), 0));
+            let e = acc
+                .entry(bucket)
+                .or_insert_with(|| (hash::RowHasher::new(algo), 0));
             match hex::decode(&rh) {
                 Ok(bytes) => e.0.update(&bytes),
                 Err(_) => e.0.update(rh.as_bytes()),
             }
             e.1 += 1;
         };
-        if use_dump {
+        if source == HashSource::Dump {
             let order = mysqlutil::order_by(&pk_meta);
             export_for_each_row(state, db, table, None, Some(order), &mut add_row).await?;
         } else {
@@ -646,7 +972,11 @@ async fn do_hashes(
             .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
             .map(|(b, (h, c))| {
                 let final_hash = hash::finalize_chunk(&b, c, h);
-                proto::ChunkHash { bucket: b, hash: final_hash, count: c }
+                proto::ChunkHash {
+                    bucket: b,
+                    hash: final_hash,
+                    count: c,
+                }
             })
             .collect();
         items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
@@ -654,33 +984,109 @@ async fn do_hashes(
 
         let total = items.len();
         for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
-            proto::write_response(send, &Response::ChunkHashes { items: chunk.to_vec() }, f).await?;
+            proto::write_response(
+                send,
+                &Response::ChunkHashes {
+                    items: chunk.to_vec(),
+                },
+                f,
+            )
+            .await?;
         }
         send_response(
             send,
-            Response::Ok { message: format!("{total} buckets"), count: Some(total as u64) },
+            Response::Ok {
+                message: format!("{total} buckets"),
+                count: Some(total as u64),
+            },
             f,
         )
         .await?;
     } else {
         // Zeilen-Hashes für bestimmte Buckets — Keyset-Paginierung über PK,
         // damit der Speicher begrenzt bleibt (Page für Page, Schreiben dazwischen).
-        let bucket_list: Vec<String> =
-            filter.as_ref().map(|f| f.iter().cloned().collect()).unwrap_or_default();
+        let bucket_list: Vec<String> = filter
+            .as_ref()
+            .map(|f| f.iter().cloned().collect())
+            .unwrap_or_default();
         let bucket_filter = if bucket_list.is_empty() {
             None
         } else {
-            Some(mysqlutil::chunk_where(&pk_meta, mode, chunked_c, &bucket_list)?)
+            Some(mysqlutil::chunk_where(
+                &pk_meta,
+                mode,
+                chunked_c,
+                &bucket_list,
+            )?)
         };
         let names = mysqlutil::column_names(&mut conn, db, table).await?;
 
-        if !use_dump {
+        if source == HashSource::RawBinary {
+            let rows = hash_binary::row_hashes(
+                &mut conn,
+                db,
+                table,
+                &pk_meta,
+                &pk_indexes,
+                mode,
+                chunked_c,
+                &bucket_list,
+                state.cfg.hash_algo(),
+            )
+            .await?;
+            for chunk in rows.chunks(MAX_ROWHASHES_PER_BATCH) {
+                proto::write_response(
+                    send,
+                    &Response::RowHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
+            }
+            send_response(send, Response::ok("row hashes done"), f).await?;
+            return Ok(());
+        }
+
+        if source == HashSource::RawTsv {
+            let rows = hash_tsv::row_hashes(
+                &state.cfg,
+                db,
+                table,
+                &pk_meta,
+                &pk_indexes,
+                mode,
+                chunked_c,
+                &bucket_list,
+            )
+            .await?;
+            for chunk in rows.chunks(MAX_ROWHASHES_PER_BATCH) {
+                proto::write_response(
+                    send,
+                    &Response::RowHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
+            }
+            send_response(send, Response::ok("row hashes done"), f).await?;
+            return Ok(());
+        }
+
+        if source != HashSource::Dump {
             let selected = filter.as_ref().map(|_| bucket_list.as_slice());
-            let rows = sqlhash::row_hashes(&mut conn, db, table, &pk_meta, mode, chunked_c, selected).await?;
+            let rows =
+                sqlhash::row_hashes(&mut conn, db, table, &pk_meta, mode, chunked_c, selected)
+                    .await?;
             for chunk in rows.chunks(MAX_ROWHASHES_PER_BATCH) {
                 let items = chunk
                     .iter()
-                    .map(|r| proto::RowHash { bucket: r.bucket.clone(), pk: r.pk.clone(), hash: r.hash.clone() })
+                    .map(|r| proto::RowHash {
+                        bucket: r.bucket.clone(),
+                        pk: r.pk.clone(),
+                        hash: r.hash.clone(),
+                    })
                     .collect();
                 proto::write_response(send, &Response::RowHashes { items }, f).await?;
             }
@@ -688,7 +1094,7 @@ async fn do_hashes(
             return Ok(());
         }
 
-        if use_dump {
+        if source == HashSource::Dump {
             // Export/Parser-Pfad: ganzer gefilterter Bereich als Stream,
             // Zeilen-Hashes direkt batchweise rausschreiben.
             let algo = state.cfg.hash_algo();
@@ -704,7 +1110,13 @@ async fn do_hashes(
             while let Some(msg) = rx.recv().await {
                 match msg {
                     export::RowMsg::Row(values) => {
-                        let bucket = match hash::chunk_key_for_row(&values, &pk_indexes, &pk_meta, mode, chunked_c) {
+                        let bucket = match hash::chunk_key_for_row(
+                            &values,
+                            &pk_indexes,
+                            &pk_meta,
+                            mode,
+                            chunked_c,
+                        ) {
                             Ok(b) => b,
                             Err(e) => {
                                 send_response(send, Response::err(format!("{e:#}")), f).await?;
@@ -713,10 +1125,21 @@ async fn do_hashes(
                         };
                         if filter.as_ref().map(|f| f.contains(&bucket)).unwrap_or(true) {
                             let pk = hash::pk_canonical(&values, &pk_indexes, &pk_meta);
-                            batch.push(proto::RowHash { bucket, pk, hash: hash::row_hash(&values, algo) });
+                            batch.push(proto::RowHash {
+                                bucket,
+                                pk,
+                                hash: hash::row_hash(&values, algo),
+                            });
                         }
                         if batch.len() >= MAX_ROWHASHES_PER_BATCH {
-                            proto::write_response(send, &Response::RowHashes { items: std::mem::take(&mut batch) }, f).await?;
+                            proto::write_response(
+                                send,
+                                &Response::RowHashes {
+                                    items: std::mem::take(&mut batch),
+                                },
+                                f,
+                            )
+                            .await?;
                         }
                     }
                     export::RowMsg::Err(e) => {
@@ -755,29 +1178,47 @@ async fn do_hashes(
             let mut page_full = false;
             let mut newest_pk: Option<String> = last_pk.clone();
 
-            mysqlutil::scan_table(&mut conn, db, table, where_clause.as_deref(), true, &pk_meta, |values| {
-                let pk = hash::pk_canonical(&values, &pk_indexes, &pk_meta);
-                newest_pk = Some(pk.clone());
-                let bucket = match hash::chunk_key_for_row(&values, &pk_indexes, &pk_meta, mode, chunked_c) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        row_err = Some(e);
-                        return futures::future::ready(false);
+            mysqlutil::scan_table(
+                &mut conn,
+                db,
+                table,
+                where_clause.as_deref(),
+                true,
+                &pk_meta,
+                |values| {
+                    let pk = hash::pk_canonical(&values, &pk_indexes, &pk_meta);
+                    newest_pk = Some(pk.clone());
+                    let bucket = match hash::chunk_key_for_row(
+                        &values,
+                        &pk_indexes,
+                        &pk_meta,
+                        mode,
+                        chunked_c,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            row_err = Some(e);
+                            return futures::future::ready(false);
+                        }
+                    };
+                    if filter.as_ref().map(|f| f.contains(&bucket)).unwrap_or(true) {
+                        let rh = hash::row_hash(&values, state.cfg.hash_algo());
+                        if log::log_enabled!(log::Level::Trace) {
+                            log::trace!("REMOTE row pk={pk} hash={rh}");
+                        }
+                        batch.push(proto::RowHash {
+                            bucket,
+                            pk,
+                            hash: rh,
+                        });
+                        if batch.len() >= PAGE_ROWS {
+                            page_full = true;
+                            return futures::future::ready(false);
+                        }
                     }
-                };
-                if filter.as_ref().map(|f| f.contains(&bucket)).unwrap_or(true) {
-                    let rh = hash::row_hash(&values, state.cfg.hash_algo());
-                    if log::log_enabled!(log::Level::Trace) {
-                        log::trace!("REMOTE row pk={pk} hash={rh}");
-                    }
-                    batch.push(proto::RowHash { bucket, pk, hash: rh });
-                    if batch.len() >= PAGE_ROWS {
-                        page_full = true;
-                        return futures::future::ready(false);
-                    }
-                }
-                futures::future::ready(true)
-            })
+                    futures::future::ready(true)
+                },
+            )
             .await?;
             if let Some(e) = row_err {
                 send_response(send, Response::err(format!("{e:#}")), f).await?;
@@ -787,7 +1228,14 @@ async fn do_hashes(
             let reached_end = !page_full;
             // Page rausschreiben
             for chunk in batch.chunks(MAX_ROWHASHES_PER_BATCH) {
-                proto::write_response(send, &Response::RowHashes { items: chunk.to_vec() }, f).await?;
+                proto::write_response(
+                    send,
+                    &Response::RowHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
             }
             match &newest_pk {
                 Some(pk) if page_full => {

@@ -8,7 +8,13 @@ use mysql_async::{Conn, Opts, OptsBuilder, Pool, Value};
 pub const SYSTEM_DBS: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
 
 const NUMERIC_TYPES: &[&str] = &[
-    "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "year",
+    "tinyint",
+    "smallint",
+    "mediumint",
+    "int",
+    "integer",
+    "bigint",
+    "year",
 ];
 
 pub fn build_opts(cfg: &MysqlCfg, db: Option<&str>) -> Result<Opts> {
@@ -33,10 +39,73 @@ pub fn new_pool(cfg: &MysqlCfg, db: Option<&str>) -> Result<Pool> {
 /// Neue Verbindung mit normalisierter Session (Zeichensatz + Zeitzone),
 /// damit Hashes und Textdarstellungen auf beiden Seiten identisch sind.
 pub async fn session_conn(pool: &Pool) -> Result<Conn> {
-    let mut conn = pool.get_conn().await.context("MySQL-Verbindung fehlgeschlagen")?;
-    conn.query_drop("SET NAMES utf8mb4").await.ok();
-    conn.query_drop("SET SESSION time_zone = '+00:00'").await.ok();
+    let mut conn = pool
+        .get_conn()
+        .await
+        .context("MySQL-Verbindung fehlgeschlagen")?;
+    conn.query_drop("SET NAMES utf8mb4")
+        .await
+        .context("SET NAMES utf8mb4 fehlgeschlagen")?;
+    conn.query_drop("SET SESSION time_zone = '+00:00'")
+        .await
+        .context("SET SESSION time_zone fehlgeschlagen")?;
     Ok(conn)
+}
+
+/// Exact session/server profile that determines how row bytes are represented.
+/// Raw hashing is only allowed when this matches on both ends.
+pub async fn mysql_profile(conn: &mut Conn) -> Result<crate::proto::MysqlProfile> {
+    let q = "SELECT VERSION(), @@version_comment, @@version_compile_os, \
+                    @@version_compile_machine, @@character_set_client, \
+                    @@character_set_connection, COALESCE(@@character_set_results, ''), \
+                    @@collation_connection, @@session.time_zone, @@session.sql_mode";
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )> = conn
+        .query_first(q)
+        .await
+        .context("MySQL-Profil lesen fehlgeschlagen")?;
+    let (
+        version,
+        version_comment,
+        version_compile_os,
+        version_compile_machine,
+        character_set_client,
+        character_set_connection,
+        character_set_results,
+        collation_connection,
+        time_zone,
+        sql_mode,
+    ) = row.context("MySQL-Profil-Abfrage lieferte keine Zeile")?;
+    Ok(crate::proto::MysqlProfile {
+        version,
+        version_comment,
+        version_compile_os,
+        version_compile_machine,
+        character_set_client,
+        character_set_connection,
+        character_set_results,
+        collation_connection,
+        time_zone,
+        sql_mode,
+    })
+}
+
+pub async fn create_sql(conn: &mut Conn, db: &str, table: &str) -> Result<String> {
+    let q = format!("SHOW CREATE TABLE {}", qualified(db, table));
+    let row: Option<(String, String)> = conn.query_first(q).await?;
+    Ok(row
+        .with_context(|| format!("Tabelle {db}.{table} nicht gefunden"))?
+        .1)
 }
 
 /// Identifier mit Backticks quoten (und Injection verhindern).
@@ -50,11 +119,17 @@ pub fn qualified(db: &str, table: &str) -> String {
 
 pub async fn list_databases(conn: &mut Conn) -> Result<Vec<String>> {
     let dbs: Vec<String> = conn.query("SHOW DATABASES").await?;
-    Ok(dbs.into_iter().filter(|d| !SYSTEM_DBS.contains(&d.as_str())).collect())
+    Ok(dbs
+        .into_iter()
+        .filter(|d| !SYSTEM_DBS.contains(&d.as_str()))
+        .collect())
 }
 
 pub async fn list_tables(conn: &mut Conn, db: &str) -> Result<Vec<String>> {
-    let q = format!("SHOW FULL TABLES IN {} WHERE Table_type = 'BASE TABLE'", quote_ident(db));
+    let q = format!(
+        "SHOW FULL TABLES IN {} WHERE Table_type = 'BASE TABLE'",
+        quote_ident(db)
+    );
     let rows: Vec<(String, String)> = conn.query(q).await?;
     Ok(rows.into_iter().map(|(t, _)| t).collect())
 }
@@ -72,7 +147,11 @@ pub async fn table_info(conn: &mut Conn, db: &str, table: &str) -> Result<TableI
     let (_, create_sql) = row.with_context(|| format!("Tabelle {db}.{table} nicht gefunden"))?;
     let columns = column_names(conn, db, table).await?;
     let count = table_count(conn, db, table).await?;
-    Ok(TableInfo { create_sql, columns, count })
+    Ok(TableInfo {
+        create_sql,
+        columns,
+        count,
+    })
 }
 
 pub async fn column_names(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<String>> {
@@ -102,7 +181,10 @@ pub enum PkKind {
 
 impl PkKind {
     pub fn is_range_supported(self) -> bool {
-        matches!(self, PkKind::Int | PkKind::UInt | PkKind::Char | PkKind::Binary)
+        matches!(
+            self,
+            PkKind::Int | PkKind::UInt | PkKind::Char | PkKind::Binary
+        )
     }
 }
 
@@ -192,7 +274,13 @@ pub async fn binary_column_indexes(conn: &mut Conn, db: &str, table: &str) -> Re
     );
     let rows: Vec<(String, String)> = conn.exec(q, (db, table)).await?;
     const BIN_TYPES: &[&str] = &[
-        "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "geometry",
+        "binary",
+        "varbinary",
+        "blob",
+        "tinyblob",
+        "mediumblob",
+        "longblob",
+        "geometry",
         "bit",
     ];
     let names = column_names(conn, db, table).await?;
@@ -219,7 +307,15 @@ pub fn order_by(pks: &[PkCol]) -> String {
 
 /// Streaming-Pass über eine Tabelle (Text-Protokoll) mit async-Callback pro Zeile.
 /// `f` liefert false, um den Scan abzubrechen.
-pub async fn scan_table<F, Fut>(conn: &mut Conn, db: &str, table: &str, where_clause: Option<&str>, order: bool, pks: &[PkCol], mut f: F) -> Result<()>
+pub async fn scan_table<F, Fut>(
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    where_clause: Option<&str>,
+    order: bool,
+    pks: &[PkCol],
+    mut f: F,
+) -> Result<()>
 where
     F: FnMut(Vec<Value>) -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -234,7 +330,10 @@ where
     if order {
         sql.push_str(&order_by(pks));
     }
-    let result = conn.query_iter(sql).await.context("SELECT fehlgeschlagen")?;
+    let result = conn
+        .query_iter(sql)
+        .await
+        .context("SELECT fehlgeschlagen")?;
     let mut result = result;
     while let Some(row) = result.next().await.context("Fehler beim Zeilen-Lesen")? {
         let values: Vec<Value> = row.unwrap();
@@ -276,7 +375,10 @@ pub fn bucket_where(pks: &[PkCol], chunked: u32, buckets: &[String]) -> Result<S
         for b in buckets {
             buf.clear();
             crate::hash::sql_quote(b.as_bytes(), &mut buf);
-            quoted.push(format!("RIGHT({expr}, {chunked}) = {}", String::from_utf8_lossy(&buf)));
+            quoted.push(format!(
+                "RIGHT({expr}, {chunked}) = {}",
+                String::from_utf8_lossy(&buf)
+            ));
         }
         Ok(format!("({})", quoted.join(" OR ")))
     }
@@ -307,7 +409,9 @@ pub fn chunk_where(
                 if !crate::hash::is_valid_int_literal(k) {
                     bail!("Ungültiger numerischer Chunk-Key: {k}");
                 }
-                let low = k.parse::<i128>().map_err(|_| anyhow::anyhow!("Chunk-Key zu groß: {k}"))?;
+                let low = k
+                    .parse::<i128>()
+                    .map_err(|_| anyhow::anyhow!("Chunk-Key zu groß: {k}"))?;
                 let high = low + width;
                 vals.push(format!("({col} >= {low} AND {col} < {high})"));
             }

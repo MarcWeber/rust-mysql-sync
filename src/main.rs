@@ -6,6 +6,8 @@ mod client;
 mod config;
 mod export;
 mod hash;
+mod hash_binary;
+mod hash_tsv;
 mod import;
 mod mysqlutil;
 mod progress;
@@ -68,6 +70,14 @@ struct Cli {
     /// Diff-/Check-Hashes über Export/Parser berechnen (transfer_all-Strategien)
     #[arg(long, alias = "check-via-dump")]
     hash_via_dump: bool,
+
+    /// Diff-/Check-Hashes über rohe MySQL-Binary-Protokoll-Zeilen berechnen
+    #[arg(long, alias = "check-via-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_tsv"])]
+    hash_via_raw_binary: bool,
+
+    /// Diff-/Check-Hashes über rohe `mysql --batch`-TSV-Zeilen berechnen
+    #[arg(long, alias = "check-via-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary"])]
+    hash_via_raw_tsv: bool,
 }
 
 #[tokio::main]
@@ -87,8 +97,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    let is_client =
-        cli.force.is_some() || cli.sync.is_some() || cli.force_schema.is_some() || cli.check.is_some();
+    let is_client = cli.force.is_some()
+        || cli.sync.is_some()
+        || cli.force_schema.is_some()
+        || cli.check.is_some();
 
     let result = if is_client {
         client::run(client::ClientArgs {
@@ -101,6 +113,8 @@ async fn main() -> ExitCode {
             no_progress: cli.no_progress,
             hash_via_select: cli.hash_via_select,
             hash_via_dump: cli.hash_via_dump,
+            hash_via_raw_binary: cli.hash_via_raw_binary,
+            hash_via_raw_tsv: cli.hash_via_raw_tsv,
         })
         .await
     } else {

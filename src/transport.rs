@@ -33,6 +33,19 @@ pub struct Session {
     kind: Kind,
 }
 
+/// QUIC keep-alive so long-running table comparisons do not hit the peer's
+/// default 30 s idle timeout while both sides are busy in MySQL.
+pub fn quic_transport() -> Result<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(300)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("QUIC-Idle-Timeout ungültig"))?,
+    ));
+    Ok(transport)
+}
+
 impl Session {
     pub async fn connect(cfg: &Config) -> Result<Self> {
         if cfg.plaintext_tcp() {
@@ -55,10 +68,11 @@ impl Session {
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
         client_crypto.alpn_protocols = vec![ALPN.to_vec()];
-        let quinn_client = quinn::ClientConfig::new(Arc::new(
+        let mut quinn_client = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .context("QUIC-TLS-Konfiguration")?,
         ));
+        quinn_client.transport_config(Arc::new(quic_transport()?));
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(quinn_client);
 
@@ -83,7 +97,9 @@ impl Session {
 
     pub async fn open(&self, cfg: &Config) -> Result<(SendHalf, RecvHalf)> {
         match &self.kind {
-            Kind::Quic { conn, hello_done, .. } => {
+            Kind::Quic {
+                conn, hello_done, ..
+            } => {
                 let (mut send, mut recv) = conn.open_bi().await.context("QUIC-Stream öffnen")?;
                 if !hello_done.swap(true, Ordering::SeqCst) {
                     hello(&mut send, &mut recv, cfg).await?;

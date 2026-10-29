@@ -1,6 +1,7 @@
 /target
 /bin
 /.test-run
+/test.log
 *.fingerprint
 *-cert.pem
 *-key.pem

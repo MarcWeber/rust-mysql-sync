@@ -83,7 +83,9 @@ impl FromStr for HashAlgo {
             "blake3" | "blake" => Ok(HashAlgo::Blake3),
             "md5" => Ok(HashAlgo::Md5),
             "sha256" | "sha_256" | "sha2" => Ok(HashAlgo::Sha256),
-            _ => Err(anyhow!("Unbekannter Hash-Algorithmus: {s} (erlaubt: xxh3, xxh64, blake3, md5, sha256)")),
+            _ => Err(anyhow!(
+                "Unbekannter Hash-Algorithmus: {s} (erlaubt: xxh3, xxh64, blake3, md5, sha256)"
+            )),
         }
     }
 }
@@ -129,12 +131,22 @@ impl RowHasher {
         {
             return RowHasher::Md5(md5::Md5::new());
         }
-        #[cfg(all(not(feature = "xxhash"), not(feature = "blake3"), not(feature = "md5"), feature = "sha2"))]
+        #[cfg(all(
+            not(feature = "xxhash"),
+            not(feature = "blake3"),
+            not(feature = "md5"),
+            feature = "sha2"
+        ))]
         {
             return RowHasher::Sha256(sha2::Sha256::new());
         }
         let _ = ();
-        #[cfg(all(not(feature = "xxhash"), not(feature = "blake3"), not(feature = "md5"), not(feature = "sha2")))]
+        #[cfg(all(
+            not(feature = "xxhash"),
+            not(feature = "blake3"),
+            not(feature = "md5"),
+            not(feature = "sha2")
+        ))]
         {
             panic!("no hash algorithm enabled");
         }
@@ -233,6 +245,42 @@ pub fn row_hash_default(values: &[Value]) -> String {
     row_hash(values, HashAlgo::default())
 }
 
+/// Hash arbitrary bytes with the configured row-hash algorithm.
+pub fn hash_bytes(data: &[u8], algo: HashAlgo) -> String {
+    let mut h = RowHasher::new(algo);
+    h.update(data);
+    h.finalize_hex()
+}
+
+/// Add a row hash (hex) to a bucket accumulator.
+pub fn add_row_hash(
+    acc: &mut std::collections::HashMap<String, (RowHasher, u64)>,
+    algo: HashAlgo,
+    bucket: String,
+    rh: &str,
+) {
+    let e = acc
+        .entry(bucket)
+        .or_insert_with(|| (RowHasher::new(algo), 0));
+    match hex::decode(rh) {
+        Ok(bytes) => e.0.update(&bytes),
+        Err(_) => e.0.update(rh.as_bytes()),
+    }
+    e.1 += 1;
+}
+
+/// Finalize per-bucket rolling hashes into `(count, hash)`.
+pub fn finish_chunks(
+    acc: std::collections::HashMap<String, (RowHasher, u64)>,
+) -> std::collections::HashMap<String, (u64, String)> {
+    acc.into_iter()
+        .map(|(b, (h, c))| {
+            let final_hash = finalize_chunk(&b, c, h);
+            (b, (c, final_hash))
+        })
+        .collect()
+}
+
 /// Finaler Bucket-Hash: laufender Zeilen-Hash-Hasher + Bucket + Count.
 pub fn finalize_chunk(bucket: &str, count: u64, hasher: RowHasher) -> String {
     let mut h = hasher;
@@ -244,7 +292,11 @@ pub fn finalize_chunk(bucket: &str, count: u64, hasher: RowHasher) -> String {
 
 /// Kanonischer PK-String: Komponenten mit \x1f joined.
 /// BINARY/VARBINARY werden hex-kodiert, damit keine Bytes verloren gehen.
-pub fn pk_canonical(values: &[Value], pk_indexes: &[usize], pks: &[crate::mysqlutil::PkCol]) -> String {
+pub fn pk_canonical(
+    values: &[Value],
+    pk_indexes: &[usize],
+    pks: &[crate::mysqlutil::PkCol],
+) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(pk_indexes.len());
     for (pos, &i) in pk_indexes.iter().enumerate() {
         let part = match pks.get(pos) {
@@ -288,7 +340,10 @@ pub fn value_to_pk_component(v: &Value) -> String {
             format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{us:06}")
         }
         Value::Time(neg, days, h, mi, s, us) => {
-            format!("{}{days:02} {h:02}:{mi:02}:{s:02}.{us:06}", if *neg { "-" } else { "" })
+            format!(
+                "{}{days:02} {h:02}:{mi:02}:{s:02}.{us:06}",
+                if *neg { "-" } else { "" }
+            )
         }
     }
 }
@@ -421,6 +476,41 @@ pub fn chunk_key_from_component(
 }
 
 /// Chunk-Key einer Zeile (genau eine PK-Spalte im Range-Modus).
+pub fn chunk_key_for_pk_values(
+    values: &[Value],
+    pks: &[crate::mysqlutil::PkCol],
+    mode: ChunkMode,
+    chunked: u32,
+) -> Result<String> {
+    if values.len() != pks.len() {
+        bail!(
+            "PK-Wertanzahl {} passt nicht zu PK-Metadaten {}",
+            values.len(),
+            pks.len()
+        );
+    }
+    if mode == ChunkMode::Mod {
+        let comps: Vec<String> = values
+            .iter()
+            .zip(pks)
+            .map(|(v, pk)| value_to_pk_component_for(v, pk))
+            .collect();
+        let numeric_last = pks.last().map(|p| p.numeric).unwrap_or(false);
+        return Ok(bucket_of_pk(&comps, numeric_last, chunked));
+    }
+    let pk = pks.first().context("kein PK-Metadatum")?;
+    chunk_key_from_value(pk.kind, &values[0], mode, chunked)
+}
+
+/// Canonical PK string from PK values in PRIMARY KEY order.
+pub fn pk_canonical_from_pk_values(values: &[Value], pks: &[crate::mysqlutil::PkCol]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(values.len());
+    for (v, pk) in values.iter().zip(pks) {
+        parts.push(value_to_pk_component_for(v, pk));
+    }
+    parts.join(&PK_SEP.to_string())
+}
+
 pub fn chunk_key_for_row(
     values: &[Value],
     pk_indexes: &[usize],
@@ -668,13 +758,16 @@ mod tests {
                 HashAlgo::Blake3 | HashAlgo::Sha256 => 64,
             };
             assert_eq!(got.len(), want, "{algo}");
-            assert_eq!(got, finalize_chunk("bucket", 4, {
-                let mut acc = RowHasher::new(algo);
-                for v in vals() {
-                    acc.update(&hex::decode(row_hash(std::slice::from_ref(&v), algo)).unwrap());
-                }
-                acc
-            }));
+            assert_eq!(
+                got,
+                finalize_chunk("bucket", 4, {
+                    let mut acc = RowHasher::new(algo);
+                    for v in vals() {
+                        acc.update(&hex::decode(row_hash(std::slice::from_ref(&v), algo)).unwrap());
+                    }
+                    acc
+                })
+            );
         }
     }
 
@@ -706,18 +799,34 @@ mod tests {
 
         let char_pk = pk(PkKind::Char, false);
         assert_eq!(
-            chunk_key_from_value(PkKind::Char, &Value::Bytes(b"abcdef".to_vec()), ChunkMode::Range, 2)
-                .unwrap(),
+            chunk_key_from_value(
+                PkKind::Char,
+                &Value::Bytes(b"abcdef".to_vec()),
+                ChunkMode::Range,
+                2
+            )
+            .unwrap(),
             "abcd"
         );
         assert_eq!(
-            chunk_key_from_value(PkKind::Char, &Value::Bytes(b"ab".to_vec()), ChunkMode::Range, 2)
-                .unwrap(),
+            chunk_key_from_value(
+                PkKind::Char,
+                &Value::Bytes(b"ab".to_vec()),
+                ChunkMode::Range,
+                2
+            )
+            .unwrap(),
             ""
         );
         assert_eq!(
-            chunk_key_for_row(&[Value::Bytes(b"abcdef".to_vec())], &[0], &[char_pk], ChunkMode::Range, 2)
-                .unwrap(),
+            chunk_key_for_row(
+                &[Value::Bytes(b"abcdef".to_vec())],
+                &[0],
+                &[char_pk],
+                ChunkMode::Range,
+                2
+            )
+            .unwrap(),
             "abcd"
         );
 
