@@ -559,21 +559,30 @@ pub fn rows_to_replace_sql(
     rows: &[Vec<Value>],
     hex_indexes: &[usize],
 ) -> Vec<u8> {
+    const ROWS_PER_STMT: usize = 500;
+    let col_sql: Vec<String> = columns.iter().map(|c| mysqlutil::quote_ident(c)).collect();
+    let cols = col_sql.join(", ");
     let mut out = Vec::with_capacity(rows.len() * 64);
-    for row in rows {
+    for chunk in rows.chunks(ROWS_PER_STMT) {
         out.extend_from_slice(b"REPLACE INTO ");
         out.extend_from_slice(qualified(db, table).as_bytes());
         out.extend_from_slice(b" (");
-        let col_sql: Vec<String> = columns.iter().map(|c| mysqlutil::quote_ident(c)).collect();
-        out.extend_from_slice(col_sql.join(", ").as_bytes());
-        out.extend_from_slice(b") VALUES (");
-        for (i, v) in row.iter().enumerate() {
-            if i > 0 {
+        out.extend_from_slice(cols.as_bytes());
+        out.extend_from_slice(b") VALUES ");
+        for (ri, row) in chunk.iter().enumerate() {
+            if ri > 0 {
                 out.push(b',');
             }
-            value_to_sql(v, hex_indexes.contains(&i), &mut out);
+            out.push(b'(');
+            for (i, v) in row.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                value_to_sql(v, hex_indexes.contains(&i), &mut out);
+            }
+            out.push(b')');
         }
-        out.extend_from_slice(b");\n");
+        out.extend_from_slice(b";\n");
     }
     out
 }

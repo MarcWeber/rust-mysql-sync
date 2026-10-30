@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub const DEFAULT_QUIC_PORT: u16 = 4433;
+pub const DEFAULT_SERVER_PORT: u16 = 4433;
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const ALPN: &[u8] = b"mysql-sync/4";
 
@@ -232,7 +232,7 @@ impl Config {
                 p.parse::<u16>().context("Port im server-Feld ungültig")?
             )
         } else {
-            format!("{raw}:{}", self.quic_port.unwrap_or(DEFAULT_QUIC_PORT))
+            format!("{raw}:{}", self.quic_port.unwrap_or(DEFAULT_SERVER_PORT))
         };
         let resolved = tokio::net::lookup_host(addr.as_str())
             .await
@@ -244,7 +244,7 @@ impl Config {
 
     pub fn listen_addr(&self) -> Result<std::net::SocketAddr> {
         let host = self.listen.clone().unwrap_or_else(|| "0.0.0.0".into());
-        Ok(format!("{}:{}", host, self.quic_port.unwrap_or(DEFAULT_QUIC_PORT)).parse()?)
+        Ok(format!("{}:{}", host, self.quic_port.unwrap_or(DEFAULT_SERVER_PORT)).parse()?)
     }
 }
 

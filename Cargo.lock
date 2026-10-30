@@ -2381,7 +2381,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "craft-ui"
-version = "0.1.0"

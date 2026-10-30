@@ -56,7 +56,7 @@ Matrix (Aktion matrix):
   raw-binary, raw-tsv). Jeder Fall bekommt aus seinem Dimensions-Hash eine eigene Tabelle
   in db_matrix, damit parallele Fälle sich nicht beeinflussen. Gemessen werden
   Clean-Check, Drift-Check und Sync (pt-table-sync: --print und --execute).
-  Globale Matrix-Parameter: MATRIX_ROWS=2000, MATRIX_JOBS=4, MATRIX_TIMEOUT=300.
+  Globale Matrix-Parameter: MATRIX_ROWS=100000, MATRIX_JOBS=4, MATRIX_TIMEOUT=300.
   MSYNC_PT_TABLE_SYNC (sonst PATH-Suche) steuert den pt-table-sync-Pfad.
 
 Exit 0 = alle aufgerufenen Aktionen bestanden.
@@ -278,7 +278,7 @@ def run_bin(args):
 
 
 MATRIX_DB = "db_matrix"
-MATRIX_ROWS = 2000
+MATRIX_ROWS = 100000
 MATRIX_JOBS = 4
 MATRIX_TIMEOUT = 300
 PT_BIN = os.environ.get("MSYNC_PT_TABLE_SYNC") or shutil.which("pt-table-sync")
@@ -514,15 +514,17 @@ def _run_pt_case(cfg, case):
     src_dsn, dst_dsn = _pt_dsn("src", case), _pt_dsn("dst", case)
     common = [PT_BIN, "--no-check-slave", "--no-check-triggers", "--chunk-size=1000"]
 
-    check_ms, r = _timed([*common, "--print", src_dsn, dst_dsn])
+    # pt always runs against the drifted tables (no clean pass):
+    # --print is the drift detection, --execute applies the differences.
+    drift_ms, r = _timed([*common, "--print", src_dsn, dst_dsn])
     if r.returncode not in (0, 2):
-        out.update(clean_ms=check_ms,
+        out.update(drift_ms=drift_ms,
                    detail=f"print rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
         return out
 
     sync_ms, r = _timed([*common, "--execute", src_dsn, dst_dsn])
     if r.returncode not in (0, 2):
-        out.update(clean_ms=check_ms, sync_ms=sync_ms,
+        out.update(drift_ms=drift_ms, sync_ms=sync_ms,
                    detail=f"execute rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
         return out
 
@@ -531,7 +533,7 @@ def _run_pt_case(cfg, case):
     a = scalar("src", _matrix_checksum_sql(case), quiet=True)
     b = scalar("dst", _matrix_checksum_sql(case), quiet=True)
     ok = rc == 0 and a == b
-    out.update(clean_ms=check_ms, sync_ms=sync_ms, total_ms=check_ms + sync_ms,
+    out.update(drift_ms=drift_ms, sync_ms=sync_ms, total_ms=drift_ms + sync_ms,
                status="ok" if ok else "mismatch",
                detail="" if ok else f"rust --check rc={rc}: {out_text[-200:]} | {a} != {b}")
     return out
@@ -562,6 +564,13 @@ def _report_matrix(rows, wall_ms):
     print("\n== Matrix: rust-sync vs pt-table-sync ==")
     print(f"  concurrency={CONCURRENCY or 'MISSING'} rows={MATRIX_ROWS} "
           f"jobs={effective_jobs()} wall={wall_ms:.0f} ms")
+    print("  Legend (all times in ms):")
+    print("    clean = check while tables are identical (rust only; detection, no writes)")
+    print("    drift = check while tables differ (detection only, no writes)")
+    print("    sync  = apply the differences (this is the real sync time)")
+    print("    total = clean + drift + sync = total time for this table")
+    print("    pt-table-sync: drift = --print, sync = --execute (no clean run)")
+    print("    mode: select/dump/raw-binary/raw-tsv = rust-sync hashing method")
     print(f"  {'tool':5s} {'key':4s} {'bin':4s} {'mode':11s} {'clean':>8s} {'drift':>8s} "
           f"{'sync':>8s} {'total':>8s}  status")
     for r in sorted(rows, key=lambda x: (x["tool"], x["key"], x["binary"], x["mode"] or "")):
@@ -572,7 +581,7 @@ def _report_matrix(rows, wall_ms):
               f"{ms(r['total_ms']):>8s}  {r['status']}"
               + (f" ({r['detail']})" if r["detail"] else ""))
 
-    print("  Summen:")
+    print("  Totals:")
     groups = {}
     for r in rows:
         label = r["tool"] if r["tool"] == "pt" else f"rust/{r['mode']}"
@@ -586,7 +595,7 @@ def _report_matrix(rows, wall_ms):
         print(f"    {label:16s} n={g['n']:2d} clean={g['clean']:8.0f} "
               f"drift={g['drift']:8.0f} sync={g['sync']:8.0f} total={g['total']:8.0f} ms")
     grand = sum(r["total_ms"] or 0.0 for r in rows)
-    print(f"    {'GESAMT':16s} n={len(rows):2d} {'':>8s} {'':>8s} {'':>8s} total={grand:8.0f} ms")
+    print(f"    {'TOTAL':16s} n={len(rows):2d} {'':>8s} {'':>8s} {'':>8s} total={grand:8.0f} ms")
 
 
 def prepare_workdir():
@@ -1144,7 +1153,7 @@ def run_actions(actions):
         outcomes.append((action, ok))
 
     if results:
-        print("\n═══════════════ GESAMTERGEBNIS ═══════════════")
+        print("\n═══════════════ OVERALL RESULT ═══════════════")
         failed = [r for r in results if not r[1]]
         for name, ok, detail in results:
             print(f"  [{PASS if ok else FAIL}] {name}" + (f" — {detail}" if detail else ""))

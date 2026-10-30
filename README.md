@@ -210,7 +210,106 @@ there is no `chunk_mode` config key. `chunked` controls the bucket width/suffix.
 
 Range chunks can be large: a single changed row changes the whole chunk hash.
 The row-count threshold heuristic therefore only applies to mod; range mode
-always drills down to exact row hashes after a chunk mismatch.
+always drills down to exact row hashes after a chunk mismatch. (The target
+design drops this heuristic entirely — see *SYNC ALGORITHM — TARGET DESIGN*.)
+
+## SYNC ALGORITHM — TARGET DESIGN
+
+This section describes how `--sync` is supposed to work.
+
+Current state: the *compare* phase is still multi-pass (compute all local chunk
+hashes, stream all remote chunk hashes, collect `diff_buckets`, then re-read
+the differing chunks once for row hashes and once for the row data). The
+*write* phase is already streaming and batched: changes of a differing bucket
+are pushed as multi-row `REPLACE` statements (500 rows per statement) inside
+one transaction per dump, so writes no longer cost a round trip and a commit
+per row. The truncate/full-copy fallback has been removed — a table with a high
+diff ratio is always resolved row-wise.
+
+The target is a single forward streaming pass per table:
+
+```
+for chunk in chunks:                        # deterministic order, one scan
+    lh = source.chunk_hash(chunk)           # local side
+    rh = target.chunk_hash(chunk)           # remote side, same chunk
+
+    if lh == rh:
+        continue                            # identical chunk, nothing to do
+
+    for row in source.rows(chunk):          # only this chunk is read again
+        rh_row = target.row_hash(row.pk)
+        if rh_row == None:        emit INSERT(row)
+        elif rh_row != row.hash:  emit UPDATE(row)
+        else:                     skip
+    for pk in target_only(chunk):
+        emit DELETE(pk)
+
+    push(batch)                             # apply now, then continue scanning
+```
+
+Properties that follow from this:
+
+- **One forward pass per side.** Chunks are compared as they are scanned; there
+  is no global `diff_buckets` list and no second full-table pass.
+- **Drill-down is local to the chunk.** A differing chunk re-reads only its own
+  rows on both sides. Row-level comparison happens for that chunk only.
+- **Writes overlap scanning.** Changes of chunk *N* are pushed while chunk *N+1*
+  is already being scanned; they are batched (one multi-row `INSERT … ON
+  DUPLICATE KEY UPDATE` / one `DELETE … IN (…)` per batch), not one round trip
+  and not one fsync per row.
+- **No truncate / full-copy fallback.** A chunk with many differing rows is
+  still resolved row-wise (implemented). `diff_threshold_percent` only survives
+  as an early-exit estimate in `--check`, where it never writes anything.
+- **Bounded memory.** Only one chunk's rows and one write batch are buffered,
+  not the whole table.
+- **`--check N` is the same loop** with the `push(batch)` step removed and the
+  first `N` differing PKs collected as examples.
+
+Composite primary keys must use range chunks via row-value comparison
+(`(id, id2) > (?, ?)`), so they do not fall back to `mod` and do not pay the
+mod-scan cost.
+
+### Row sources — four separate implementations
+
+The four `--hash-via-*` modes are four different ways to produce the *same*
+information (chunk hash, row hash, PK, row payload for changed rows). They
+differ in **where hashing happens** and **whether row bytes cross the wire**,
+so they are kept as four independent implementations, all consumed through one
+thin engine interface — not merged into one "smart" path and not duplicated
+engines.
+
+| Mode | Hash computed by | Row bytes transferred | File |
+|---|---|---|---|
+| `select` (default) | MySQL: `GROUP BY` over a null-safe, length-prefixed row fingerprint (MD5) | no row data, only bucket/row hashes | `src/sqlhash.rs` |
+| `dump` | Rust, over the export/parser stream (`select-stream`, `INTO OUTFILE`, `mysql -e`, `mysqldump`) | row values for compared chunks | `src/export.rs` + `src/hash.rs` |
+| `raw-binary` | Rust, over native MySQL binary-protocol row packets | raw row packets | `src/hash_binary.rs` |
+| `raw-tsv` | Rust, over `mysql --batch` TSV lines | escaped text lines (no binary columns) | `src/hash_tsv.rs` |
+
+Keeping them separate is deliberate:
+
+- `select` never moves row data; MySQL hashes in place. It cannot be expressed
+  through the dump/CSV path without moving data that the select path does not
+  move.
+- `dump`/`raw-tsv` read *text* (escaping, locales, NULL as `\N`); `raw-binary`
+  reads the binary protocol (length-encoded, NULL bitmap). Sharing one parser
+  would force one representation onto the other.
+- `raw-tsv` cannot represent binary columns at all and must reject such tables;
+  that constraint belongs with its implementation.
+
+The engine (`src/sync.rs`) owns chunk order, comparison, batching and
+transport; a row source only answers "chunk hash" and "rows of this chunk".
+Proposed layout, one file per strategy:
+
+```
+src/hashvia/mod.rs          trait RowSource { chunk_hash(chunk); rows(chunk) }
+src/hashvia/select.rs       = today's src/sqlhash.rs
+src/hashvia/dump.rs         = today's src/export.rs + hash glue
+src/hashvia/raw_binary.rs   = today's src/hash_binary.rs
+src/hashvia/raw_tsv.rs      = today's src/hash_tsv.rs
+```
+
+The target-side writer (`src/server.rs`, `src/import.rs`) stays a single
+implementation; it is not duplicated per strategy.
 
 ## CONFIG
 

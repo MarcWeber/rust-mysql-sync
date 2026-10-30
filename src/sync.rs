@@ -501,13 +501,12 @@ async fn run_inner(
     let total_rows = local_info.count.max(1) as f64;
     let diff_pct = diff_rows_est as f64 * 100.0 / total_rows;
     log::info!(
-        "[{label}] {} von {} Buckets differieren (~{} von {} Zeilen, {:.1}%, Threshold {:.1}%)",
+        "[{label}] {} von {} Buckets differieren (~{} von {} Zeilen, {:.1}%)",
         diff_buckets.len(),
         total_buckets,
         diff_rows_est,
         local_info.count,
-        diff_pct,
-        cfg.diff_threshold_percent
+        diff_pct
     );
 
     if diff_buckets.is_empty() {
@@ -515,61 +514,9 @@ async fn run_inner(
         return Ok((0, 0, Some(0), vec![]));
     }
 
-    // Vollkopie bei zu hohem Diff-Anteil?
-    // Bei Range-Chunks ist die Bucket-Quote kein guter Zeilen-Schätzer: ein
-    // einzelner Treffer ändert den Hash des ganzen (grossen) Bereichs.
-    if chunk_mode == ChunkMode::Mod && diff_pct > cfg.diff_threshold_percent {
-        log::info!("[{label}] Über Threshold — Vollkopie (Truncate + alle Zeilen)");
-        bar.phase("Vollkopie");
-        if cfg.disable_triggers {
-            proto::write_request(
-                &mut send,
-                &Request::DisableTriggers {
-                    db: task.remote_db.clone(),
-                    table: task.remote_table.clone(),
-                },
-                &f,
-            )
-            .await?;
-            expect_ok(&mut recv, &f, "DisableTriggers").await?;
-        }
-        proto::write_request(
-            &mut send,
-            &Request::Truncate {
-                db: task.remote_db.clone(),
-                table: task.remote_table.clone(),
-            },
-            &f,
-        )
-        .await?;
-        expect_ok(&mut recv, &f, "Truncate").await?;
-        let sent = transfer_all_rows(
-            cfg,
-            &mut send,
-            &mut recv,
-            &mut local_conn,
-            task,
-            &hex_indexes,
-            &local_info.columns,
-            None,
-            &bar,
-        )
-        .await?;
-        if cfg.disable_triggers {
-            proto::write_request(
-                &mut send,
-                &Request::RestoreTriggers {
-                    db: task.remote_db.clone(),
-                    table: task.remote_table.clone(),
-                },
-                &f,
-            )
-            .await?;
-            expect_ok(&mut recv, &f, "RestoreTriggers").await?;
-        }
-        bar.done(&format!("Vollkopie: {sent} Zeilen"));
-        return Ok((sent, 0, Some(local_info.count), vec![]));
-    }
+    // Kein Truncate/Vollkopie-Fallback: auch bei hohem Diff-Anteil wird
+    // zeilenweise abgeglichen, damit Writes während des Scans fliessen und
+    // keine nicht-destruktive Fremdtabelle überschrieben wird.
 
     // ---- Drill-Down: Zeilen-Hashes beider Seiten ----
     bar.phase("Drill-Down (Zeilen-Hashes)");

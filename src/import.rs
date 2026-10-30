@@ -100,24 +100,30 @@ impl TsvBatcher {
 }
 
 /// Batches als REPLACE INTO importieren (idempotent — Sync darf erneut laufen).
+///
+/// Mehrere Zeilen pro Statement: ein Round-Trip und eine Transaktion pro Batch
+/// statt einem Round-Trip/Commit pro Zeile (vorher ~10 ms/Zeile).
 pub async fn import_rows(conn: &mut Conn, db: &str, table: &str, columns: &[String], rows: Vec<Vec<Value>>) -> Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
+    const ROWS_PER_STMT: usize = 500;
     let cols_sql: Vec<String> = columns.iter().map(|c| mysqlutil::quote_ident(c)).collect();
-    let placeholders = vec!["?"; columns.len()].join(",");
-    let sql = format!(
-        "REPLACE INTO {} ({}) VALUES ({})",
-        qualified(db, table),
-        cols_sql.join(", "),
-        placeholders
-    );
-    let stmt = conn.prep(&sql).await.context("REPLACE-Statement vorbereiten fehlgeschlagen")?;
+    let tuple = format!("({})", vec!["?"; columns.len()].join(","));
     let mut total = 0u64;
-    for row in rows {
-        let params: Vec<Value> = row;
-        conn.exec_drop(&stmt, params).await.context("REPLACE fehlgeschlagen")?;
-        total += 1;
+    for chunk in rows.chunks(ROWS_PER_STMT) {
+        let values = vec![tuple.as_str(); chunk.len()].join(",");
+        let sql = format!(
+            "REPLACE INTO {} ({}) VALUES {}",
+            qualified(db, table),
+            cols_sql.join(", "),
+            values
+        );
+        let params: Vec<Value> = chunk.iter().flatten().cloned().collect();
+        conn.exec_drop(&sql, params)
+            .await
+            .with_context(|| format!("REPLACE fehlgeschlagen ({} Zeilen)", chunk.len()))?;
+        total += chunk.len() as u64;
     }
     Ok(total)
 }
@@ -150,6 +156,9 @@ pub async fn delete_pks(
 /// Erlaubt: INSERT/REPLACE/DELETE/UPDATE/SET/TRUNCATE (keine DDL aus Dump).
 pub async fn execute_dump(conn: &mut Conn, sql: &str) -> Result<u64> {
     let statements = split_sql_statements(sql);
+    // Eine Transaktion für den ganzen Dump: sonst committet jedes Statement
+    // einzeln (~10 ms/Zeile bei fsync=1).
+    conn.query_drop("START TRANSACTION").await.context("START TRANSACTION fehlgeschlagen")?;
     let mut executed = 0u64;
     for st in statements {
         let trimmed = st.trim();
@@ -160,11 +169,15 @@ pub async fn execute_dump(conn: &mut Conn, sql: &str) -> Result<u64> {
             log::debug!("Dump-Statement gefiltert: {}", &trimmed[..trimmed.len().min(60)]);
             continue;
         }
-        conn.query_drop(trimmed)
-            .await
-            .with_context(|| format!("Dump-Statement fehlgeschlagen: {}", &trimmed[..trimmed.len().min(120)]))?;
+        if let Err(e) = conn.query_drop(trimmed).await {
+            let _ = conn.query_drop("ROLLBACK").await;
+            return Err(e).with_context(|| {
+                format!("Dump-Statement fehlgeschlagen: {}", &trimmed[..trimmed.len().min(120)])
+            });
+        }
         executed += 1;
     }
+    conn.query_drop("COMMIT").await.context("COMMIT fehlgeschlagen")?;
     Ok(executed)
 }
 

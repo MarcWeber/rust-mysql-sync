@@ -45,6 +45,8 @@ pub fn server_identity(cfg: &Config, config_path: &std::path::Path) -> Result<(V
     if cert_path.exists() && key_path.exists() {
         let (certs, key) = load_pem(&cert_path, &key_path)?;
         let fp = fingerprint_of(certs[0].as_ref());
+        let fp_path = config_path.with_extension("fingerprint");
+        let _ = std::fs::write(&fp_path, format!("{fp}\n"));
         return Ok((certs, key, fp));
     }
 
