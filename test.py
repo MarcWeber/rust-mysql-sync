@@ -49,9 +49,11 @@ Szenarien (Aktion old):
   L) Raw-Profil-Gate : raw-binary/raw-tsv lehnen abweichendes MySQL-Profil ab
 
 Matrix (Aktion matrix):
-  Produkt aus Tool (rust-sync, pt-table-sync), Key (int, str) und Binärspalte
-  (nein, ja). rust-sync zusätzlich pro Read-Mode (select, dump, raw-binary,
-  raw-tsv). Jeder Fall bekommt aus seinem Dimensions-Hash eine eigene Tabelle
+  Produkt aus Tool (rust-sync, pt-table-sync), Key (int, str, int-tuple,
+  str-tuple, mixed-tuple) und Binärspalte (nein, ja). "-tuple" heißt
+  zusammengesetzter Primary Key (id, id2); mixed-tuple ist str-int
+  (id VARCHAR, id2 INT). rust-sync zusätzlich pro Read-Mode (select, dump,
+  raw-binary, raw-tsv). Jeder Fall bekommt aus seinem Dimensions-Hash eine eigene Tabelle
   in db_matrix, damit parallele Fälle sich nicht beeinflussen. Gemessen werden
   Clean-Check, Drift-Check und Sync (pt-table-sync: --print und --execute).
   Globale Matrix-Parameter: MATRIX_ROWS=2000, MATRIX_JOBS=4, MATRIX_TIMEOUT=300.
@@ -108,7 +110,7 @@ DOCKER = shutil.which("docker") is not None and not os.environ.get("MSYNC_LOCAL"
 SRC_PORT = int(os.environ.get("MSYNC_SRC_PORT", 7012 if DOCKER else 33061))
 DST_PORT = int(os.environ.get("MSYNC_DST_PORT", 7013 if DOCKER else 33062))
 ROOT_PW = os.environ.get("MSYNC_ROOT_PW", "syncroot" if DOCKER else "")
-QUIC_PORT = int(os.environ.get("MSYNC_QUIC_PORT", 44330))
+MYSQL_SYNC_SERVER_PORT = int(os.environ.get("MSYNC_MYSQL_SYNC_SERVER_PORT", 44330))
 
 PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
 SKIP = "\033[33mSKIP\033[0m"
@@ -302,7 +304,7 @@ def _matrix_case(tool, key, binary, mode=None):
 
 def matrix_cases():
     cases = []
-    for key in ("int", "str"):
+    for key in ("int", "str", "int-tuple", "str-tuple", "mixed-tuple"):
         for binary in ("none", "bin"):
             cases.append(_matrix_case("pt", key, binary))
             for mode, _ in RUST_MODES:
@@ -310,37 +312,73 @@ def matrix_cases():
     return cases
 
 
+def _key_kind(case):
+    return case["key"].split("-")[0]
+
+
+def _is_tuple(case):
+    return case["key"].endswith("-tuple")
+
+
+def _key_types(case):
+    """(id_type, id2_type) — id2_type ist None ohne zusammengesetzten Key."""
+    id_type = "BIGINT" if _key_kind(case) == "int" else "VARCHAR(32)"
+    if not _is_tuple(case):
+        return id_type, None
+    return id_type, "VARCHAR(32)" if _key_kind(case) == "str" else "INT"
+
+
 def _matrix_ddl(case):
-    key = "BIGINT" if case["key"] == "int" else "VARCHAR(32)"
+    key, id2_type = _key_types(case)
+    tuple_col = f"  id2 {id2_type} NOT NULL,\n" if id2_type else ""
+    pk = "(id, id2)" if id2_type else "(id)"
     bin_col = "  bin_data VARBINARY(128) NULL,\n" if case["binary"] == "bin" else ""
     return (
         f"CREATE TABLE {MATRIX_DB}.{case['table']} (\n"
         f"  id {key} NOT NULL,\n"
+        f"{tuple_col}"
         f"{bin_col}"
         "  txt VARCHAR(64) NOT NULL,\n"
         "  n INT NOT NULL,\n"
-        "  PRIMARY KEY (id)\n"
+        f"  PRIMARY KEY {pk}\n"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     )
 
 
+def _matrix_id_expr(case, n="n"):
+    base = f"CEIL({n} / 3)" if _is_tuple(case) else n
+    if _key_kind(case) == "int":
+        return base
+    return f"CONCAT('k', LPAD({base}, 8, '0'))"
+
+
+def _matrix_id2_expr(case, n="n"):
+    if _key_kind(case) == "str":
+        return f"CONCAT('c', MOD({n}, 3))"
+    return f"MOD({n}, 3)"
+
+
 def _matrix_seed(case, rows):
     table = f"{MATRIX_DB}.{case['table']}"
-    id_expr = "n" if case["key"] == "int" else "CONCAT('k', LPAD(n, 8, '0'))"
+    id_expr = _matrix_id_expr(case)
     txt_expr = "CONCAT('row-', n, CASE WHEN n % 7 = 0 THEN '\\tTab' ELSE '' END)"
+    cols = ["id"]
+    vals = [id_expr]
+    if _is_tuple(case):
+        cols.append("id2")
+        vals.append(_matrix_id2_expr(case))
     if case["binary"] == "bin":
-        bin_expr = (
+        cols.append("bin_data")
+        vals.append(
             "CASE WHEN n % 17 = 0 THEN NULL "
             "WHEN n % 19 = 0 THEN UNHEX('000000') "
             "WHEN n % 23 = 0 THEN UNHEX('FFFE80C0AF') "
             "ELSE UNHEX(CONCAT('00FF0A09', LPAD(HEX(n), 8, '0'), "
             "REPEAT('AB', 8 + (n % 16)))) END"
         )
-        cols = "id, bin_data, txt, n"
-        vals = f"{id_expr}, {bin_expr}, {txt_expr}, n"
-    else:
-        cols = "id, txt, n"
-        vals = f"{id_expr}, {txt_expr}, n"
+    cols += ["txt", "n"]
+    vals += [txt_expr, "n"]
+    cols, vals = ", ".join(cols), ", ".join(vals)
     return f"""INSERT INTO {table} ({cols})
 SELECT {vals} FROM (
   SELECT a.N + b.N * 10 + c.N * 100 + d.N * 1000 + e.N * 10000 + 1 AS n
@@ -360,21 +398,26 @@ SELECT {vals} FROM (
 def _matrix_drift(case):
     table = f"{MATRIX_DB}.{case['table']}"
     update_bin = ", bin_data = UNHEX('DEADBEEF')" if case["binary"] == "bin" else ""
-    extra_id = "900000 + n" if case["key"] == "int" else "CONCAT('extra-', LPAD(n, 4, '0'))"
+    extra_id = "900000 + n" if _key_kind(case) == "int" else "CONCAT('extra-', LPAD(n, 4, '0'))"
+    tuple_col = ", id2" if _is_tuple(case) else ""
+    tuple_val = ", " + _matrix_id2_expr(case) if _is_tuple(case) else ""
     bin_col = ", bin_data" if case["binary"] == "bin" else ""
     bin_val = ", UNHEX('00FF00FF')" if case["binary"] == "bin" else ""
     return f"""
 DELETE FROM {table} WHERE MOD(n, 20) = 0;
 UPDATE {table} SET txt = CONCAT(txt, ' [drift]'), n = n + 100000{update_bin} WHERE MOD(n, 20) = 1;
-INSERT INTO {table} (id{bin_col}, txt, n)
-SELECT {extra_id}{bin_val}, CONCAT('extra-', n), 900000 + n
+INSERT INTO {table} (id{tuple_col}{bin_col}, txt, n)
+SELECT {extra_id}{tuple_val}{bin_val}, CONCAT('extra-', n), 900000 + n
 FROM (SELECT 1 AS n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
       UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9 UNION SELECT 10) x;
 """
 
 
 def _matrix_checksum_sql(case):
-    cols = ["HEX(id)", "HEX(txt)", "CAST(n AS CHAR)"]
+    cols = ["HEX(id)"]
+    if _is_tuple(case):
+        cols.append("CAST(id2 AS CHAR)")
+    cols += ["HEX(txt)", "CAST(n AS CHAR)"]
     if case["binary"] == "bin":
         cols.append("IFNULL(HEX(bin_data), 'NULL')")
     expr = "CONCAT_WS('|', " + ", ".join(cols) + ")"
@@ -458,7 +501,10 @@ def _pt_dsn(which, case):
     return ",".join(parts)
 
 
-def _run_pt_case(case):
+def _run_pt_case(cfg, case):
+    # pt-table-sync exit 2 means "Differences found" (also after a successful
+    # --execute), 0 means "Nothing to do", 1 means error. Verify the outcome
+    # with our own check instead of trusting the exit code.
     out = _matrix_base(case)
     if not PT_BIN:
         out.update(status="skip", detail="pt-table-sync nicht im PATH")
@@ -475,23 +521,26 @@ def _run_pt_case(case):
         return out
 
     sync_ms, r = _timed([*common, "--execute", src_dsn, dst_dsn])
-    if r.returncode != 0:
+    if r.returncode not in (0, 2):
         out.update(clean_ms=check_ms, sync_ms=sync_ms,
                    detail=f"execute rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
         return out
 
+    rc, out_text = run_bin([*cfg, "--no-progress", "--check", "0",
+                            f"{MATRIX_DB}.{case['table']}"])
     a = scalar("src", _matrix_checksum_sql(case), quiet=True)
     b = scalar("dst", _matrix_checksum_sql(case), quiet=True)
+    ok = rc == 0 and a == b
     out.update(clean_ms=check_ms, sync_ms=sync_ms, total_ms=check_ms + sync_ms,
-               status="ok" if a == b else "mismatch",
-               detail="" if a == b else f"{a} != {b}")
+               status="ok" if ok else "mismatch",
+               detail="" if ok else f"rust --check rc={rc}: {out_text[-200:]} | {a} != {b}")
     return out
 
 
 def _matrix_runner(cfg, case):
     try:
         if case["tool"] == "pt":
-            return _run_pt_case(case)
+            return _run_pt_case(cfg, case)
         return _run_rust_case(cfg, case)
     except Exception as exc:
         out = _matrix_base(case)
@@ -617,7 +666,7 @@ def make_server_cfg():
     cfg.write_text(json.dumps({
         "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": DST_PORT},
         "listen": "127.0.0.1",
-        "port": QUIC_PORT,
+        "port": MYSQL_SYNC_SERVER_PORT,
     }, indent=2))
     return cfg
 
@@ -626,7 +675,7 @@ def make_client_cfg(fingerprint):
     cfg = WORK / "config-client.json"
     cfg.write_text(json.dumps({
         "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": SRC_PORT},
-        "server": f"127.0.0.1:{QUIC_PORT}",
+        "server": f"127.0.0.1:{MYSQL_SYNC_SERVER_PORT}",
         "server_fingerprint": fingerprint,
         "allow_csv": True,
         "dump_strategies": ["select-stream"],
@@ -653,7 +702,7 @@ def update_json(path, **changes):
 def print_env():
     print("== Testumgebung ==")
     print(f"  Modus: {'Docker (2 MySQL-8-Container)' if DOCKER else 'lokal (vorab gestartete Instanzen)'}")
-    print(f"  Quelle : 127.0.0.1:{SRC_PORT}\n  Ziel   : 127.0.0.1:{DST_PORT}\n  QUIC   : 127.0.0.1:{QUIC_PORT}")
+    print(f"  Quelle : 127.0.0.1:{SRC_PORT}\n  Ziel   : 127.0.0.1:{DST_PORT}\n  QUIC   : 127.0.0.1:{MYSQL_SYNC_SERVER_PORT}")
 
 
 def start_server(server_cfg, log_name):
@@ -917,7 +966,7 @@ def test_plaintext_tcp(ctx):
     ctx.server, _, _ = restart_server(ctx.server, ctx.server_cfg,
                                       "config-server-tcp.json", "server-tcp.log",
                                       transport="tcp", allow_plaintext=True)
-    wait_tcp(QUIC_PORT)
+    wait_tcp(MYSQL_SYNC_SERVER_PORT)
     client_cfg_t = json_variant(ctx.client_cfg, "config-client-tcp.json",
                                 transport="tcp", allow_plaintext=True)
     ok = mysql_sync(["-C", str(client_cfg_t), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
@@ -1042,6 +1091,19 @@ def cmd_down():
     return True
 
 
+def cmd_clean():
+    if not DOCKER:
+        print("  clean: lokaler Modus, nichts zu entfernen")
+        return True
+    print("== Docker clean ==")
+    r = compose("down", "--remove-orphans", "--volumes")
+    if r.returncode != 0:
+        print(r.stdout[-2000:])
+        print(r.stderr[-2000:])
+        return False
+    return True
+
+
 def cmd_old():
     ensure_binary()
     return old_test()
@@ -1057,6 +1119,7 @@ ACTIONS = {
     "old": cmd_old,
     "matrix": cmd_matrix,
     "down": cmd_down,
+    "clean": cmd_clean,
 }
 
 
