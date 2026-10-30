@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 const MAX_BUCKETS_PER_BATCH: usize = 512;
 const MAX_ROWHASHES_PER_BATCH: usize = 1024;
@@ -693,6 +694,46 @@ async fn export_for_each_row(
     Ok(())
 }
 
+async fn write_chunk_stream(
+    send: &mut SendHalf,
+    mut rx: mpsc::Receiver<hash::ChunkHashEvent>,
+    f: &Framing,
+    filter: Option<HashSet<String>>,
+) -> Result<u64> {
+    let mut batch: Vec<proto::ChunkHash> = Vec::with_capacity(MAX_BUCKETS_PER_BATCH);
+    let mut total = 0u64;
+    while let Some(event) = rx.recv().await {
+        match event {
+            hash::ChunkHashEvent::Item((bucket, count, hash)) => {
+                if filter.as_ref().map(|f| f.contains(&bucket)).unwrap_or(true) {
+                    batch.push(proto::ChunkHash { bucket, hash, count });
+                    total += 1;
+                    if batch.len() >= MAX_BUCKETS_PER_BATCH {
+                        proto::write_response(
+                            send,
+                            &Response::ChunkHashes {
+                                items: std::mem::take(&mut batch),
+                            },
+                            f,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            hash::ChunkHashEvent::Error(e) => anyhow::bail!("{e:#}"),
+        }
+    }
+    if !batch.is_empty() {
+        proto::write_response(
+            send,
+            &Response::ChunkHashes { items: batch },
+            f,
+        )
+        .await?;
+    }
+    Ok(total)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_hashes(
     state: &ServerState,
@@ -804,204 +845,89 @@ async fn do_hashes(
     let chunked_c = chunked.clamp(1, 6);
 
     if hash_of_chunk {
-        if source == HashSource::RawBinary {
-            let acc = hash_binary::chunk_hashes(
-                &mut conn,
-                db,
-                table,
-                &pk_meta,
-                &pk_indexes,
-                mode,
-                chunked_c,
-                state.cfg.hash_algo(),
-                || {},
-            )
-            .await?;
-            let mut items: Vec<proto::ChunkHash> = acc
-                .into_iter()
-                .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
-                .map(|(bucket, (count, hash))| proto::ChunkHash {
-                    bucket,
-                    hash,
-                    count,
-                })
-                .collect();
-            items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
-            let total = items.len();
-            for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
-                proto::write_response(
-                    send,
-                    &Response::ChunkHashes {
-                        items: chunk.to_vec(),
-                    },
-                    f,
-                )
-                .await?;
+        let (tx, rx) = mpsc::channel::<hash::ChunkHashEvent>(200);
+        let scan = async {
+            match source {
+                HashSource::RawBinary => {
+                    hash_binary::stream_chunk_hashes(
+                        tx,
+                        &mut conn,
+                        db,
+                        table,
+                        &pk_meta,
+                        &pk_indexes,
+                        mode,
+                        chunked_c,
+                        state.cfg.hash_algo(),
+                    )
+                    .await
+                }
+                HashSource::RawTsv => {
+                    hash_tsv::stream_chunk_hashes(
+                        tx,
+                        &state.cfg,
+                        db,
+                        table,
+                        &pk_meta,
+                        &pk_indexes,
+                        mode,
+                        chunked_c,
+                    )
+                    .await
+                }
+                HashSource::Dump => {
+                    let strategies = server_export_strategies(state, db, table).await?;
+                    export::stream_chunk_hashes(
+                        tx,
+                        &state.cfg,
+                        db,
+                        table,
+                        &pk_meta,
+                        &pk_indexes,
+                        mode,
+                        chunked_c,
+                        strategies,
+                    )
+                    .await
+                }
+                HashSource::Select => {
+                    sqlhash::stream_chunk_hashes(
+                        tx,
+                        &mut conn,
+                        db,
+                        table,
+                        &pk_meta,
+                        mode,
+                        chunked_c,
+                    )
+                    .await
+                }
             }
-            send_response(
-                send,
-                Response::Ok {
-                    message: format!("{total} buckets"),
-                    count: Some(total as u64),
-                },
-                f,
-            )
-            .await?;
-            return Ok(());
-        }
-        if source == HashSource::RawTsv {
-            let acc = hash_tsv::chunk_hashes(
-                &state.cfg,
-                db,
-                table,
-                &pk_meta,
-                &pk_indexes,
-                mode,
-                chunked_c,
-                || {},
-            )
-            .await?;
-            let mut items: Vec<proto::ChunkHash> = acc
-                .into_iter()
-                .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
-                .map(|(bucket, (count, hash))| proto::ChunkHash {
-                    bucket,
-                    hash,
-                    count,
-                })
-                .collect();
-            items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
-            let total = items.len();
-            for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
-                proto::write_response(
-                    send,
-                    &Response::ChunkHashes {
-                        items: chunk.to_vec(),
-                    },
-                    f,
-                )
-                .await?;
-            }
-            send_response(
-                send,
-                Response::Ok {
-                    message: format!("{total} buckets"),
-                    count: Some(total as u64),
-                },
-                f,
-            )
-            .await?;
-            return Ok(());
-        }
-        if source != HashSource::Dump {
-            let acc =
-                sqlhash::chunk_hashes(&mut conn, db, table, &pk_meta, mode, chunked_c).await?;
-            let mut items: Vec<proto::ChunkHash> = acc
-                .into_iter()
-                .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
-                .map(|(bucket, (count, hash))| proto::ChunkHash {
-                    bucket,
-                    hash,
-                    count,
-                })
-                .collect();
-            items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
-            log::info!("[{db}.{table}] {} SQL-Bucket-Hashes berechnet", items.len());
-            let total = items.len();
-            for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
-                proto::write_response(
-                    send,
-                    &Response::ChunkHashes {
-                        items: chunk.to_vec(),
-                    },
-                    f,
-                )
-                .await?;
-            }
-            send_response(
-                send,
-                Response::Ok {
-                    message: format!("{total} buckets"),
-                    count: Some(total as u64),
-                },
-                f,
-            )
-            .await?;
-            return Ok(());
-        }
-        // Ein Scan über die Tabelle; pro Bucket Hasher + Count.
-        let algo = state.cfg.hash_algo();
-        let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
-        let mut row_err: Option<anyhow::Error> = None;
-        let mut add_row = |values: &[Value]| {
-            let bucket =
-                match hash::chunk_key_for_row(values, &pk_indexes, &pk_meta, mode, chunked_c) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        row_err = Some(e);
-                        return;
-                    }
-                };
-            let rh = hash::row_hash(values, algo);
-            let e = acc
-                .entry(bucket)
-                .or_insert_with(|| (hash::RowHasher::new(algo), 0));
-            match hex::decode(&rh) {
-                Ok(bytes) => e.0.update(&bytes),
-                Err(_) => e.0.update(rh.as_bytes()),
-            }
-            e.1 += 1;
         };
-        if source == HashSource::Dump {
-            let order = mysqlutil::order_by(&pk_meta);
-            export_for_each_row(state, db, table, None, Some(order), &mut add_row).await?;
-        } else {
-            mysqlutil::scan_table(&mut conn, db, table, None, true, &pk_meta, |values| {
-                add_row(&values);
-                futures::future::ready(true)
-            })
-            .await?;
-        }
-        if let Some(e) = row_err {
+        let writer = write_chunk_stream(send, rx, f, filter);
+        let (scan_res, writer_res) = tokio::join!(scan, writer);
+        if let Err(e) = scan_res {
             send_response(send, Response::err(format!("{e:#}")), f).await?;
             return Ok(());
         }
-
-        let mut items: Vec<proto::ChunkHash> = acc
-            .into_iter()
-            .filter(|(b, _)| filter.as_ref().map(|f| f.contains(b)).unwrap_or(true))
-            .map(|(b, (h, c))| {
-                let final_hash = hash::finalize_chunk(&b, c, h);
-                proto::ChunkHash {
-                    bucket: b,
-                    hash: final_hash,
-                    count: c,
-                }
-            })
-            .collect();
-        items.sort_by(|a, b| a.bucket.cmp(&b.bucket));
-        log::info!("[{db}.{table}] {} Bucket-Hashes berechnet", items.len());
-
-        let total = items.len();
-        for chunk in items.chunks(MAX_BUCKETS_PER_BATCH) {
-            proto::write_response(
-                send,
-                &Response::ChunkHashes {
-                    items: chunk.to_vec(),
-                },
-                f,
-            )
-            .await?;
-        }
+        let total = match writer_res {
+            Ok(n) => n,
+            Err(e) => {
+                send_response(send, Response::err(format!("{e:#}")), f).await?;
+                return Ok(());
+            }
+        };
+        log::info!("[{db}.{table}] {total} Bucket-Hashes gestreamt");
         send_response(
             send,
             Response::Ok {
                 message: format!("{total} buckets"),
-                count: Some(total as u64),
+                count: Some(total),
             },
             f,
         )
         .await?;
+        return Ok(());
     } else {
         // Zeilen-Hashes für bestimmte Buckets — Keyset-Paginierung über PK,
         // damit der Speicher begrenzt bleibt (Page für Page, Schreiben dazwischen).

@@ -38,6 +38,9 @@ fn d_chunked() -> u32 {
 fn d_transfer_batch_rows() -> usize {
     1000
 }
+fn d_chunk_stream_buffer() -> usize {
+    200
+}
 fn d_concurrent() -> usize {
     3
 }
@@ -139,6 +142,15 @@ pub struct Config {
     /// - mod:   letzte N Zeichen des Primary Keys bilden einen Bucket (10^N Buckets)
     #[serde(default = "d_chunked")]
     pub chunked: u32,
+
+    /// Lookahead in Chunk-Hashes pro Seite (lokal/remote). Mehr Puffer
+    /// ueberbrueckt hoehere Netzwerklatenz, kostet aber Speicher.
+    #[serde(
+        default = "d_chunk_stream_buffer",
+        alias = "chunk_lookahead",
+        alias = "chunk_buffer"
+    )]
+    pub chunk_stream_buffer: usize,
 
     /// Parallel laufende Tabellen-Tasks (je ein QUIC-Stream)
     #[serde(default = "d_concurrent", alias = "concurrent_processes")]
@@ -300,6 +312,9 @@ impl Config {
         }
         if self.concurrent_processes == 0 {
             anyhow::bail!("\"concurrent_processes\" muss >= 1 sein");
+        }
+        if self.chunk_stream_buffer == 0 || self.chunk_stream_buffer > 100_000 {
+            anyhow::bail!("\"chunk_stream_buffer\" muss zwischen 1 und 100000 liegen");
         }
         if self.max_frame < 64 * 1024 {
             anyhow::bail!("\"max_frame\" zu klein (min. 65536)");

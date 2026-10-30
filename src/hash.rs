@@ -269,6 +269,60 @@ pub fn add_row_hash(
     e.1 += 1;
 }
 
+/// Running chunk hash for a stream whose rows arrive already grouped by bucket.
+///
+/// The producer is responsible for the ordering. `push` returns the previous
+/// bucket when the key changes, so callers can forward every completed chunk
+/// without ever materializing the full table.
+pub struct ChunkAccumulator {
+    algo: HashAlgo,
+    current: Option<(String, RowHasher, u64)>,
+}
+
+pub type ChunkHashValue = (String, u64, String);
+
+/// Events on a chunk-hash stream. `Error` is used by the client-side producer
+/// task; the server writes its own protocol error after the scan returns.
+pub enum ChunkHashEvent {
+    Item(ChunkHashValue),
+    Error(anyhow::Error),
+}
+
+impl ChunkAccumulator {
+    pub fn new(algo: HashAlgo) -> Self {
+        Self { algo, current: None }
+    }
+
+    pub fn push(&mut self, bucket: String, row_hash: &str) -> Option<ChunkHashValue> {
+        let mut completed = None;
+        if self
+            .current
+            .as_ref()
+            .map(|(b, _, _)| b != &bucket)
+            .unwrap_or(false)
+        {
+            completed = self.finish();
+        }
+        if self.current.is_none() {
+            self.current = Some((bucket.clone(), RowHasher::new(self.algo), 0));
+        }
+        let (_, hasher, count) = self.current.as_mut().unwrap();
+        match hex::decode(row_hash) {
+            Ok(bytes) => hasher.update(&bytes),
+            Err(_) => hasher.update(row_hash.as_bytes()),
+        }
+        *count += 1;
+        completed
+    }
+
+    pub fn finish(&mut self) -> Option<ChunkHashValue> {
+        self.current.take().map(|(bucket, hasher, count)| {
+            let hash = finalize_chunk(&bucket, count, hasher);
+            (bucket, count, hash)
+        })
+    }
+}
+
 /// Finalize per-bucket rolling hashes into `(count, hash)`.
 pub fn finish_chunks(
     acc: std::collections::HashMap<String, (RowHasher, u64)>,

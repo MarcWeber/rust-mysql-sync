@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use mysql_async::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use tokio::sync::mpsc;
 
 /// Extract only the PK fields from a raw TSV line, preserving PK order.
 pub fn pk_values_from_line(line: &[u8], pk_indexes: &[usize]) -> Result<Vec<Value>> {
@@ -67,6 +68,49 @@ pub fn pk_values_from_line(line: &[u8], pk_indexes: &[usize]) -> Result<Vec<Valu
         .enumerate()
         .map(|(i, v)| v.with_context(|| format!("PK-Feld {} fehlt in TSV-Zeile", pk_indexes[i])))
         .collect()
+}
+
+/// Streamt abgeschlossene Bucket-Hashes in Sortierreihenfolge.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chunk_hashes(
+    tx: mpsc::Sender<hash::ChunkHashEvent>,
+    cfg: &Config,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    pk_indexes: &[usize],
+    mode: ChunkMode,
+    chunked: u32,
+) -> Result<u64> {
+    let algo = cfg.hash_algo();
+    let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
+    let mut rx = export::spawn_raw_tsv(cfg, db.to_string(), table.to_string(), None, Some(order));
+    let mut acc = hash::ChunkAccumulator::new(algo);
+    let mut total = 0u64;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            RawMsg::Line(line) => {
+                let pk_values = pk_values_from_line(&line, pk_indexes)?;
+                let bucket = hash::chunk_key_for_pk_values(&pk_values, pks, mode, chunked)?;
+                let rh = hash::hash_bytes(&line, algo);
+                if let Some(item) = acc.push(bucket, &rh) {
+                    tx.send(hash::ChunkHashEvent::Item(item))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))?;
+                    total += 1;
+                }
+            }
+            RawMsg::Err(e) => bail!("raw-tsv Export-Fehler: {e}"),
+            RawMsg::Done => break,
+        }
+    }
+    if let Some(item) = acc.finish() {
+        tx.send(hash::ChunkHashEvent::Item(item))
+            .await
+            .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))?;
+        total += 1;
+    }
+    Ok(total)
 }
 
 pub async fn chunk_hashes<F>(

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 
 pub struct SqlRowHash {
     pub bucket: String,
@@ -163,7 +164,7 @@ fn group_query(
          IFNULL(SUM(CAST(CONV(SUBSTR(row_md5, 1, 16), 16, 10) AS UNSIGNED)), 0), \
          IFNULL(SUM(CAST(CONV(SUBSTR(row_md5, 17, 16), 16, 10) AS UNSIGNED)), 0)))) AS hash \
          FROM (SELECT {bucket} AS bucket, {row_md5} AS row_md5 FROM {}) AS x \
-         GROUP BY bucket ORDER BY bucket",
+         GROUP BY bucket ORDER BY BINARY bucket",
         mysqlutil::qualified(db, table)
     ))
 }
@@ -201,6 +202,55 @@ fn row_query(
     }
     sql.push_str(&mysqlutil::order_by(pks));
     Ok(sql)
+}
+
+/// Sortierklausel fuer einen Stream, dessen Buckets beim Lesen abgeschlossen
+/// werden. Range ist bereits durch die PK-Reihenfolge gruppiert; Mod braucht
+/// Bucket + PK als Sortierschluessel.
+pub fn order_by_bucket(pks: &[PkCol], mode: ChunkMode, chunked: u32) -> Result<String> {
+    match mode {
+        ChunkMode::Range => Ok(mysqlutil::order_by(pks)),
+        ChunkMode::Mod => {
+            let bucket = bucket_expr(pks, mode, chunked)?;
+            let cols: Vec<String> = pks.iter().map(|p| mysqlutil::quote_ident(&p.name)).collect();
+            Ok(format!(
+                " ORDER BY BINARY ({bucket}), {}",
+                cols.join(", ")
+            ))
+        }
+    }
+}
+
+/// Streamt die GROUP-BY-Bucket-Hashes in Bucket-Reihenfolge.
+pub async fn stream_chunk_hashes(
+    tx: mpsc::Sender<hash::ChunkHashEvent>,
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    mode: ChunkMode,
+    chunked: u32,
+) -> Result<u64> {
+    let columns = mysqlutil::column_names(conn, db, table).await?;
+    let sql = group_query(db, table, pks, &columns, mode, chunked)?;
+    log::debug!("SQL group hashes (stream): {sql}");
+    let mut result = conn
+        .query_iter(&sql)
+        .await
+        .context("SQL-Gruppen-Hashes fehlgeschlagen")?;
+    let mut count = 0u64;
+    while let Some(row) = result
+        .next()
+        .await
+        .context("Fehler beim Lesen der Gruppen-Hashes")?
+    {
+        let (bucket, cnt, hash): (String, u64, String) = mysql_async::from_row(row);
+        tx.send(hash::ChunkHashEvent::Item((bucket, cnt, hash)))
+            .await
+            .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 pub async fn chunk_hashes(

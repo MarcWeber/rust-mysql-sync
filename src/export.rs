@@ -9,8 +9,8 @@
 //! probiert (mid-stream-Fehler können nicht sicher wiederholt werden).
 
 use crate::config::{Config, MysqlCfg};
-use crate::hash::{tsv_unescape_field, value_to_sql};
-use crate::mysqlutil::{self, qualified};
+use crate::hash::{self, tsv_unescape_field, value_to_sql, ChunkAccumulator, ChunkHashEvent, ChunkMode};
+use crate::mysqlutil::{self, qualified, PkCol};
 use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Value;
@@ -141,6 +141,57 @@ pub fn spawn_fetch_with_fallback(
 }
 
 /// Wie spawn_fetch_with_fallback, aber mit expliziter Strategie-Reihenfolge.
+/// Streamt Bucket-Hashes ueber den Export-/Parser-Pfad. Die Zeilen muessen in
+/// Bucket-Reihenfolge kommen, damit nur ein Bucket gleichzeitig offen ist.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chunk_hashes(
+    tx: mpsc::Sender<ChunkHashEvent>,
+    cfg: &Config,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    pk_indexes: &[usize],
+    mode: ChunkMode,
+    chunked: u32,
+    strategies: Vec<String>,
+) -> Result<u64> {
+    let algo = cfg.hash_algo();
+    let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
+    let mut rx = spawn_fetch_with_strategies(
+        cfg,
+        db.to_string(),
+        table.to_string(),
+        None,
+        Some(order),
+        strategies,
+    );
+    let mut acc = ChunkAccumulator::new(algo);
+    let mut total = 0u64;
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            RowMsg::Row(values) => {
+                let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
+                let rh = hash::row_hash(&values, algo);
+                if let Some(item) = acc.push(bucket, &rh) {
+                    tx.send(ChunkHashEvent::Item(item))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))?;
+                    total += 1;
+                }
+            }
+            RowMsg::Err(e) => bail!("Export/Parser-Fehler: {e}"),
+            RowMsg::Done => break,
+        }
+    }
+    if let Some(item) = acc.finish() {
+        tx.send(ChunkHashEvent::Item(item))
+            .await
+            .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))?;
+        total += 1;
+    }
+    Ok(total)
+}
+
 pub fn spawn_fetch_with_strategies(
     cfg: &Config,
     db: String,

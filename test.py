@@ -281,6 +281,8 @@ MATRIX_DB = "db_matrix"
 MATRIX_ROWS = 100000
 MATRIX_JOBS = 4
 MATRIX_TIMEOUT = 300
+MATRIX_DRIFT_OFFSET = MATRIX_ROWS
+MATRIX_EXTRA_OFFSET = 9 * MATRIX_ROWS
 PT_BIN = os.environ.get("MSYNC_PT_TABLE_SYNC") or shutil.which("pt-table-sync")
 
 
@@ -379,35 +381,33 @@ def _matrix_seed(case, rows):
     cols += ["txt", "n"]
     vals += [txt_expr, "n"]
     cols, vals = ", ".join(cols), ", ".join(vals)
+    digits = max(1, len(str(rows - 1)))
+    digit = ("(SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 "
+             "UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 "
+             "UNION SELECT 8 UNION SELECT 9)")
+    from_clause = ",\n       ".join(f"{digit} d{i}" for i in range(digits))
+    n_expr = " + ".join(f"d{i}.N * {10 ** i}" for i in range(digits))
     return f"""INSERT INTO {table} ({cols})
 SELECT {vals} FROM (
-  SELECT a.N + b.N * 10 + c.N * 100 + d.N * 1000 + e.N * 10000 + 1 AS n
-  FROM (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-        UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
-       (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-        UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
-       (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-        UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c,
-       (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-        UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d,
-       (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-        UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e
+  SELECT {n_expr} + 1 AS n
+  FROM {from_clause}
 ) nums WHERE n <= {rows}"""
 
 
 def _matrix_drift(case):
     table = f"{MATRIX_DB}.{case['table']}"
     update_bin = ", bin_data = UNHEX('DEADBEEF')" if case["binary"] == "bin" else ""
-    extra_id = "900000 + n" if _key_kind(case) == "int" else "CONCAT('extra-', LPAD(n, 4, '0'))"
+    extra_id = (f"{MATRIX_EXTRA_OFFSET} + n" if _key_kind(case) == "int"
+                else "CONCAT('extra-', LPAD(n, 4, '0'))")
     tuple_col = ", id2" if _is_tuple(case) else ""
     tuple_val = ", " + _matrix_id2_expr(case) if _is_tuple(case) else ""
     bin_col = ", bin_data" if case["binary"] == "bin" else ""
     bin_val = ", UNHEX('00FF00FF')" if case["binary"] == "bin" else ""
     return f"""
 DELETE FROM {table} WHERE MOD(n, 20) = 0;
-UPDATE {table} SET txt = CONCAT(txt, ' [drift]'), n = n + 100000{update_bin} WHERE MOD(n, 20) = 1;
+UPDATE {table} SET txt = CONCAT(txt, ' [drift]'), n = n + {MATRIX_DRIFT_OFFSET}{update_bin} WHERE MOD(n, 20) = 1;
 INSERT INTO {table} (id{tuple_col}{bin_col}, txt, n)
-SELECT {extra_id}{tuple_val}{bin_val}, CONCAT('extra-', n), 900000 + n
+SELECT {extra_id}{tuple_val}{bin_val}, CONCAT('extra-', n), {MATRIX_EXTRA_OFFSET} + n
 FROM (SELECT 1 AS n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
       UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9 UNION SELECT 10) x;
 """

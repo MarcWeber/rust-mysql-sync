@@ -23,6 +23,8 @@ use mysql_async::{Conn, Value};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
+const DIFF_BUCKET_BATCH: usize = 200;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HashVia {
     Select,
@@ -61,6 +63,219 @@ async fn fetch_server_profile(
     }
 }
 
+struct ChunkStream {
+    local_rx: mpsc::Receiver<hash::ChunkHashEvent>,
+    remote_rx: mpsc::Receiver<hash::ChunkHashEvent>,
+    local_task: tokio::task::JoinHandle<()>,
+    remote_task: tokio::task::JoinHandle<()>,
+    chunk_send: SendHalf,
+    send: SendHalf,
+    recv: RecvHalf,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_local_chunk_stream(
+    tx: mpsc::Sender<hash::ChunkHashEvent>,
+    cfg: &Config,
+    pool: &mysql_async::Pool,
+    task: &TableTask,
+    pks: &[PkCol],
+    pk_names: &[String],
+    hash_via: HashVia,
+    mode: ChunkMode,
+) -> Result<()> {
+    let mut conn = mysqlutil::session_conn(pool).await?;
+    let names = mysqlutil::column_names(&mut conn, &task.local_db, &task.local_table).await?;
+    let pk_indexes = pk_indexes_for(&names, pk_names)?;
+    match hash_via {
+        HashVia::Select => {
+            sqlhash::stream_chunk_hashes(
+                tx,
+                &mut conn,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                mode,
+                cfg.chunked,
+            )
+            .await?;
+        }
+        HashVia::Dump => {
+            let strategies =
+                check_export_strategies(cfg, &mut conn, &task.local_db, &task.local_table).await?;
+            export::stream_chunk_hashes(
+                tx,
+                cfg,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                &pk_indexes,
+                mode,
+                cfg.chunked,
+                strategies,
+            )
+            .await?;
+        }
+        HashVia::RawBinary => {
+            hash_binary::stream_chunk_hashes(
+                tx,
+                &mut conn,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                &pk_indexes,
+                mode,
+                cfg.chunked,
+                cfg.hash_algo(),
+            )
+            .await?;
+        }
+        HashVia::RawTsv => {
+            hash_tsv::stream_chunk_hashes(
+                tx,
+                cfg,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                &pk_indexes,
+                mode,
+                cfg.chunked,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_remote_chunk_stream(
+    mut recv: RecvHalf,
+    f: Framing,
+    tx: mpsc::Sender<hash::ChunkHashEvent>,
+) -> Result<()> {
+    loop {
+        let resp = read_response(&mut recv, &f).await?;
+        match resp {
+            Response::ChunkHashes { items } => {
+                for it in items {
+                    if tx
+                        .send(hash::ChunkHashEvent::Item((it.bucket, it.count, it.hash)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            Response::Ok { .. } => return Ok(()),
+            Response::Err { message } => bail!("{message}"),
+            _ => bail!("Unerwartete Antwort auf Hashes"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_chunk_stream(
+    cfg: &Config,
+    session: &crate::transport::Session,
+    pool: &mysql_async::Pool,
+    task: &TableTask,
+    local_pks: &[PkCol],
+    pk_names: &[String],
+    hash_via: HashVia,
+    mode: ChunkMode,
+    raw_profile: Option<proto::MysqlProfile>,
+    schema_hash: Option<String>,
+    mut chunk_send: SendHalf,
+    chunk_recv: RecvHalf,
+    f: Framing,
+) -> Result<ChunkStream> {
+    proto::write_request(
+        &mut chunk_send,
+        &Request::Hashes {
+            db: task.remote_db.clone(),
+            table: task.remote_table.clone(),
+            primary_keys: pk_names.to_vec(),
+            chunked: cfg.chunked,
+            hash_of_chunk: true,
+            buckets: None,
+            hash_source: hash_via_source(hash_via),
+            profile: raw_profile,
+            schema_hash,
+        },
+        &f,
+    )
+    .await?;
+
+    let (local_tx, local_rx) = mpsc::channel::<hash::ChunkHashEvent>(cfg.chunk_stream_buffer);
+    let (remote_tx, remote_rx) = mpsc::channel::<hash::ChunkHashEvent>(cfg.chunk_stream_buffer);
+
+    let job_cfg = cfg.clone();
+    let job_pool = pool.clone();
+    let job_task = (*task).clone();
+    let job_pks = local_pks.to_vec();
+    let job_pk_names = pk_names.to_vec();
+    let local_task = tokio::spawn(async move {
+        let err_tx = local_tx.clone();
+        let res = run_local_chunk_stream(
+            local_tx,
+            &job_cfg,
+            &job_pool,
+            &job_task,
+            &job_pks,
+            &job_pk_names,
+            hash_via,
+            mode,
+        )
+        .await;
+        if let Err(e) = res {
+            let _ = err_tx.send(hash::ChunkHashEvent::Error(e)).await;
+        }
+    });
+
+    let remote_task = tokio::spawn(async move {
+        let err_tx = remote_tx.clone();
+        let res = read_remote_chunk_stream(chunk_recv, f, remote_tx).await;
+        if let Err(e) = res {
+            let _ = err_tx.send(hash::ChunkHashEvent::Error(e)).await;
+        }
+    });
+
+    let (send, recv) = session.open(cfg).await?;
+    Ok(ChunkStream {
+        local_rx,
+        remote_rx,
+        local_task,
+        remote_task,
+        chunk_send,
+        send,
+        recv,
+    })
+}
+
+async fn next_chunk(
+    rx: &mut mpsc::Receiver<hash::ChunkHashEvent>,
+) -> Result<Option<ChunkHash>> {
+    match rx.recv().await {
+        None => Ok(None),
+        Some(hash::ChunkHashEvent::Item((bucket, count, hash))) => Ok(Some(ChunkHash {
+            bucket,
+            hash,
+            count,
+        })),
+        Some(hash::ChunkHashEvent::Error(e)) => Err(e),
+    }
+}
+
+async fn join_stream_tasks(
+    local_task: tokio::task::JoinHandle<()>,
+    remote_task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    local_task.await.context("lokaler Chunk-Hash-Task")?;
+    remote_task.await.context("Remote-Chunk-Hash-Task")?;
+    Ok(())
+}
+
+#[derive(Clone)]
 pub struct TableTask {
     pub local_db: String,
     pub local_table: String,
@@ -294,8 +509,10 @@ async fn run_inner(
         // Nur vergleichen: Chunk- und Zeilen-Diffs ohne Schreibzugriffe
         let stats = diff_and_report(
             cfg,
-            &mut send,
-            &mut recv,
+            session,
+            pool,
+            send,
+            recv,
             &mut local_conn,
             &local_pks,
             &local_info,
@@ -374,300 +591,127 @@ async fn run_inner(
         return Ok((sent, 0, Some(local_info.count), vec![]));
     }
 
-    // Chunk-Hashes lokal
-    bar.set_total(local_info.count, "Lokale Chunk-Hashes");
-    let local_chunks = match hash_via {
-        HashVia::Select => {
-            compute_chunk_hashes(
-                &mut local_conn,
-                &task.local_db,
-                &task.local_table,
-                &local_pks,
-                chunk_mode,
-                cfg.chunked,
-                Some(&bar),
-            )
-            .await?
-        }
-        HashVia::Dump => {
-            compute_chunk_hashes_via_export(
-                cfg,
-                &mut local_conn,
-                task,
-                &local_pks,
-                &pk_names,
-                chunk_mode,
-                cfg.chunked,
-                Some(&bar),
-            )
-            .await?
-        }
-        HashVia::RawBinary => {
-            compute_chunk_hashes_raw_binary(
-                &mut local_conn,
-                task,
-                &local_pks,
-                &pk_names,
-                chunk_mode,
-                cfg.chunked,
-                cfg.hash_algo(),
-                Some(&bar),
-            )
-            .await?
-        }
-        HashVia::RawTsv => {
-            compute_chunk_hashes_raw_tsv(
-                cfg,
-                &mut local_conn,
-                task,
-                &local_pks,
-                &pk_names,
-                chunk_mode,
-                cfg.chunked,
-                Some(&bar),
-            )
-            .await?
-        }
-    };
-
-    // Chunk-Hashes remote (Stream)
-    bar.phase("Remote Chunk-Hashes");
-    proto::write_request(
-        &mut send,
-        &Request::Hashes {
-            db: task.remote_db.clone(),
-            table: task.remote_table.clone(),
-            primary_keys: pk_names.clone(),
-            chunked: cfg.chunked,
-            hash_of_chunk: true,
-            buckets: None,
-            hash_source: hash_via_source(hash_via),
-            profile: raw_profile.clone(),
-            schema_hash: schema_hash.clone(),
-        },
-        &f,
+    // ---- 3. Chunk-Hashes: lokaler und remote Scan laufen parallel ----
+    bar.phase("Chunk-Hashes (parallel)");
+    let chunk_stream = start_chunk_stream(
+        cfg,
+        session,
+        pool,
+        task,
+        &local_pks,
+        &pk_names,
+        hash_via,
+        chunk_mode,
+        raw_profile.clone(),
+        schema_hash.clone(),
+        send,
+        recv,
+        f,
     )
     .await?;
-    let mut remote_chunks: HashMap<String, ChunkHash> = HashMap::new();
-    loop {
-        let resp = read_response(&mut recv, &f).await?;
-        match resp {
-            Response::ChunkHashes { items } => {
-                bar.inc(items.len() as u64);
-                for it in items {
-                    remote_chunks.insert(it.bucket.clone(), it);
-                }
-            }
-            Response::Ok { .. } => break,
-            Response::Err { message } => bail!("{message}"),
-            _ => bail!("Unerwartete Antwort auf Hashes"),
-        }
-    }
-    bar.done(&format!(
-        "{} Buckets verglichen",
-        local_chunks.len().max(remote_chunks.len())
-    ));
+    let ChunkStream {
+        mut local_rx,
+        mut remote_rx,
+        local_task,
+        remote_task,
+        chunk_send,
+        mut send,
+        mut recv,
+    } = chunk_stream;
 
-    // Differierende Buckets
-    let mut diff_buckets: Vec<String> = Vec::new();
-    for (b, lh) in &local_chunks {
-        match remote_chunks.get(b) {
-            None => diff_buckets.push(b.clone()),
-            Some(rh) => {
-                if rh.hash != lh.1 || rh.count != lh.0 {
-                    diff_buckets.push(b.clone());
-                }
-            }
-        }
-    }
-    for b in remote_chunks.keys() {
-        if !local_chunks.contains_key(b) {
-            diff_buckets.push(b.clone());
-        }
-    }
-    diff_buckets.sort();
-
-    let total_buckets = local_chunks.len().max(remote_chunks.len()).max(1) as u64;
-    let diff_rows_est: u64 = diff_buckets
-        .iter()
-        .map(|b| {
-            local_chunks
-                .get(b)
-                .map(|(c, _)| *c)
-                .or_else(|| remote_chunks.get(b).map(|r| r.count))
-                .unwrap_or(0)
-        })
-        .sum();
     let total_rows = local_info.count.max(1) as f64;
-    let diff_pct = diff_rows_est as f64 * 100.0 / total_rows;
-    log::info!(
-        "[{label}] {} von {} Buckets differieren (~{} von {} Zeilen, {:.1}%)",
-        diff_buckets.len(),
-        total_buckets,
-        diff_rows_est,
-        local_info.count,
-        diff_pct
-    );
-
-    if diff_buckets.is_empty() {
-        bar.done("identisch");
-        return Ok((0, 0, Some(0), vec![]));
-    }
-
-    // Kein Truncate/Vollkopie-Fallback: auch bei hohem Diff-Anteil wird
-    // zeilenweise abgeglichen, damit Writes während des Scans fliessen und
-    // keine nicht-destruktive Fremdtabelle überschrieben wird.
-
-    // ---- Drill-Down: Zeilen-Hashes beider Seiten ----
-    bar.phase("Drill-Down (Zeilen-Hashes)");
-    let local_rows = match hash_via {
-        HashVia::Select => {
-            compute_row_hashes(
-                &mut local_conn,
-                &task.local_db,
-                &task.local_table,
-                &local_pks,
-                chunk_mode,
-                cfg.chunked,
-                &diff_buckets,
-                Some(&bar),
-            )
-            .await?
-        }
-        HashVia::Dump => {
-            compute_row_hashes_via_export(
-                cfg,
-                &mut local_conn,
-                task,
-                &local_pks,
-                &pk_names,
-                chunk_mode,
-                cfg.chunked,
-                &diff_buckets,
-                Some(&bar),
-            )
-            .await?
-        }
-        HashVia::RawBinary => {
-            compute_row_hashes_raw_binary(
-                &mut local_conn,
-                task,
-                &local_pks,
-                &pk_names,
-                chunk_mode,
-                cfg.chunked,
-                &diff_buckets,
-                cfg.hash_algo(),
-                Some(&bar),
-            )
-            .await?
-        }
-        HashVia::RawTsv => {
-            compute_row_hashes_raw_tsv(
-                cfg,
-                &mut local_conn,
-                task,
-                &local_pks,
-                &pk_names,
-                chunk_mode,
-                cfg.chunked,
-                &diff_buckets,
-                Some(&bar),
-            )
-            .await?
-        }
-    };
-
-    proto::write_request(
-        &mut send,
-        &Request::Hashes {
-            db: task.remote_db.clone(),
-            table: task.remote_table.clone(),
-            primary_keys: pk_names.clone(),
-            chunked: cfg.chunked,
-            hash_of_chunk: false,
-            buckets: Some(diff_buckets.clone()),
-            hash_source: hash_via_source(hash_via),
-            profile: raw_profile.clone(),
-            schema_hash: schema_hash.clone(),
-        },
-        &f,
-    )
-    .await?;
-    let mut remote_rows: HashMap<String, String> = HashMap::new();
-    loop {
-        let resp = read_response(&mut recv, &f).await?;
-        match resp {
-            Response::RowHashes { items } => {
-                bar.inc(items.len() as u64);
-                for it in items {
-                    remote_rows.insert(it.pk, it.hash);
-                }
-            }
-            Response::Ok { .. } => break,
-            Response::Err { message } => bail!("{message}"),
-            _ => bail!("Unerwartete Antwort auf RowHashes"),
-        }
-    }
-
-    let mut to_send: Vec<String> = Vec::new(); // PKs lokal vorhanden, remote fehlen/abweichen
-    let mut to_delete: Vec<String> = Vec::new(); // PKs remote vorhanden, lokal fehlen
-    for (pk, lh) in &local_rows {
-        match remote_rows.get(pk) {
-            None => to_send.push(pk.clone()),
-            Some(rh) => {
-                if rh != lh {
-                    to_send.push(pk.clone());
-                }
-            }
-        }
-    }
-    for pk in remote_rows.keys() {
-        if !local_rows.contains_key(pk) {
-            to_delete.push(pk.clone());
-        }
-    }
-
-    let examples: Vec<String> = {
-        let mut ex: Vec<String> = to_send
-            .iter()
-            .take(check_examples as usize)
-            .cloned()
-            .collect();
-        for pk in to_delete.iter() {
-            if ex.len() >= check_examples as usize {
-                break;
-            }
-            ex.push(pk.clone());
-        }
-        ex
-    };
-
-    if mode == Mode::Check {
-        let differ = to_send.len() as u64 + to_delete.len() as u64;
-        bar.done(&format!("{differ} Zeilen differieren"));
-        return Ok((0, 0, Some(differ), examples));
-    }
-
-    // ---- Änderungen senden ----
-    bar.set_total((to_send.len() + to_delete.len()) as u64, "Sende Änderungen");
+    let mut local_cur: Option<ChunkHash> = None;
+    let mut remote_cur: Option<ChunkHash> = None;
+    let mut local_done = false;
+    let mut remote_done = false;
+    let mut batch: Vec<String> = Vec::with_capacity(DIFF_BUCKET_BATCH);
+    let mut compared = 0u64;
+    let mut diff_bucket_total = 0u64;
+    let mut diff_rows_est = 0u64;
+    let mut differ_total = 0u64;
     let mut sent_total = 0u64;
     let mut deleted_total = 0u64;
+    let mut examples: Vec<String> = Vec::new();
 
-    if !to_send.is_empty() {
-        if cfg.disable_triggers {
-            proto::write_request(
+    loop {
+        if local_cur.is_none() && !local_done {
+            local_cur = next_chunk(&mut local_rx).await?;
+            local_done = local_cur.is_none();
+        }
+        if remote_cur.is_none() && !remote_done {
+            remote_cur = next_chunk(&mut remote_rx).await?;
+            remote_done = remote_cur.is_none();
+        }
+        if local_cur.is_none() && remote_cur.is_none() {
+            break;
+        }
+
+        let take_local = match (&local_cur, &remote_cur) {
+            (Some(l), Some(r)) => l.bucket <= r.bucket,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let diff_bucket = if take_local {
+            let l = local_cur.take().unwrap();
+            compared += 1;
+            match remote_cur.as_ref() {
+                Some(r) if r.bucket == l.bucket => {
+                    let r = remote_cur.take().unwrap();
+                    if l.hash != r.hash || l.count != r.count {
+                        diff_rows_est += l.count;
+                        Some(l.bucket)
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    diff_rows_est += l.count;
+                    Some(l.bucket)
+                }
+            }
+        } else {
+            let r = remote_cur.take().unwrap();
+            compared += 1;
+            diff_rows_est += r.count;
+            Some(r.bucket)
+        };
+        if let Some(bucket) = diff_bucket {
+            batch.push(bucket);
+            diff_bucket_total += 1;
+        }
+
+        if batch.len() >= DIFF_BUCKET_BATCH {
+            let (sent, deleted, differ, ex) = sync_diff_batch(
+                cfg,
                 &mut send,
-                &Request::DisableTriggers {
-                    db: task.remote_db.clone(),
-                    table: task.remote_table.clone(),
-                },
-                &f,
+                &mut recv,
+                &mut local_conn,
+                task,
+                &local_pks,
+                &hex_indexes,
+                &local_info.columns,
+                &batch,
+                hash_via,
+                raw_profile.clone(),
+                schema_hash.clone(),
+                &bar,
+                check_examples,
             )
             .await?;
-            expect_ok(&mut recv, &f, "DisableTriggers").await?;
+            sent_total += sent;
+            deleted_total += deleted;
+            differ_total += differ;
+            for pk in ex {
+                if examples.len() < check_examples as usize {
+                    examples.push(pk);
+                }
+            }
+            batch.clear();
         }
-        sent_total = send_changed_rows(
+    }
+
+    if !batch.is_empty() {
+        let (sent, deleted, differ, ex) = sync_diff_batch(
             cfg,
             &mut send,
             &mut recv,
@@ -676,64 +720,42 @@ async fn run_inner(
             &local_pks,
             &hex_indexes,
             &local_info.columns,
-            &to_send,
+            &batch,
+            hash_via,
+            raw_profile,
+            schema_hash,
             &bar,
+            check_examples,
         )
         .await?;
-        if !to_delete.is_empty() {
-            for chunk in to_delete.chunks(1000) {
-                proto::write_request(
-                    &mut send,
-                    &Request::DeletePks {
-                        db: task.remote_db.clone(),
-                        table: task.remote_table.clone(),
-                        pks: chunk.to_vec(),
-                    },
-                    &f,
-                )
-                .await?;
-                expect_ok(&mut recv, &f, "DeletePks").await?;
-                deleted_total += chunk.len() as u64;
-                bar.inc(chunk.len() as u64);
+        sent_total += sent;
+        deleted_total += deleted;
+        differ_total += differ;
+        for pk in ex {
+            if examples.len() < check_examples as usize {
+                examples.push(pk);
             }
-        }
-        if cfg.disable_triggers {
-            proto::write_request(
-                &mut send,
-                &Request::RestoreTriggers {
-                    db: task.remote_db.clone(),
-                    table: task.remote_table.clone(),
-                },
-                &f,
-            )
-            .await?;
-            expect_ok(&mut recv, &f, "RestoreTriggers").await?;
-        }
-    } else if !to_delete.is_empty() {
-        for chunk in to_delete.chunks(1000) {
-            proto::write_request(
-                &mut send,
-                &Request::DeletePks {
-                    db: task.remote_db.clone(),
-                    table: task.remote_table.clone(),
-                    pks: chunk.to_vec(),
-                },
-                &f,
-            )
-            .await?;
-            expect_ok(&mut recv, &f, "DeletePks").await?;
-            deleted_total += chunk.len() as u64;
-            bar.inc(chunk.len() as u64);
         }
     }
 
+    join_stream_tasks(local_task, remote_task).await?;
+    drop(chunk_send);
+
+    if diff_bucket_total == 0 {
+        bar.done("identisch");
+        return Ok((0, 0, Some(0), vec![]));
+    }
+    let diff_pct = diff_rows_est as f64 * 100.0 / total_rows;
+    log::info!(
+        "[{label}] {} von {} Buckets differieren (~{} von {} Zeilen, {:.1}%)",
+        diff_bucket_total,
+        compared.max(1),
+        diff_rows_est,
+        local_info.count,
+        diff_pct
+    );
     bar.done(&format!("{sent_total} gesendet, {deleted_total} gelöscht"));
-    Ok((
-        sent_total,
-        deleted_total,
-        Some(to_send.len() as u64 + to_delete.len() as u64),
-        examples,
-    ))
+    Ok((sent_total, deleted_total, Some(differ_total), examples))
 }
 
 async fn read_response(recv: &mut RecvHalf, f: &Framing) -> Result<Response> {
@@ -1034,6 +1056,326 @@ async fn compute_row_hashes_raw_tsv(
     Ok(items.into_iter().map(|r| (r.pk, r.hash)).collect())
 }
 
+struct RowDiff {
+    to_send: Vec<String>,
+    to_delete: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn row_diff_for_buckets(
+    cfg: &Config,
+    send: &mut SendHalf,
+    recv: &mut RecvHalf,
+    local_conn: &mut Conn,
+    pks: &[PkCol],
+    task: &TableTask,
+    buckets: &[String],
+    hash_via: HashVia,
+    raw_profile: Option<proto::MysqlProfile>,
+    schema_hash: Option<String>,
+    bar: &crate::progress::TableBar,
+) -> Result<RowDiff> {
+    let f = Framing::from_cfg(cfg);
+    let pk_names: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
+    let mode = hash::chunk_mode_for_pk(pks);
+    let chunked = cfg.chunked;
+
+    let local_rows = match hash_via {
+        HashVia::Select => {
+            compute_row_hashes(
+                local_conn,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                mode,
+                chunked,
+                buckets,
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::Dump => {
+            compute_row_hashes_via_export(
+                cfg,
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                buckets,
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawBinary => {
+            compute_row_hashes_raw_binary(
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                buckets,
+                cfg.hash_algo(),
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawTsv => {
+            compute_row_hashes_raw_tsv(
+                cfg,
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                buckets,
+                Some(bar),
+            )
+            .await?
+        }
+    };
+
+    proto::write_request(
+        send,
+        &Request::Hashes {
+            db: task.remote_db.clone(),
+            table: task.remote_table.clone(),
+            primary_keys: pk_names,
+            chunked,
+            hash_of_chunk: false,
+            buckets: Some(buckets.to_vec()),
+            hash_source: hash_via_source(hash_via),
+            profile: raw_profile,
+            schema_hash,
+        },
+        &f,
+    )
+    .await?;
+    let mut remote_rows: HashMap<String, String> = HashMap::new();
+    loop {
+        match read_response(recv, &f).await? {
+            Response::RowHashes { items } => {
+                bar.inc(items.len() as u64);
+                for it in items {
+                    remote_rows.insert(it.pk, it.hash);
+                }
+            }
+            Response::Ok { .. } => break,
+            Response::Err { message } => bail!("{message}"),
+            _ => bail!("Unerwartete Antwort auf RowHashes"),
+        }
+    }
+
+    let mut to_send: Vec<String> = Vec::new();
+    let mut to_delete: Vec<String> = Vec::new();
+    for (pk, lh) in &local_rows {
+        match remote_rows.get(pk) {
+            None => to_send.push(pk.clone()),
+            Some(rh) => {
+                if rh != lh {
+                    to_send.push(pk.clone());
+                }
+            }
+        }
+    }
+    for pk in remote_rows.keys() {
+        if !local_rows.contains_key(pk) {
+            to_delete.push(pk.clone());
+        }
+    }
+    Ok(RowDiff { to_send, to_delete })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_row_diff(
+    cfg: &Config,
+    send: &mut SendHalf,
+    recv: &mut RecvHalf,
+    local_conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    hex_indexes: &[usize],
+    columns: &[String],
+    diff: &RowDiff,
+    bar: &crate::progress::TableBar,
+) -> Result<(u64, u64)> {
+    let f = Framing::from_cfg(cfg);
+    let mut sent = 0u64;
+    let mut deleted = 0u64;
+
+    if !diff.to_send.is_empty() {
+        if cfg.disable_triggers {
+            proto::write_request(
+                send,
+                &Request::DisableTriggers {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
+            expect_ok(recv, &f, "DisableTriggers").await?;
+        }
+        sent = send_changed_rows(
+            cfg,
+            send,
+            recv,
+            local_conn,
+            task,
+            pks,
+            hex_indexes,
+            columns,
+            &diff.to_send,
+            bar,
+        )
+        .await?;
+        if !diff.to_delete.is_empty() {
+            for chunk in diff.to_delete.chunks(1000) {
+                proto::write_request(
+                    send,
+                    &Request::DeletePks {
+                        db: task.remote_db.clone(),
+                        table: task.remote_table.clone(),
+                        pks: chunk.to_vec(),
+                    },
+                    &f,
+                )
+                .await?;
+                expect_ok(recv, &f, "DeletePks").await?;
+                deleted += chunk.len() as u64;
+                bar.inc(chunk.len() as u64);
+            }
+        }
+        if cfg.disable_triggers {
+            proto::write_request(
+                send,
+                &Request::RestoreTriggers {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                },
+                &f,
+            )
+            .await?;
+            expect_ok(recv, &f, "RestoreTriggers").await?;
+        }
+    } else if !diff.to_delete.is_empty() {
+        for chunk in diff.to_delete.chunks(1000) {
+            proto::write_request(
+                send,
+                &Request::DeletePks {
+                    db: task.remote_db.clone(),
+                    table: task.remote_table.clone(),
+                    pks: chunk.to_vec(),
+                },
+                &f,
+            )
+            .await?;
+            expect_ok(recv, &f, "DeletePks").await?;
+            deleted += chunk.len() as u64;
+            bar.inc(chunk.len() as u64);
+        }
+    }
+    Ok((sent, deleted))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_diff_batch(
+    cfg: &Config,
+    send: &mut SendHalf,
+    recv: &mut RecvHalf,
+    local_conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    hex_indexes: &[usize],
+    columns: &[String],
+    buckets: &[String],
+    hash_via: HashVia,
+    raw_profile: Option<proto::MysqlProfile>,
+    schema_hash: Option<String>,
+    bar: &crate::progress::TableBar,
+    check_examples: u32,
+) -> Result<(u64, u64, u64, Vec<String>)> {
+    let diff = row_diff_for_buckets(
+        cfg,
+        send,
+        recv,
+        local_conn,
+        pks,
+        task,
+        buckets,
+        hash_via,
+        raw_profile,
+        schema_hash,
+        bar,
+    )
+    .await?;
+    let differ = (diff.to_send.len() + diff.to_delete.len()) as u64;
+    let mut examples = Vec::new();
+    for pk in diff.to_send.iter().chain(diff.to_delete.iter()) {
+        if examples.len() >= check_examples as usize {
+            break;
+        }
+        examples.push(pk.clone());
+    }
+    let (sent, deleted) = apply_row_diff(
+        cfg,
+        send,
+        recv,
+        local_conn,
+        task,
+        pks,
+        hex_indexes,
+        columns,
+        &diff,
+        bar,
+    )
+    .await?;
+    Ok((sent, deleted, differ, examples))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_diff_batch(
+    cfg: &Config,
+    send: &mut SendHalf,
+    recv: &mut RecvHalf,
+    local_conn: &mut Conn,
+    pks: &[PkCol],
+    task: &TableTask,
+    buckets: &[String],
+    hash_via: HashVia,
+    raw_profile: Option<proto::MysqlProfile>,
+    schema_hash: Option<String>,
+    bar: &crate::progress::TableBar,
+    check_examples: u32,
+) -> Result<(u64, Vec<String>)> {
+    let diff = row_diff_for_buckets(
+        cfg,
+        send,
+        recv,
+        local_conn,
+        pks,
+        task,
+        buckets,
+        hash_via,
+        raw_profile,
+        schema_hash,
+        bar,
+    )
+    .await?;
+    let differ = (diff.to_send.len() + diff.to_delete.len()) as u64;
+    let mut examples = Vec::new();
+    for pk in diff.to_send.iter().chain(diff.to_delete.iter()) {
+        if examples.len() >= check_examples as usize {
+            break;
+        }
+        examples.push(pk.clone());
+    }
+    Ok((differ, examples))
+}
+
 /// Wenn die Tabelle binäre Spalten hat, wird CSV/TSV vermieden und mysqldump
 /// bevorzugt (hex/bit-sicher). Sonst möglichst Parser-Strategien (kein
 /// select-stream), damit der Transfer-Pfad wirklich getestet wird.
@@ -1326,8 +1668,10 @@ pub struct DiffReport {
 #[allow(clippy::too_many_arguments)]
 async fn diff_and_report(
     cfg: &Config,
-    send: &mut SendHalf,
-    recv: &mut RecvHalf,
+    session: &crate::transport::Session,
+    pool: &mysql_async::Pool,
+    send: SendHalf,
+    recv: RecvHalf,
     local_conn: &mut Conn,
     pks: &[PkCol],
     local_info: &mysqlutil::TableInfo,
@@ -1340,256 +1684,184 @@ async fn diff_and_report(
 ) -> Result<(u64, Vec<String>)> {
     let f = Framing::from_cfg(cfg);
     let pk_names: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
-    let chunked = cfg.chunked;
     let mode = hash::chunk_mode_for_pk(pks);
 
-    let local_chunks = match hash_via {
-        HashVia::Select => {
-            compute_chunk_hashes(
-                local_conn,
-                &task.local_db,
-                &task.local_table,
-                pks,
-                mode,
-                chunked,
-                Some(bar),
-            )
-            .await?
-        }
-        HashVia::Dump => {
-            compute_chunk_hashes_via_export(
-                cfg,
-                local_conn,
-                task,
-                pks,
-                &pk_names,
-                mode,
-                chunked,
-                Some(bar),
-            )
-            .await?
-        }
-        HashVia::RawBinary => {
-            compute_chunk_hashes_raw_binary(
-                local_conn,
-                task,
-                pks,
-                &pk_names,
-                mode,
-                chunked,
-                cfg.hash_algo(),
-                Some(bar),
-            )
-            .await?
-        }
-        HashVia::RawTsv => {
-            compute_chunk_hashes_raw_tsv(
-                cfg,
-                local_conn,
-                task,
-                pks,
-                &pk_names,
-                mode,
-                chunked,
-                Some(bar),
-            )
-            .await?
-        }
-    };
-
-    proto::write_request(
+    bar.phase("Chunk-Hashes (parallel)");
+    let chunk_stream = start_chunk_stream(
+        cfg,
+        session,
+        pool,
+        task,
+        pks,
+        &pk_names,
+        hash_via,
+        mode,
+        raw_profile.clone(),
+        schema_hash.clone(),
         send,
-        &Request::Hashes {
-            db: task.remote_db.clone(),
-            table: task.remote_table.clone(),
-            primary_keys: pk_names.clone(),
-            chunked,
-            hash_of_chunk: true,
-            buckets: None,
-            hash_source: hash_via_source(hash_via),
-            profile: raw_profile.clone(),
-            schema_hash: schema_hash.clone(),
-        },
-        &f,
+        recv,
+        f,
     )
     .await?;
-    let mut remote_chunks: HashMap<String, ChunkHash> = HashMap::new();
-    loop {
-        match read_response(recv, &f).await? {
-            Response::ChunkHashes { items } => {
-                bar.inc(items.len() as u64);
-                for it in items {
-                    remote_chunks.insert(it.bucket.clone(), it);
-                }
-            }
-            Response::Ok { .. } => break,
-            Response::Err { message } => bail!("{message}"),
-            _ => bail!("Unerwartete Antwort"),
-        }
-    }
+    let ChunkStream {
+        mut local_rx,
+        mut remote_rx,
+        local_task,
+        remote_task,
+        chunk_send,
+        mut send,
+        mut recv,
+    } = chunk_stream;
 
-    let mut diff_buckets: Vec<String> = Vec::new();
-    for (b, lh) in &local_chunks {
-        match remote_chunks.get(b) {
-            None => diff_buckets.push(b.clone()),
-            Some(rh) => {
-                if rh.hash != lh.1 || rh.count != lh.0 {
-                    diff_buckets.push(b.clone());
-                }
-            }
-        }
-    }
-    for b in remote_chunks.keys() {
-        if !local_chunks.contains_key(b) {
-            diff_buckets.push(b.clone());
-        }
-    }
-    diff_buckets.sort();
-
-    if diff_buckets.is_empty() {
-        return Ok((0, vec![]));
-    }
-
-    let total_buckets = local_chunks.len().max(remote_chunks.len()).max(1) as u64;
-    let est: u64 = diff_buckets
-        .iter()
-        .map(|b| {
-            local_chunks
-                .get(b)
-                .map(|(c, _)| *c)
-                .unwrap_or(remote_chunks.get(b).map(|r| r.count).unwrap_or(0))
-        })
-        .sum();
     let total_rows = local_info.count.max(1) as f64;
-    let diff_pct = est as f64 * 100.0 / total_rows;
-    if mode == ChunkMode::Mod && diff_pct > cfg.diff_threshold_percent {
-        // Zu viele Diffs für Drill-Down — grobe Schätzung:
-        log::warn!(
-            "[{}.{tbl}] {} von {total_buckets} Buckets differieren (~{est} Zeilen, {diff_pct:.1}%) — Zeilen-Anzahl ist eine Schätzung (Mindestwert)",
-            task.local_db,
-            diff_buckets.len(),
-            tbl = task.local_table
-        );
-        let examples = (0..check_examples.min(est as u32))
-            .map(|i| format!("?#{i}"))
-            .collect();
-        return Ok((est, examples));
-    }
-
-    let local_rows = match hash_via {
-        HashVia::Select => {
-            compute_row_hashes(
-                local_conn,
-                &task.local_db,
-                &task.local_table,
-                pks,
-                mode,
-                chunked,
-                &diff_buckets,
-                Some(bar),
-            )
-            .await?
-        }
-        HashVia::Dump => {
-            compute_row_hashes_via_export(
-                cfg,
-                local_conn,
-                task,
-                pks,
-                &pk_names,
-                mode,
-                chunked,
-                &diff_buckets,
-                Some(bar),
-            )
-            .await?
-        }
-        HashVia::RawBinary => {
-            compute_row_hashes_raw_binary(
-                local_conn,
-                task,
-                pks,
-                &pk_names,
-                mode,
-                chunked,
-                &diff_buckets,
-                cfg.hash_algo(),
-                Some(bar),
-            )
-            .await?
-        }
-        HashVia::RawTsv => {
-            compute_row_hashes_raw_tsv(
-                cfg,
-                local_conn,
-                task,
-                pks,
-                &pk_names,
-                mode,
-                chunked,
-                &diff_buckets,
-                Some(bar),
-            )
-            .await?
-        }
-    };
-    proto::write_request(
-        send,
-        &Request::Hashes {
-            db: task.remote_db.clone(),
-            table: task.remote_table.clone(),
-            primary_keys: pk_names.clone(),
-            chunked,
-            hash_of_chunk: false,
-            buckets: Some(diff_buckets.clone()),
-            hash_source: hash_via_source(hash_via),
-            profile: raw_profile.clone(),
-            schema_hash: schema_hash.clone(),
-        },
-        &f,
-    )
-    .await?;
-    let mut remote_rows: HashMap<String, String> = HashMap::new();
-    loop {
-        match read_response(recv, &f).await? {
-            Response::RowHashes { items } => {
-                bar.inc(items.len() as u64);
-                for it in items {
-                    remote_rows.insert(it.pk, it.hash);
-                }
-            }
-            Response::Ok { .. } => break,
-            Response::Err { message } => bail!("{message}"),
-            _ => bail!("Unerwartete Antwort"),
-        }
-    }
-
+    let mut local_cur: Option<ChunkHash> = None;
+    let mut remote_cur: Option<ChunkHash> = None;
+    let mut local_done = false;
+    let mut remote_done = false;
+    let mut batch: Vec<String> = Vec::with_capacity(DIFF_BUCKET_BATCH);
+    let mut batch_est = 0u64;
+    let mut compared = 0u64;
+    let mut diff_bucket_total = 0u64;
+    let mut diff_rows_est = 0u64;
     let mut differ = 0u64;
     let mut examples: Vec<String> = Vec::new();
-    for (pk, lh) in &local_rows {
-        match remote_rows.get(pk) {
-            None => {
-                differ += 1;
-                if (examples.len() as u32) < check_examples {
-                    examples.push(pk.clone());
+    let mut skipped = false;
+
+    loop {
+        if local_cur.is_none() && !local_done {
+            local_cur = next_chunk(&mut local_rx).await?;
+            local_done = local_cur.is_none();
+        }
+        if remote_cur.is_none() && !remote_done {
+            remote_cur = next_chunk(&mut remote_rx).await?;
+            remote_done = remote_cur.is_none();
+        }
+        if local_cur.is_none() && remote_cur.is_none() {
+            break;
+        }
+
+        let take_local = match (&local_cur, &remote_cur) {
+            (Some(l), Some(r)) => l.bucket <= r.bucket,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let diff_bucket = if take_local {
+            let l = local_cur.take().unwrap();
+            compared += 1;
+            match remote_cur.as_ref() {
+                Some(r) if r.bucket == l.bucket => {
+                    let r = remote_cur.take().unwrap();
+                    if l.hash != r.hash || l.count != r.count {
+                        diff_rows_est += l.count;
+                        batch_est += l.count;
+                        Some(l.bucket)
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    diff_rows_est += l.count;
+                    batch_est += l.count;
+                    Some(l.bucket)
                 }
             }
-            Some(rh) => {
-                if rh != lh {
-                    differ += 1;
-                    if (examples.len() as u32) < check_examples {
-                        examples.push(pk.clone());
+        } else {
+            let r = remote_cur.take().unwrap();
+            compared += 1;
+            diff_rows_est += r.count;
+            batch_est += r.count;
+            Some(r.bucket)
+        };
+        if let Some(bucket) = diff_bucket {
+            batch.push(bucket);
+            diff_bucket_total += 1;
+        }
+
+        if batch.len() >= DIFF_BUCKET_BATCH {
+            let diff_pct = diff_rows_est as f64 * 100.0 / total_rows;
+            if mode == ChunkMode::Mod && diff_pct > cfg.diff_threshold_percent {
+                skipped = true;
+                differ += batch_est;
+            } else {
+                let (d, ex) = check_diff_batch(
+                    cfg,
+                    &mut send,
+                    &mut recv,
+                    local_conn,
+                    pks,
+                    task,
+                    &batch,
+                    hash_via,
+                    raw_profile.clone(),
+                    schema_hash.clone(),
+                    bar,
+                    check_examples,
+                )
+                .await?;
+                differ += d;
+                for pk in ex {
+                    if examples.len() < check_examples as usize {
+                        examples.push(pk);
                     }
                 }
             }
+            batch.clear();
+            batch_est = 0;
         }
     }
-    for pk in remote_rows.keys() {
-        if !local_rows.contains_key(pk) {
-            differ += 1;
-            if (examples.len() as u32) < check_examples {
-                examples.push(pk.clone());
+
+    if !batch.is_empty() {
+        let diff_pct = diff_rows_est as f64 * 100.0 / total_rows;
+        if mode == ChunkMode::Mod && diff_pct > cfg.diff_threshold_percent {
+            skipped = true;
+            differ += batch_est;
+        } else {
+            let (d, ex) = check_diff_batch(
+                cfg,
+                &mut send,
+                &mut recv,
+                local_conn,
+                pks,
+                task,
+                &batch,
+                hash_via,
+                raw_profile,
+                schema_hash,
+                bar,
+                check_examples,
+            )
+            .await?;
+            differ += d;
+            for pk in ex {
+                if examples.len() < check_examples as usize {
+                    examples.push(pk);
+                }
             }
+        }
+    }
+
+    join_stream_tasks(local_task, remote_task).await?;
+    drop(chunk_send);
+
+    if diff_bucket_total == 0 {
+        return Ok((0, vec![]));
+    }
+
+    let diff_pct = diff_rows_est as f64 * 100.0 / total_rows;
+    if skipped {
+        log::warn!(
+            "[{}.{tbl}] {} von {} Buckets differieren (~{} Zeilen, {:.1}%) — Zeilen-Anzahl ist eine Schätzung (Mindestwert)",
+            task.local_db,
+            diff_bucket_total,
+            compared.max(1),
+            diff_rows_est,
+            diff_pct,
+            tbl = task.local_table
+        );
+        if examples.is_empty() {
+            examples = (0..check_examples.min(differ as u32))
+                .map(|i| format!("?#{i}"))
+                .collect();
         }
     }
     Ok((differ, examples))

@@ -20,6 +20,7 @@ use mysql_common::io::ParseBuf;
 use mysql_common::value::{BinValue, ValueDeserializer};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use tokio::sync::mpsc;
 
 fn row_sql(db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&str>) -> String {
     let mut sql = format!("SELECT * FROM {}", mysqlutil::qualified(db, table));
@@ -137,6 +138,56 @@ pub fn pk_values_from_packet(
         .enumerate()
         .map(|(i, v)| v.with_context(|| format!("PK-Spalte {} fehlt im Row-Paket", pk_indexes[i])))
         .collect()
+}
+
+/// Streamt abgeschlossene Bucket-Hashes in Sortierreihenfolge.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chunk_hashes(
+    tx: mpsc::Sender<hash::ChunkHashEvent>,
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    pk_indexes: &[usize],
+    mode: ChunkMode,
+    chunked: u32,
+    algo: hash::HashAlgo,
+) -> Result<u64> {
+    let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
+    let sql = row_sql(db, table, None, Some(&order));
+    let mut result = conn
+        .exec_iter(sql, ())
+        .await
+        .context("binäres SELECT fehlgeschlagen")?;
+    let mut acc = hash::ChunkAccumulator::new(algo);
+    let mut total = 0u64;
+    while let Some((columns, packet)) = result
+        .next_raw()
+        .await
+        .context("binäre Zeile lesen fehlgeschlagen")?
+    {
+        let pk_values = pk_values_from_packet(&packet, &columns, pk_indexes)?;
+        let bucket = hash::chunk_key_for_pk_values(&pk_values, pks, mode, chunked)?;
+        let rh = hash_packet(&packet, columns.len(), algo)?;
+        if let Some(item) = acc.push(bucket, &rh) {
+            send_chunk(&tx, item).await?;
+            total += 1;
+        }
+    }
+    if let Some(item) = acc.finish() {
+        send_chunk(&tx, item).await?;
+        total += 1;
+    }
+    Ok(total)
+}
+
+async fn send_chunk(
+    tx: &mpsc::Sender<hash::ChunkHashEvent>,
+    item: hash::ChunkHashValue,
+) -> Result<()> {
+    tx.send(hash::ChunkHashEvent::Item(item))
+        .await
+        .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))
 }
 
 pub async fn chunk_hashes<F>(
