@@ -2,6 +2,7 @@
 //!
 //! Haupt-Einstiegspunkt: CLI parsen, Config laden, Server- oder Client-Modus.
 
+mod benchmark;
 mod client;
 mod config;
 mod export;
@@ -29,7 +30,7 @@ use std::process::ExitCode;
     name = "mysql-sync",
     version,
     about = "MySQL-Tabellen differentiell über QUIC synchronisieren",
-    after_help = "Beispiele:\n  Server:  ./mysql-sync -C config-server.json\n  Client:  ./mysql-sync -C config-client.json --sync db_skywings.*\n           ./mysql-sync -C config-client.json --force --sync db_skywings.*\n           ./mysql-sync -C config-client.json --force-schema db_skywings,db_airwings\n           ./mysql-sync -C config-client.json --check 10 db_skywings.*\n\nSelector A.B: A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
+    after_help = "Beispiele:\n  Server:  ./mysql-sync -C config-server.json\n  Client:  ./mysql-sync -C config-client.json --sync db1.*\n           ./mysql-sync -C config-client.json --force --sync db1.*\n           ./mysql-sync -C config-client.json --force-schema db1,db2\n           ./mysql-sync -C config-client.json --check 10 db1.*\n           ./mysql-sync -C config-client.json --benchmark db_bench.big\n\nSelector A.B: A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
     /// Pfad zur JSON-Konfigurationsdatei ("-" liest die Config von stdin)
@@ -52,7 +53,11 @@ struct Cli {
     #[arg(long)]
     check: Option<u32>,
 
-    /// Selector A.B (z.B. "db_skywings.*" oder "db1,db2.t1,t2")
+    /// Chunk-Hashes lokal erzeugen und Zeit messen (kein Server, kein Schreiben). Optionaler Selector A.B
+    #[arg(long, num_args = 0..=1, default_missing_value = "*")]
+    benchmark: Option<String>,
+
+    /// Selector A.B (z.B. "db1.*" oder "db1,db2.t1,t2")
     selector: Option<String>,
 
     /// Keine Fortschrittsbalken anzeigen (für Cron/CI)
@@ -64,19 +69,19 @@ struct Cli {
     log_level: String,
 
     /// Diff-/Check-Hashes als gruppierte MD5-Aggregate in MySQL berechnen (Default)
-    #[arg(long, alias = "check-via-select")]
+    #[arg(long, alias = "check-select")]
     hash_via_select: bool,
 
     /// Diff-/Check-Hashes über Export/Parser berechnen (transfer_all-Strategien)
-    #[arg(long, alias = "check-via-dump")]
+    #[arg(long, alias = "check-dump")]
     hash_via_dump: bool,
 
     /// Diff-/Check-Hashes über rohe MySQL-Binary-Protokoll-Zeilen berechnen
-    #[arg(long, alias = "check-via-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_tsv"])]
+    #[arg(long, alias = "check-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_tsv"])]
     hash_via_raw_binary: bool,
 
     /// Diff-/Check-Hashes über rohe `mysql --batch`-TSV-Zeilen berechnen
-    #[arg(long, alias = "check-via-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary"])]
+    #[arg(long, alias = "check-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary"])]
     hash_via_raw_tsv: bool,
 }
 
@@ -102,7 +107,21 @@ async fn main() -> ExitCode {
         || cli.force_schema.is_some()
         || cli.check.is_some();
 
-    let result = if is_client {
+    let bench_modes: Vec<sync::HashVia> = if cli.hash_via_raw_tsv {
+        vec![sync::HashVia::RawTsv]
+    } else if cli.hash_via_raw_binary {
+        vec![sync::HashVia::RawBinary]
+    } else if cli.hash_via_dump {
+        vec![sync::HashVia::Dump]
+    } else if cli.hash_via_select {
+        vec![sync::HashVia::Select]
+    } else {
+        sync::HashVia::ALL.to_vec()
+    };
+
+    let result = if let Some(selector) = cli.benchmark.clone() {
+        benchmark::run(&cfg, Some(&selector), &bench_modes).await
+    } else if is_client {
         client::run(client::ClientArgs {
             cfg,
             force: cli.force,

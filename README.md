@@ -2,15 +2,32 @@
 
 # mysql-sync(1)
 
+Start mysql-sync on source and target server and tell which tables to
+synchronize by glob patterns.
+
+SYNCHRONIZATION:
+on target machine build hashes on chunks send to source machine,
+if hashes differ hash rows -> send diff of chunk to server which applies
+target.
+
+A chunk is defined by int/binary/varchar primary keys eg any last n chars
+such as 19.. (thus 1901 1902 1903 ..) or Benjam.. (eg for names such as
+Benjamin)
+
 ## NAME
 
-mysql-sync — differentially synchronize MySQL tables over QUIC (or plaintext TCP).
+mysql-sync — differentially synchronize MySQL tables over QUIC (or plaintext
+TCP) using multiple ways to process the data (SELECT vs dump as tsv vs ..) so
+you can pick the fastest way
 
 ## SYNOPSIS
 
 ```
-mysql-sync -C CONFIG [--force-schema|--force|--sync|--check N] [OPTIONS] [SELECTOR]
-mysql-sync -C -  < config.json
+# SOURCE (CLIENT)
+mysql-sync -C CONFIG [--force-schema|--force|--sync|--check N|--benchmark] [OPTIONS] [SELECTOR]
+
+# TARGET (SERVER)
+mysql-sync -C config.json
 ```
 
 `-C -` (or `--config -`) reads the JSON config from **stdin**.
@@ -20,50 +37,63 @@ mysql-sync -C -  < config.json
 Compares source (client) and target (server) via bucket and row hashes and
 transfers only differing rows. Transport is QUIC/TLS 1.3 with certificate
 pinning. **Client and server must use the same `hash_algo`** (the Hello
-handshake aborts otherwise), but `--hash-via-select` always uses MySQL `MD5`.
+handshake aborts otherwise), but `--hash-select` always uses MySQL `MD5`.
 
 `SELECTOR` = `A.B` — `A` = DB list or `*`, `B` = table list or `*`.
-Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`.
+Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`, `db1,db2.t1,t2`
 
 | Mode | Effect |
 |---|---|
-| `--force-schema [SEL]` | Create/align schema and databases only |
+| `--force-schema [SEL]` | Create/align schema and databases only. | (TODO better name such as --try-update-schema)
 | `--force [SEL]` | Recreate the target table (data loss) |
 | `--sync [SEL]` | Differential sync (INSERT/UPDATE/DELETE) |
-| `--check N [SEL]` | Diff report + N sample IDs only; no writes |
+| `--check N [SEL]` | Diff report + N sample IDs only; no writes; shows timings thus could be seen as dry-run option to predict the time to diff |
+
+| `--benchmark [SEL]` | same as chuck but run locally only to get an idea how fast it is to walk all rows which roughly is the time it will take for a final sync |
+-> how is it different from check? If you run check you'll get the same
+basically with network latency
 
 | Option | Meaning |
 |---|---|
 | `-C, --config FILE` | JSON config (required); `-` = stdin |
-| `--hash-via-select` | Grouped MD5 fingerprints computed in MySQL (default) |
-| `--hash-via-dump` | Diff hashes via export/parser (alias: `--check-via-dump`) |
-| `--hash-via-raw-binary` | Hash raw MySQL binary-protocol rows (alias: `--check-via-raw-binary`) |
-| `--hash-via-raw-tsv` | Hash raw `mysql --batch` TSV lines (alias: `--check-via-raw-tsv`) |
+
+| `--hash-select` | Grouped MD5 fingerprints computed in MySQL (default, no mysqldump or mysql binary required but slower) |
+| `--hash-dump`   | Diff hashes via export/parser (alias: `--check-dump`) |
+| `--hash-raw-binary-row` | Hash raw MySQL binary-protocol rows (alias: `--check-raw-binary`) |
+| `--hash-raw-binary-row-vec` | Hash raw MySQL binary-protocol rows (alias: `--check-raw-binary`) |
+| `--hash-raw-tsv` | Hash raw `mysql --batch` TSV lines - no binary columns (alias: `--check-raw-tsv`) |
+-> Should try fastest automatically
+
 | `--no-progress` | No progress bars (cron/CI) |
 | `--log-level LVL` | `error|warn|info|debug|trace` |
 
 ## HASHING — RECOMMENDATION
 
-`--hash-via-select` (default) computes bucket fingerprints inside MySQL. One
+`--hash-dump` streams rows through the export/parser path and hashes them
+in Rust with `hash_algo` (xxh3 by default). Use it when that exact export/parser
+path must be exercised or special cases force `mysqldump`.
+
+`--hash-raw-binary-row` reads prepared-statement result rows through a patched
+`mysql_async` `next_raw()` accessor and hashes the native binary row packet
+directly. It decodes only PK fields, and only when a differing bucket must be
+drilled down. This is the fastest path for clean scans and small diffs.
+
+`--hash-raw-tsv` starts `mysql --batch --quick --skip-column-names
+--default-character-set=utf8mb4` on each side and hashes each escaped output
+line. It avoids a second Rust row parser, but depends on an external `mysql`
+CLI and is slower than raw-binary.
+
+`--hash-select` (default) 
+NOTE: happens to be slower than raw-binary/tsv due to nested function calls to
+compute hashes when running on same host.
+
+computes bucket fingerprints inside MySQL. One
 `GROUP BY` query per table returns `bucket`, `COUNT(*)` and an MD5 group hash:
 MySQL builds a null-safe, length-prefixed fingerprint per row, sums both 64-bit
 MD5 halves per bucket, then hashes the aggregate. Only buckets with a different
 hash/count trigger row hashes; only rows with a different PK/hash are exported
 and sent.
 
-`--hash-via-dump` streams rows through the export/parser path and hashes them
-in Rust with `hash_algo` (xxh3 by default). Use it when that exact export/parser
-path must be exercised or special cases force `mysqldump`.
-
-`--hash-via-raw-binary` reads prepared-statement result rows through a patched
-`mysql_async` `next_raw()` accessor and hashes the native binary row packet
-directly. It decodes only PK fields, and only when a differing bucket must be
-drilled down. This is the fastest path for clean scans and small diffs.
-
-`--hash-via-raw-tsv` starts `mysql --batch --quick --skip-column-names
---default-character-set=utf8mb4` on each side and hashes each escaped output
-line. It avoids a second Rust row parser, but depends on an external `mysql`
-CLI and is slower than raw-binary.
 
 Raw modes are **fail-closed**:
 
@@ -78,7 +108,7 @@ Raw modes are **fail-closed**:
 - `hash_algo` controls dump/raw mode only. Select mode always uses MySQL
   `MD5`, because MySQL has no built-in xxh3/blake3. Client and server still need
   the same `hash_algo` because the Hello handshake validates it.
-- `--hash-via-select` avoids serializing/parsing rows, but MySQL `MD5` is slower
+- `--hash-select` avoids serializing/parsing rows, but MySQL `MD5` is slower
   per row than Rust xxh3. Measure both paths for your workload.
 - `xxh3` is not cryptographic, but perfectly sufficient for drift detection
   and the fastest algorithm in dump mode.
@@ -87,77 +117,43 @@ Raw modes are **fail-closed**:
 - `xxh64`, `md5`, `sha256` are primarily for compatibility; not faster than
   xxh3 in dump mode.
 
-**Test environment (measurement 2026-10-29, all hash paths):**
-Apple M1 Ultra (20 cores, 64 GB), macOS, release build (`opt-level=2`).
-Client and server run natively on the host, MySQL 8.0 in Docker
-(`docker-compose.yml`, source `:3306`, target `:3317`). Dataset: synthetic
-table `db_bench.big` with **100,000 rows** (id, VARCHAR MD5 string, INT,
-DATETIME), `chunked=3`, `--check 0`, median of 5 runs (full comparison
-including network and both sides).
+**Test environment (measurement 2026-10-31, all hash paths):**
+Linux x86_64, release build, MySQL 8.0 in Docker (`docker-compose.yml`,
+source `:7012`). Dataset: synthetic table `db_bench.big` with **100,000 rows**
+(id, VARCHAR MD5 string, INT, DATETIME), `chunked=3`.
 
-| Scenario | select (SQL MD5) | dump (Rust xxh3) | raw-binary | raw-tsv |
-|---|---:|---:|---:|---:|
-| clean (0 diffs) | 867 ms | 258 ms | **142 ms** | 555 ms |
-| 10% of rows differ (10% of buckets) | 980 ms | 303 ms | **164 ms** | 961 ms |
-| target empty (100% diff) | 679 ms | **147 ms** | 301 ms | 1096 ms |
+`--benchmark` generates the chunk hashes locally and discards them. It needs no
+server and performs no writes; the measured time is the local scan + hashing
+work that dominates a clean synchronization.
+
+| mode | time (median of 5) | rows/s |
+|---|---:|---:|
+| select (SQL MD5) | 871 ms | 114,850 |
+| dump (Rust xxh3) | 489 ms | 204,624 |
+| raw-binary | **100 ms** | 998,004 |
+| raw-tsv | 185 ms | 540,000 |
 
 The dump path is fast because `select-stream` sends native rows to the Rust
-process and xxh3 hashes them. No CSV is written for `--check`; CSV is used only
-when `--sync` actually transfers changed rows (and binary columns force the SQL
-dump path). Raw-binary avoids building `Vec<Value>` and hashing text: it hashes
-the binary protocol packet directly and decodes only the PK fields it needs.
-
-When the target is empty, every bucket differs, so the check performs a second
-row-hash pass over all rows. Raw-binary pays for two full scans, while select's
-row-hash query stays inside MySQL; raw-tsv additionally pays for the external
-`mysql` process and TSV escaping/unescaping per row. The numbers are
-indicative — reproduce them on your own hardware with `--check`.
+process and xxh3 hashes them. Raw-binary avoids building `Vec<Value>` and
+hashing text: it hashes the binary protocol packet directly and decodes only
+the PK fields it needs. Raw-tsv additionally pays for the external `mysql`
+process and TSV escaping/unescaping per row. The numbers are indicative —
+reproduce them on your own hardware.
 
 **Reproducing the benchmark** (test data is generated, not shipped):
 
 ```bash
-# 1) create the 100k-row table on the source
-docker compose exec -T mysql-src mysql -uroot -psyncroot -e "
-CREATE DATABASE IF NOT EXISTS db_bench;
-CREATE TABLE db_bench.big (id INT NOT NULL AUTO_INCREMENT, a VARCHAR(64) NOT NULL,
-  b INT NOT NULL, c DATETIME NOT NULL, PRIMARY KEY(id)) ENGINE=InnoDB;
-INSERT INTO db_bench.big (a,b,c)
-SELECT CONCAT('row-',n,'-',MD5(n)), n%1000, DATE_ADD('2024-01-01', INTERVAL n SECOND)
-FROM (SELECT a.N + b.N*10 + c.N*100 + d.N*1000 + e.N*10000 + 1 AS n
-      FROM (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
-           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
-           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c,
-           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d,
-           (SELECT 0 N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
-            UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e) s
-WHERE n <= 100000;"
+# 1) create the 100k-row table on the source (see deploy/ or your own data)
+# 2) benchmark all hash paths locally (no server required)
+mysql-sync -C config-client.json --benchmark db_bench.big
 
-# 2) fill the target and time both data paths (5× each)
-mysql-sync -C .test-run/config-client.json --force --sync db_bench.big
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-binary db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-tsv db_bench.big; done
-
-# 3) repeat with ~10% differing rows on the target
-docker compose exec -T mysql-dst mysql -uroot -psyncroot -e \
-  "UPDATE db_bench.big SET a=CONCAT(a,'-x') WHERE id <= 10000"
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-binary db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-tsv db_bench.big; done
-
-# 4) repeat with an empty target (100% diff)
-docker compose exec -T mysql-dst mysql -uroot -psyncroot -e "TRUNCATE db_bench.big"
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-dump db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-binary db_bench.big; done
-for i in 1 2 3 4 5; do time mysql-sync -C .test-run/config-client.json --check 0 --hash-via-raw-tsv db_bench.big; done
+# one path only (selector directly after --benchmark)
+mysql-sync -C config-client.json --benchmark db_bench.big --hash-raw-binary-row
 ```
+
+Output is tab-separated: `table`, `mode`, `sync_ms`, `rows`, `buckets`,
+`rows_per_s`, so it can be sorted with standard tools. Use
+`--hash-select|dump|raw-binary|raw-tsv` to restrict the run to one path.
 
 All algorithms are compiled in by default (`blake3`, `xxhash`, `md5`, `sha2`).
 Minimal build: `cargo build --no-default-features --features xxhash`.
@@ -191,6 +187,19 @@ points at the source instance, its writes would modify the source.
 
 ## CHUNK MODES
 
+Most database tables have a very simlpe order.
+primary id fields evenly distirbuted incrementing.
+-> That's what' range is for
+-> See **Range**
+
+If you think about arbitrary keys such as dates/floats whatever :-/
+there is no real structure to divide the data into.
+Maybe it would be best to find biggest/smallest and divide into 2 buckets
+keep dividing till buckets are reasonably small or just scan and hash
+-> This case I honestly don't care about
+-> **Mod** might go await/be rewritten changed whatever
+
+
 The chunk mode is selected automatically per table from the primary-key metadata;
 there is no `chunk_mode` config key. `chunked` controls the bucket width/suffix.
 
@@ -199,12 +208,16 @@ there is no `chunk_mode` config key. `chunked` controls the bucket width/suffix.
   `floor(pk / 10^chunked) * 10^chunked` (`chunked=3` → 1,000-value ranges);
   CHAR/BINARY keys remove the last `chunked` characters/bytes. Every chunk
   SELECT/export is ordered by PK.
+
+  In primary key tuples the last field is chunked only right now
+
 - **Mod** is chosen automatically as the fallback for composite PKs and other
   single-column types (DATE/TIME, DECIMAL, FLOAT/DOUBLE, ENUM/SET, BIT,
   TEXT/BLOB prefix keys, …). It uses modulo/suffix buckets: the last `chunked`
   characters of the canonical PK component, or `ABS(pk) % 10^N` for numeric
   components. Composite keys bucket by their last component. Date keys use the
   date-only form.
+
 - Mod buckets are not contiguous, so they generally cannot use PK range
   predicates and may scan the table.
 
@@ -271,7 +284,7 @@ mod-scan cost.
 
 ### Row sources — four separate implementations
 
-The four `--hash-via-*` modes are four different ways to produce the *same*
+The four `--hash-*` modes are four different ways to produce the *same*
 information (chunk hash, row hash, PK, row payload for changed rows). They
 differ in **where hashing happens** and **whether row bytes cross the wire**,
 so they are kept as four independent implementations, all consumed through one
@@ -405,14 +418,14 @@ mysql-sync -C config-server.json
 mysql-sync -C config-client.json --force-schema db1,db2
 mysql-sync -C config-client.json --force --sync db1.*,db2.*
 mysql-sync -C config-client.json --check 10 "db1.*" || alert "DB drift!"
-mysql-sync -C config-client.json --check 10 --hash-via-dump "db1.t1"
+mysql-sync -C config-client.json --check 10 --hash-dump "db1.t1"
 
 # config from stdin (e.g. from a secret store)
 cat config-client.json | mysql-sync -C - --check 10 "db1.*"
 ```
 
-`--check-via-select`, `--check-via-dump`, `--check-via-raw-binary`, and
-`--check-via-raw-tsv` remain valid aliases for their `--hash-via-*` forms.
+`--check-select`, `--check-dump`, `--check-raw-binary`, and
+`--check-raw-tsv` remain valid aliases for their `--hash-*` forms.
 
 For `--sync`, put the selector directly after the flag (or after `--check N`).
 `--sync` accepts an optional selector; if another option sits between `--sync`

@@ -1,37 +1,23 @@
 #!/usr/bin/env python3
 """
+
+Docker only so that test is portable.
+table names have prefixes
+
+src_XXXX -> can be reused
+dst_YYYY -> where YYYY is a specific test case so each test case gets its own rw target table
+
+The docker mysql instances are both read and write targets
+
+to keep it simpsle the database is called 
+rust_mysql_sync.* for now
+
 mysql-sync End-to-End-Test.
 
 Aufruf:
-  python3 test.py single|parallel [up|old|matrix|down] ...
-  python3 test.py single up matrix      # Matrix-Fälle nacheinander
-  python3 test.py parallel up matrix    # Matrix-Fälle parallel
-  python3 test.py single up old matrix down   # kompletter Zyklus
-
-single/parallel ist Pflicht und setzt CONCURRENCY. "single" führt Matrix-Fälle
-sequentiell aus (1 Job), "parallel" nutzt MATRIX_JOBS Jobs.
-
-Aktionen:
-  up     : Docker-Container starten und auf MySQL warten (lokal: no-op)
-  old    : Szenarien A-L auf frisch geladenem Seed ausführen
-  matrix : rust-sync vs pt-table-sync auf isolierten db_matrix-Tabellen
-  down   : Docker-Container stoppen/entfernen (lokal: no-op)
-
-Ohne Aktionen nach single/parallel läuft "up old matrix down".
-Alle Ausgaben werden zusätzlich mit Datum, CPU-Typ und CONCURRENCY nach
-test.log geschrieben (überschreibbar mit MSYNC_LOG).
-
-
 Modi:
   1. Docker (Standard):  startet 2 MySQL-8-Container via docker compose,
      baut/startet den Server-Binary auf dem Host und spielt alle Szenarien durch.
-  2. Lokal (MSYNC_LOCAL=1): erwartet 2 laufende MySQL/MariaDB-Instanzen
-     (Quelle MSYNC_SRC_PORT=33061, Ziel MSYNC_DST_PORT=33062, User root,
-     Passwort MSYNC_ROOT_PW=''), plus mysql-CLI im PATH (MSYNC_MYSQL_CLI).
-
-Das Binary wird über MSYNC_BIN oder cargo (inkl. CARGO_TARGET_DIR) gesucht.
-Fehlt es, baut der Test es automatisch mit `cargo build --release`
-(abschaltbar mit MSYNC_NO_BUILD=1).
 
 Szenarien (Aktion old):
   A) --force-schema  : Schema auf Ziel erzwingen
@@ -72,13 +58,26 @@ import socket
 import subprocess
 import sys
 import time
+import yaml
 import traceback
 from datetime import datetime
 from pathlib import Path
+from yachalk import chalk
+from asyncio import create_task, to_thread, sleep, timeout, timeout_at, Semaphore, Future
+import asyncio
+
+from u_redirect_logging import with_logging
+from u_asyncio import run_show_out_tail_on_error, task
+
+START_PORT = 7012
+
+DOCKER_MYSQL_INSTANCES = [
+    {"name": "mysql80", "version": 8.0, "port": 7012},
+    {"name": "mysql97", "version": 9.7, "port": 7013}
+]
 
 HERE = Path(__file__).resolve().parent
 WORK = HERE / ".test-run"
-
 
 def _cargo_target_dir():
     override = os.environ.get("CARGO_TARGET_DIR")
@@ -106,78 +105,20 @@ if os.environ.get("MSYNC_BIN"):
 else:
     BIN = _default_bin()
 
-DOCKER = shutil.which("docker") is not None and not os.environ.get("MSYNC_LOCAL")
-SRC_PORT = int(os.environ.get("MSYNC_SRC_PORT", 7012 if DOCKER else 33061))
-DST_PORT = int(os.environ.get("MSYNC_DST_PORT", 7013 if DOCKER else 33062))
-ROOT_PW = os.environ.get("MSYNC_ROOT_PW", "syncroot" if DOCKER else "")
-MYSQL_SYNC_SERVER_PORT = int(os.environ.get("MSYNC_MYSQL_SYNC_SERVER_PORT", 44330))
+E = os.environ
 
-PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
-SKIP = "\033[33mSKIP\033[0m"
+DOCKER = E["MSYNC_DOCKER"]
+SRC_PORT = int(E["MSYNC_SRC_PORT"])
+DST_PORT = int(E["MSYNC_DST_PORT"])
+ROOT_PW = E["MSYNC_ROOT_PW"] # "syncroot"
+MYSQL_SYNC_SERVER_PORT = int(E["MYSQL_SYNC_SERVER_PORT"])
+
+PASS, FAIL = chalk.green("PASS"), chalk.red("FAIL")
+SKIP = chalk.yellow("SKIP")
 results = []
-CONCURRENCY = None
+CONCURRENCY = 1
 
 LOG_PATH = Path(os.environ.get("MSYNC_LOG") or (HERE / "test.log"))
-
-
-class Tee:
-    def __init__(self, *streams):
-        self.streams = streams
-
-    def write(self, data):
-        for stream in self.streams:
-            stream.write(data)
-            stream.flush()
-        return len(data)
-
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
-
-    def isatty(self):
-        return False
-
-
-def cpu_type():
-    if sys.platform == "darwin":
-        try:
-            return subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                text=True, stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            pass
-    try:
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
-            if line.startswith("model name"):
-                return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return platform.processor() or platform.machine() or "unknown"
-
-
-def start_logging():
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    log = open(LOG_PATH, "a", encoding="utf-8")
-    original_out, original_err = sys.stdout, sys.stderr
-    sys.stdout = Tee(original_out, log)
-    sys.stderr = Tee(original_err, log)
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"===== {stamp} | cpu={cpu_type()} | concurrency={CONCURRENCY or 'MISSING'} | "
-          f"log={LOG_PATH} | argv={' '.join(sys.argv)} =====")
-    print(f"CONCURRENCY={CONCURRENCY or 'MISSING'} matrix_jobs={effective_jobs() if CONCURRENCY else '-'}")
-    return original_out, original_err, log
-
-
-def stop_logging(state):
-    original_out, original_err, log = state
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-    finally:
-        sys.stdout = original_out
-        sys.stderr = original_err
-        log.close()
 
 
 def step(name, ok, detail=""):
@@ -238,7 +179,6 @@ def ensure_binary():
     if not BIN.exists():
         raise SystemExit(f"Binary auch nach dem Build nicht gefunden: {BIN}")
 
-
 def sql(which, query, database=None, check=True, quiet=False):
     """SQL auf Quelle (which='src') oder Ziel (which='dst') ausführen."""
     if DOCKER:
@@ -285,17 +225,12 @@ MATRIX_DRIFT_OFFSET = MATRIX_ROWS
 MATRIX_EXTRA_OFFSET = 9 * MATRIX_ROWS
 PT_BIN = os.environ.get("MSYNC_PT_TABLE_SYNC") or shutil.which("pt-table-sync")
 
-
-def effective_jobs():
-    return 1 if CONCURRENCY == "single" else max(1, MATRIX_JOBS)
-
 RUST_MODES = (
     ("select", None),
-    ("dump", "--hash-via-dump"),
-    ("raw-binary", "--hash-via-raw-binary"),
-    ("raw-tsv", "--hash-via-raw-tsv"),
+    ("dump", "--hash-dump"),
+    ("raw-binary", "--hash-raw-binary-row"),
+    ("raw-tsv", "--hash-raw-tsv"),
 )
-
 
 def _matrix_case(tool, key, binary, mode=None):
     dims = {"tool": tool, "key": key, "binary": binary, "mode": mode}
@@ -306,13 +241,24 @@ def _matrix_case(tool, key, binary, mode=None):
 
 def matrix_cases():
     cases = []
-    for key in ("int", "str", "int-tuple", "str-tuple", "mixed-tuple"):
-        for binary in ("none", "bin"):
-            cases.append(_matrix_case("pt", key, binary))
-            for mode, _ in RUST_MODES:
-                cases.append(_matrix_case("rust", key, binary, mode))
-    return cases
+    # different mysql versions !
+    # the binary-via-
+    for key, binary, mysql_versions in product(
+           # primary key  variations
+           ("int", "str", "int-tuple", "str-tuple", "mixed-tuple"),
 
+           # with or without binary
+           ("none", "bin"),
+
+           # mysql versions differ
+           # --hash-raw-binary-row -> expected to fail if mysql versions differ
+           # --hash-raw-binary-row-vec -> expected to always work
+           ("8.0:8.0", "8.0:9.7")
+        ):
+        cases.append(_matrix_case("pt", key, binary))
+        for mode, _ in RUST_MODES:
+            cases.append(_matrix_case("rust", key, binary, mode))
+    return cases
 
 def _key_kind(case):
     return case["key"].split("-")[0]
@@ -549,9 +495,8 @@ def _matrix_runner(cfg, case):
         out.update(status="error", detail=str(exc)[-300:])
         return out
 
-
 async def _matrix_async(cfg, cases):
-    sem = asyncio.Semaphore(effective_jobs())
+    sem = asyncio.Semaphore(CONCURRENCY)
 
     async def one(case):
         async with sem:
@@ -562,8 +507,8 @@ async def _matrix_async(cfg, cases):
 
 def _report_matrix(rows, wall_ms):
     print("\n== Matrix: rust-sync vs pt-table-sync ==")
-    print(f"  concurrency={CONCURRENCY or 'MISSING'} rows={MATRIX_ROWS} "
-          f"jobs={effective_jobs()} wall={wall_ms:.0f} ms")
+    print(f"concurrency={CONCURRENCY} rows={MATRIX_ROWS} "
+          f"wall={wall_ms:.0f} ms")
     print("  Legend (all times in ms):")
     print("    clean = check while tables are identical (rust only; detection, no writes)")
     print("    drift = check while tables differ (detection only, no writes)")
@@ -571,14 +516,13 @@ def _report_matrix(rows, wall_ms):
     print("    total = clean + drift + sync = total time for this table")
     print("    pt-table-sync: drift = --print, sync = --execute (no clean run)")
     print("    mode: select/dump/raw-binary/raw-tsv = rust-sync hashing method")
-    print(f"  {'tool':5s} {'key':4s} {'bin':4s} {'mode':11s} {'clean':>8s} {'drift':>8s} "
-          f"{'sync':>8s} {'total':>8s}  status")
-    for r in sorted(rows, key=lambda x: (x["tool"], x["key"], x["binary"], x["mode"] or "")):
+    print("key\tbin\tsync\ttool\tmode\tclean\tdrift\ttotal\tstatus")
+    for r in sorted(rows, key=lambda x: (x["key"], x["binary"], x["tool"], x["mode"] or "")):
         def ms(v):
             return "-" if v is None else f"{v:.0f}"
-        print(f"  {r['tool']:5s} {r['key']:4s} {r['binary']:4s} {(r['mode'] or '-'):11s} "
-              f"{ms(r['clean_ms']):>8s} {ms(r['drift_ms']):>8s} {ms(r['sync_ms']):>8s} "
-              f"{ms(r['total_ms']):>8s}  {r['status']}"
+        print(f"{r['key']}\t{r['binary']}\t{ms(r['sync_ms'])}\t{r['tool']}\t"
+              f"{r['mode'] or '-'}\t{ms(r['clean_ms'])}\t{ms(r['drift_ms'])}\t"
+              f"{ms(r['total_ms'])}\t{r['status']}"
               + (f" ({r['detail']})" if r["detail"] else ""))
 
     print("  Totals:")
@@ -590,15 +534,17 @@ def _report_matrix(rows, wall_ms):
         for k in ("clean", "drift", "sync", "total"):
             if r[f"{k}_ms"] is not None:
                 g[k] += r[f"{k}_ms"]
+    print("tool\tn\tclean\tdrift\tsync\ttotal")
     for label in sorted(groups):
         g = groups[label]
-        print(f"    {label:16s} n={g['n']:2d} clean={g['clean']:8.0f} "
-              f"drift={g['drift']:8.0f} sync={g['sync']:8.0f} total={g['total']:8.0f} ms")
+        print(f"{label}\t{g['n']}\t{g['clean']:.0f}\t{g['drift']:.0f}\t"
+              f"{g['sync']:.0f}\t{g['total']:.0f}")
     grand = sum(r["total_ms"] or 0.0 for r in rows)
-    print(f"    {'TOTAL':16s} n={len(rows):2d} {'':>8s} {'':>8s} {'':>8s} total={grand:8.0f} ms")
+    print(f"TOTAL\t{len(rows)}\t-\t-\t-\t{grand:.0f}")
 
 
-def prepare_workdir():
+@task
+async def prepare_workdir():
     WORK.mkdir(exist_ok=True)
     if not DOCKER:
         return
@@ -658,8 +604,12 @@ sys.exit(subprocess.call(cmd))
     wrapper.chmod(0o755)
     os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
 
+@task
+async def docker_db_up():
+    await compose("up", "-d", "--wait")
+    await ensure_dbs_up()
 
-def wait_for_db(attempts=60):
+async def ensure_dbs_up(attempts=20):
     for _ in range(attempts):
         try:
             sql("src", "SELECT 1", quiet=True)
@@ -667,8 +617,8 @@ def wait_for_db(attempts=60):
             return True
         except SystemExit:
             time.sleep(2)
-    return False
-
+            print(".. waiting for dbs")
+    assert False, "dbs not up"
 
 def make_server_cfg():
     cfg = WORK / "config-server.json"
@@ -678,7 +628,6 @@ def make_server_cfg():
         "port": MYSQL_SYNC_SERVER_PORT,
     }, indent=2))
     return cfg
-
 
 def make_client_cfg(fingerprint):
     cfg = WORK / "config-client.json"
@@ -765,35 +714,35 @@ class OldContext:
 
 def test_force_schema(ctx):
     print("== A: --force-schema ==")
-    ok = mysql_sync(ctx.cfg + ["--force-schema", "db_skywings,db_airwings"])
-    tbls = scalar("dst", "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='db_skywings'")
+    ok = mysql_sync(ctx.cfg + ["--force-schema", "db1,db2"])
+    tbls = scalar("dst", "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='db1'")
     ok &= step("Tabellen auf Ziel erstellt", tbls == "1")
     return step("A: force-schema", ok)
 
 
 def test_initial_sync(ctx):
     print("== B: --sync (differentiell) ==")
-    ok = mysql_sync(ctx.cfg + ["--sync", "db_skywings.*,db_airwings.*"])
-    for db, table in [("db_skywings", "flights"), ("db_airwings", "payloads")]:
+    ok = mysql_sync(ctx.cfg + ["--sync", "db1.*,db2.*"])
+    for db, table in [("db1", "flights"), ("db2", "payloads")]:
         s = scalar("src", f"SELECT COUNT(*) FROM {table}", db)
         d = scalar("dst", f"SELECT COUNT(*) FROM {table}", db)
         ok &= step(f"Count gleich: {db}.{table}", s == d, f"src={s} dst={d}")
-    cs = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,'')))+SUM(CRC32(label)) FROM payloads", "db_airwings")
-    cd = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,'')))+SUM(CRC32(label)) FROM payloads", "db_airwings")
+    cs = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,'')))+SUM(CRC32(label)) FROM payloads", "db2")
+    cd = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,'')))+SUM(CRC32(label)) FROM payloads", "db2")
     ok &= step("BLOB-Prüfsummen identisch (binärsicher!)", cs == cd and cs != "0", f"{cs} vs {cd}")
-    fs = scalar("src", "SELECT SUM(CRC32(COALESCE(notes,'')))+SUM(CRC32(flight_no))+SUM(CRC32(origin)) FROM flights", "db_skywings")
-    fd = scalar("dst", "SELECT SUM(CRC32(COALESCE(notes,'')))+SUM(CRC32(flight_no))+SUM(CRC32(origin)) FROM flights", "db_skywings")
+    fs = scalar("src", "SELECT SUM(CRC32(COALESCE(notes,'')))+SUM(CRC32(flight_no))+SUM(CRC32(origin)) FROM flights", "db1")
+    fd = scalar("dst", "SELECT SUM(CRC32(COALESCE(notes,'')))+SUM(CRC32(flight_no))+SUM(CRC32(origin)) FROM flights", "db1")
     ok &= step("Inhalts-Prüfsummen identisch", fs == fd, f"{fs} vs {fd}")
     return step("B: sync", ok)
 
 
 def test_check_identical(ctx):
     print("== C: --check (select/dump/raw-binary/raw-tsv) 10 (identisch) ==")
-    ok = mysql_sync(ctx.cfg + ["--check", "10", "db_skywings.*,db_airwings.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--check-via-dump", "db_skywings.*,db_airwings.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--hash-via-raw-binary", "db_skywings.*,db_airwings.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--hash-via-raw-tsv", "db_skywings.*"], expect_rc=0)
-    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-via-raw-tsv", "db_airwings.payloads"])
+    ok = mysql_sync(ctx.cfg + ["--check", "10", "db1.*,db2.*"], expect_rc=0)
+    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--check-dump", "db1.*,db2.*"], expect_rc=0)
+    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--hash-raw-binary-row", "db1.*,db2.*"], expect_rc=0)
+    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--hash-raw-tsv", "db1.*"], expect_rc=0)
+    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-raw-tsv", "db2.payloads"])
     ok &= step("raw-tsv lehnt binäre Spalten ab",
                rc != 0 and "keine binären Spalten" in out, f"rc={rc}")
     return step("C: check (select/dump/raw) → Exit 0", ok)
@@ -803,47 +752,47 @@ def test_drift_check(ctx):
     print("== D: Drift erzeugen + --check (select/dump/raw) 5 ==")
     sql("dst", (HERE / "deploy/drift.sql").read_text())
 
-    def capture_check(extra=None, selector="db_skywings.*,db_airwings.*"):
+    def capture_check(extra=None, selector="db1.*,db2.*"):
         return run_bin(ctx.cfg + ["--check", "5", *([extra] if extra else []), selector])
 
     ok = True
-    for name, extra in (("--check", None), ("--check-via-dump", "--check-via-dump"),
-                        ("--hash-via-raw-binary", "--hash-via-raw-binary")):
+    for name, extra in (("--check", None), ("--check-dump", "--check-dump"),
+                        ("--hash-raw-binary-row", "--hash-raw-binary-row")):
         rc, joined = capture_check(extra)
         ok &= step(f"{name}: Exit 1", rc == 1, f"rc={rc}")
         ok &= step(f"{name}: 49 Diffs in flights erkannt", "49" in joined)
         ok &= step(f"{name}: 19 Diffs in payloads erkannt", "19" in joined)
         ok &= step(f"{name}: Beispiel-IDs angegeben", "Beispiele:" in joined)
-    rc, joined = capture_check("--hash-via-raw-tsv", "db_skywings.*")
-    ok &= step("--hash-via-raw-tsv: Exit 1", rc == 1, f"rc={rc}")
-    ok &= step("--hash-via-raw-tsv: 49 Diffs in flights erkannt", "49" in joined)
-    ok &= step("--hash-via-raw-tsv: Beispiel-IDs angegeben", "Beispiele:" in joined)
+    rc, joined = capture_check("--hash-raw-tsv", "db1.*")
+    ok &= step("--hash-raw-tsv: Exit 1", rc == 1, f"rc={rc}")
+    ok &= step("--hash-raw-tsv: 49 Diffs in flights erkannt", "49" in joined)
+    ok &= step("--hash-raw-tsv: Beispiel-IDs angegeben", "Beispiele:" in joined)
     return step("D: check mit Drift (select/dump/raw)", ok)
 
 
 def test_drift_repair(ctx):
     print("== E: --sync (nur Differenzen, raw-tsv + raw-binary) ==")
-    ok = mysql_sync(ctx.cfg + ["--sync", "db_skywings.*", "--hash-via-raw-tsv"])
-    e1 = scalar("src", "SELECT SUM(CRC32(CONCAT(flight_no,'|',origin,'|',COALESCE(notes,'')))) FROM flights", "db_skywings")
-    e2 = scalar("dst", "SELECT SUM(CRC32(CONCAT(flight_no,'|',origin,'|',COALESCE(notes,'')))) FROM flights", "db_skywings")
+    ok = mysql_sync(ctx.cfg + ["--sync", "db1.*", "--hash-raw-tsv"])
+    e1 = scalar("src", "SELECT SUM(CRC32(CONCAT(flight_no,'|',origin,'|',COALESCE(notes,'')))) FROM flights", "db1")
+    e2 = scalar("dst", "SELECT SUM(CRC32(CONCAT(flight_no,'|',origin,'|',COALESCE(notes,'')))) FROM flights", "db1")
     ok &= step("raw-tsv: Flights-Prüfsummen nach Drift-Fix identisch", e1 == e2)
-    ok &= mysql_sync(ctx.cfg + ["--sync", "db_skywings.*,db_airwings.*", "--hash-via-raw-binary"])
-    e1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db_airwings")
-    e2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db_airwings")
+    ok &= mysql_sync(ctx.cfg + ["--sync", "db1.*,db2.*", "--hash-raw-binary-row"])
+    e1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
+    e2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
     ok &= step("raw-binary: BLOB-Prüfsummen nach Drift-Fix identisch", e1 == e2)
-    rc, _ = run_bin(ctx.cfg + ["--check", "10", "--hash-via-raw-binary",
-                              "db_skywings.*,db_airwings.*"])
+    rc, _ = run_bin(ctx.cfg + ["--check", "10", "--hash-raw-binary-row",
+                              "db1.*,db2.*"])
     ok &= step("Erneuter raw-binary --check → Exit 0", rc == 0)
-    rc, _ = run_bin(ctx.cfg + ["--check", "10", "--hash-via-raw-tsv", "db_skywings.*"])
+    rc, _ = run_bin(ctx.cfg + ["--check", "10", "--hash-raw-tsv", "db1.*"])
     ok &= step("Erneuter raw-tsv --check → Exit 0", rc == 0)
     return step("E: drift behoben (raw)", ok)
 
 
 def test_force_resync(ctx):
     print("== F: --force --sync (Recreate + Vollkopie) ==")
-    ok = mysql_sync(ctx.cfg + ["--force", "--sync", "db_airwings.payloads"])
-    f1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db_airwings")
-    f2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db_airwings")
+    ok = mysql_sync(ctx.cfg + ["--force", "--sync", "db2.payloads"])
+    f1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
+    f2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
     ok &= step("Nach Force-Recreate identisch (Binary!)", f1 == f2)
     return step("F: force+sync", ok)
 
@@ -867,16 +816,16 @@ def test_chunking(ctx):
         ok &= step(f"{label} Inhalt identisch", a == b and a != "0", f"{a} vs {b}")
 
     raw_checks = (
-        ("--hash-via-select", None, range_tables),
-        ("--hash-via-dump", "--hash-via-dump", range_tables),
-        ("--hash-via-raw-binary", "--hash-via-raw-binary", range_tables),
-        ("--hash-via-raw-tsv", "--hash-via-raw-tsv", range_tsv_tables),
+        ("--hash-select", None, range_tables),
+        ("--hash-dump", "--hash-dump", range_tables),
+        ("--hash-raw-binary-row", "--hash-raw-binary-row", range_tables),
+        ("--hash-raw-tsv", "--hash-raw-tsv", range_tsv_tables),
     )
     for name, extra, selector in raw_checks:
         ok &= mysql_sync(ctx.cfg + ["--check", "5", *([extra] if extra else []), selector],
                          expect_rc=0, label=name)
 
-    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-via-raw-tsv", "db_range.binary_keys"])
+    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-raw-tsv", "db_range.binary_keys"])
     ok &= step("Chunking raw-tsv lehnt BINARY-Spalten ab",
                rc != 0 and "keine binären Spalten" in out, f"rc={rc}")
 
@@ -895,14 +844,14 @@ def test_chunking(ctx):
         ok &= step(f"Chunking {name}: Fallback je 3 Diffs",
                    joined.count("3 Zeilen differieren") >= 2)
 
-    ok &= mysql_sync(ctx.cfg + ["--sync", range_tsv_tables, "--hash-via-raw-tsv"])
-    ok &= mysql_sync(ctx.cfg + ["--sync", range_tables, "--hash-via-raw-binary"])
+    ok &= mysql_sync(ctx.cfg + ["--sync", range_tsv_tables, "--hash-raw-tsv"])
+    ok &= mysql_sync(ctx.cfg + ["--sync", range_tables, "--hash-raw-binary-row"])
     for name, extra, selector in raw_checks:
         ok &= mysql_sync(ctx.cfg + ["--check", "10", *([extra] if extra else []), selector],
                          expect_rc=0, label=f"Chunking sync {name}")
 
-    for name, extra in (("select", None), ("dump", "--hash-via-dump"),
-                        ("raw-binary", "--hash-via-raw-binary"), ("raw-tsv", "--hash-via-raw-tsv")):
+    for name, extra in (("select", None), ("dump", "--hash-dump"),
+                        ("raw-binary", "--hash-raw-binary-row"), ("raw-tsv", "--hash-raw-tsv")):
         rc, out = run_bin(ctx.cfg + ["--check", "3", *([extra] if extra else []), "db_range.no_pk"])
         ok &= step(f"Sync ohne Primary Key wird abgelehnt ({name})",
                    rc != 0 and "keinen Primary Key" in out, f"rc={rc}")
@@ -916,7 +865,7 @@ def test_raw_profile_gate(ctx):
     ctx.server, fp_l, _ = restart_server(ctx.server, ctx.server_cfg, "config-server.json",
                                          "server-profile-mismatch.log")
     update_json(ctx.client_cfg, server_fingerprint=fp_l)
-    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-via-raw-binary", "db_skywings.*"])
+    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-raw-binary-row", "db1.*"])
     ok = step("raw-binary lehnt abweichendes MySQL-Profil ab",
               rc != 0 and "MySQL-Profil weicht ab" in out, f"rc={rc}")
 
@@ -925,17 +874,17 @@ def test_raw_profile_gate(ctx):
     ctx.server, fp_l, _ = restart_server(ctx.server, ctx.server_cfg, "config-server.json",
                                          "server-profile-restored.log")
     update_json(ctx.client_cfg, server_fingerprint=fp_l)
-    ok &= mysql_sync(ctx.cfg + ["--check", "5", "--hash-via-raw-binary", "db_skywings.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "5", "--hash-via-raw-tsv", "db_skywings.*"], expect_rc=0)
+    ok &= mysql_sync(ctx.cfg + ["--check", "5", "--hash-raw-binary-row", "db1.*"], expect_rc=0)
+    ok &= mysql_sync(ctx.cfg + ["--check", "5", "--hash-raw-tsv", "db1.*"], expect_rc=0)
     return step("L: raw profile gate", ok)
 
 
 def test_dump_mode(ctx):
     print("== G: SQL-Dump-Modus (allow_csv=false) ==")
     dump_cfg = json_variant(ctx.client_cfg, "config-client-dump.json", allow_csv=False)
-    ok = mysql_sync(["-C", str(dump_cfg), "--sync", "db_airwings.payloads"])
-    g1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db_airwings")
-    g2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db_airwings")
+    ok = mysql_sync(["-C", str(dump_cfg), "--sync", "db2.payloads"])
+    g1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db2")
+    g2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db2")
     ok &= step("Dump-Modus binärsicher", g1 == g2)
     return step("G: Dump-Modus", ok)
 
@@ -943,7 +892,7 @@ def test_dump_mode(ctx):
 def test_hash_algo(ctx):
     print("== H: hash_algo ==")
     bad_cfg = json_variant(ctx.client_cfg, "config-client-md5.json", hash_algo="md5")
-    rc, out = run_bin(["-C", str(bad_cfg), "--check", "3", "db_skywings.*"])
+    rc, out = run_bin(["-C", str(bad_cfg), "--check", "3", "db1.*"])
     ok = step("Mismatch (md5 vs xxh3) wird abgelehnt",
               rc != 0 and "Hash-Algorithmus weicht ab" in out, f"rc={rc}")
 
@@ -953,7 +902,7 @@ def test_hash_algo(ctx):
     blake_cfg = json_variant(ctx.client_cfg, "config-client-blake3.json",
                              hash_algo="blake3", server_fingerprint=fp_b)
     ok &= step("Server mit blake3 gestartet", bool(fp_b))
-    ok &= mysql_sync(["-C", str(blake_cfg), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
+    ok &= mysql_sync(["-C", str(blake_cfg), "--check", "5", "db1.*,db2.*"], expect_rc=0)
     return step("H: hash_algo", ok)
 
 
@@ -966,7 +915,7 @@ def test_zstd(ctx):
                                 compression="zstd", compression_level=3,
                                 server_fingerprint=fp_z)
     ok = step("Server mit zstd gestartet", bool(fp_z))
-    ok &= mysql_sync(["-C", str(client_cfg_z), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
+    ok &= mysql_sync(["-C", str(client_cfg_z), "--check", "5", "db1.*,db2.*"], expect_rc=0)
     return step("I: zstd compression", ok)
 
 
@@ -978,32 +927,38 @@ def test_plaintext_tcp(ctx):
     wait_tcp(MYSQL_SYNC_SERVER_PORT)
     client_cfg_t = json_variant(ctx.client_cfg, "config-client-tcp.json",
                                 transport="tcp", allow_plaintext=True)
-    ok = mysql_sync(["-C", str(client_cfg_t), "--check", "5", "db_skywings.*,db_airwings.*"], expect_rc=0)
+    ok = mysql_sync(["-C", str(client_cfg_t), "--check", "5", "db1.*,db2.*"], expect_rc=0)
     step("J: plaintext TCP", ok)
 
     bad_tcp_cfg = json_variant(ctx.client_cfg, "config-client-tcp-bad.json", transport="tcp")
-    rc, out = run_bin(["-C", str(bad_tcp_cfg), "--check", "3", "db_skywings.*"])
+    rc, out = run_bin(["-C", str(bad_tcp_cfg), "--check", "3", "db1.*"])
     return step("tcp ohne allow_plaintext wird abgelehnt",
                 rc != 0 and "allow_plaintext" in out)
 
 
-def old_test():
+async def down():
+    await compose("down", "--remove-orphans")
+
+async def clean():
+    await compose("down", "--remove-orphans", "--volumes")
+
+async def old():
+    ensure_binary()
     prepare_workdir()
-    if not wait_for_db():
-        raise SystemExit("Datenbanken nicht erreichbar")
+    await ensure_dbs_up()
     print_env()
     before = len(results)
 
     print("== Seed-Daten ==")
-    sql("src", "DROP DATABASE IF EXISTS db_skywings")
-    sql("src", "DROP DATABASE IF EXISTS db_airwings")
+    sql("src", "DROP DATABASE IF EXISTS db1")
+    sql("src", "DROP DATABASE IF EXISTS db2")
     sql("src", (HERE / "deploy/seed.sql").read_text())
-    n_flights = scalar("src", "SELECT COUNT(*) FROM db_skywings.flights")
-    n_payloads = scalar("src", "SELECT COUNT(*) FROM db_airwings.payloads")
+    n_flights = scalar("src", "SELECT COUNT(*) FROM db1.flights")
+    n_payloads = scalar("src", "SELECT COUNT(*) FROM db2.payloads")
     step("Seed geladen", n_flights == "5000" and n_payloads == "800",
          f"flights={n_flights} payloads={n_payloads}")
-    n_nullbytes = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = '000000'", "db_airwings")
-    n_badutf = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = 'FFFE80C0AF'", "db_airwings")
+    n_nullbytes = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = '000000'", "db2")
+    n_badutf = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = 'FFFE80C0AF'", "db2")
     step("Binäre Giftdaten vorhanden (\\0\\0\\0, invalid UTF-8)",
          int(n_nullbytes or 0) > 0 and int(n_badutf or 0) > 0,
          f"nullbytes={n_nullbytes} badutf={n_badutf}")
@@ -1037,10 +992,10 @@ def old_test():
     return not failed
 
 
-def run_matrix_action():
+async def matrix():
+    ensure_binary()
     prepare_workdir()
-    if not wait_for_db():
-        raise SystemExit("Datenbanken nicht erreichbar")
+    await ensure_dbs_up()
     print_env()
 
     server = None
@@ -1068,120 +1023,92 @@ def run_matrix_action():
     finally:
         stop_server(server)
 
+async def compose(*args):
+    await run_show_out_tail_on_error(["docker", "compose", "-f", HERE / "docker-compose.yml", *args])
 
-def compose(*args):
-    return run(["docker", "compose", "-f", HERE / "docker-compose.yml", *args], check=False)
-
-
-def cmd_up():
+async def up():
     prepare_workdir()
-    if not DOCKER:
-        print("  up: lokaler Modus, nichts zu starten")
-        return True
-    print("== Docker up ==")
-    r = compose("up", "-d", "--wait")
-    if r.returncode != 0:
-        print(r.stdout[-2000:])
-        print(r.stderr[-2000:])
-        return False
-    return wait_for_db()
+    await docker_db_up()
 
+async def write_docker_compose():
+    def kv(name, version, port):
+        y = f"""
+        {name}:
+            image: mysql:{version}
+            container_name: mysqlsync-src
+            environment:
+              MYSQL_ROOT_PASSWORD: syncroot
+              MYSQL_DATABASE: db1
+            command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
+            ports:
+              - "${{MSYNC_SRC_PORT:-{port}}}:3306"
+            volumes:
+              - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+            healthcheck:
+              test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
+              interval: 3s
+              timeout: 3s
+              retries: 30
+        """
+        return yaml.parse(y)
 
-def cmd_down():
-    if not DOCKER:
-        print("  down: lokaler Modus, nichts zu stoppen")
-        return True
-    print("== Docker down ==")
-    r = compose("down", "--remove-orphans")
-    if r.returncode != 0:
-        print(r.stdout[-2000:])
-        print(r.stderr[-2000:])
-        return False
-    return True
-
-
-def cmd_clean():
-    if not DOCKER:
-        print("  clean: lokaler Modus, nichts zu entfernen")
-        return True
-    print("== Docker clean ==")
-    r = compose("down", "--remove-orphans", "--volumes")
-    if r.returncode != 0:
-        print(r.stdout[-2000:])
-        print(r.stderr[-2000:])
-        return False
-    return True
-
-
-def cmd_old():
-    ensure_binary()
-    return old_test()
-
-
-def cmd_matrix():
-    ensure_binary()
-    return run_matrix_action()
-
+    dcy = {}
+    for i, m in enumerate(DOCKER_MYSQL_INSTANCES):
+        dcy = {**docker, **kv(m["name"], m["version"], START_PORT + i)}
+    Path("docker-compose.yml").write_text(yaml.dumps(dcy))
 
 ACTIONS = {
-    "up": cmd_up,
-    "old": cmd_old,
-    "matrix": cmd_matrix,
-    "down": cmd_down,
-    "clean": cmd_clean,
+    "write_docker_compose": write_docker_compose,
+    "up": up,
+    "old": old,
+    "matrix": matrix,
+    "down": down,
+    "clean": clean,
 }
 
-
-def run_actions(actions):
-    unknown = [a for a in actions if a not in ACTIONS]
-    if unknown:
-        print(f"Unbekannte Aktion(en): {', '.join(unknown)}")
-        print(f"Nutzung: python3 test.py single|parallel [{'|'.join(ACTIONS)}] ...")
-        return 2
-
-    outcomes = []
-    for action in actions:
-        print(f"\n===== Aktion: {action} =====")
+def cpu_type():
+    """
+    cleanup?
+    """
+    if sys.platform == "darwin":
         try:
-            ok = ACTIONS[action]()
-        except SystemExit as exc:
-            print(f"  [{FAIL}] {action}: {exc}")
-            ok = False
-        except Exception:
-            traceback.print_exc()
-            ok = False
-        outcomes.append((action, ok))
-
-    if results:
-        print("\n═══════════════ OVERALL RESULT ═══════════════")
-        failed = [r for r in results if not r[1]]
-        for name, ok, detail in results:
-            print(f"  [{PASS if ok else FAIL}] {name}" + (f" — {detail}" if detail else ""))
-        print(f"═══════════════ {len(results)-len(failed)}/{len(results)} bestanden ═══════════════")
-
-    print("\n═══════════════ AKTIONEN ═══════════════")
-    for action, ok in outcomes:
-        print(f"  [{PASS if ok else FAIL}] {action}")
-    return 1 if any(not ok for _, ok in outcomes) else 0
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine() or "unknown"
 
 
-def main():
+async def main():
     global CONCURRENCY
     args = sys.argv[1:]
-    if args and args[0] in ("single", "parallel"):
-        CONCURRENCY = args[0]
 
-    state = start_logging()
-    try:
-        if CONCURRENCY is None:
-            print("Fehler: single|parallel muss als erstes Argument angegeben werden.")
-            print(f"Nutzung: python3 test.py single|parallel [{'|'.join(ACTIONS)}] ...")
-            return 2
+    # --concurrency[N]
+    c = "--concurrency"
+    if args[0].startswith(c):
+        CONCURRENCY = int(args[0][len(c):])
+        args = sys.argv[1:]
+    print("\n\n")
+    print(f"CONCURRENCY {CONCURRENCY}")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"===== cpu={cpu_type()} | concurrency={CONCURRENCY or 'MISSING'} | "
+    with with_logging(header = header):
+        print(f"CONCURRENCY={CONCURRENCY or 'MISSING'} matrix_jobs={CONCURRENCY}")
+
+        # python test.py [--concurrencyN] up old matrix down [clean]
         actions = args[1:] or ["up", "old", "matrix", "down"]
-        return run_actions(actions)
-    finally:
-        stop_logging(state)
-
+        for action in actions:
+            assert action in ACTIONS
+            await ACTIONS[action]()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    asyncio.run(main())

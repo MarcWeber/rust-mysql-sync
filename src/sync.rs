@@ -34,6 +34,22 @@ pub enum HashVia {
 }
 
 impl HashVia {
+    pub const ALL: [HashVia; 4] = [
+        HashVia::Select,
+        HashVia::Dump,
+        HashVia::RawBinary,
+        HashVia::RawTsv,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HashVia::Select => "select",
+            HashVia::Dump => "dump",
+            HashVia::RawBinary => "raw-binary",
+            HashVia::RawTsv => "raw-tsv",
+        }
+    }
+
     fn is_raw(self) -> bool {
         matches!(self, HashVia::RawBinary | HashVia::RawTsv)
     }
@@ -304,6 +320,87 @@ pub enum Mode {
     Check,
 }
 
+pub struct BenchStats {
+    pub rows: u64,
+    pub buckets: u64,
+    pub ms: f64,
+}
+
+impl BenchStats {
+    pub fn rows_per_s(&self) -> f64 {
+        if self.ms <= 0.0 {
+            0.0
+        } else {
+            self.rows as f64 * 1000.0 / self.ms
+        }
+    }
+}
+
+/// Erzeugt die Chunk-Hashes lokal und verwirft sie. Kein Server, kein Schreiben.
+/// Die Zeit enthält nur die Hash-Erzeugung (Datenbank lesen + hashen).
+pub async fn benchmark_table(
+    cfg: &Config,
+    pool: &mysql_async::Pool,
+    task: &TableTask,
+    hash_via: HashVia,
+) -> Result<BenchStats> {
+    let mut conn = mysqlutil::session_conn(pool).await?;
+    let pks = mysqlutil::pk_columns(&mut conn, &task.local_db, &task.local_table).await?;
+    if pks.is_empty() {
+        bail!("{}.{} hat keinen Primary Key", task.local_db, task.local_table);
+    }
+    let mode = hash::chunk_mode_for_pk(&pks);
+    let pk_names: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
+
+    if hash_via == HashVia::RawTsv {
+        let binary =
+            mysqlutil::binary_column_indexes(&mut conn, &task.local_db, &task.local_table).await?;
+        if !binary.is_empty() {
+            bail!(
+                "{}.{}: raw-tsv unterstützt keine binären Spalten (Indizes {binary:?})",
+                task.local_db,
+                task.local_table
+            );
+        }
+    }
+
+    let (tx, mut rx) = mpsc::channel::<hash::ChunkHashEvent>(cfg.chunk_stream_buffer.max(1));
+    let job_cfg = cfg.clone();
+    let job_pool = pool.clone();
+    let job_task = task.clone();
+    let job_pks = pks.clone();
+    let job_pk_names = pk_names.clone();
+    let started = std::time::Instant::now();
+    let scan = tokio::spawn(async move {
+        run_local_chunk_stream(
+            tx,
+            &job_cfg,
+            &job_pool,
+            &job_task,
+            &job_pks,
+            &job_pk_names,
+            hash_via,
+            mode,
+        )
+        .await
+    });
+
+    let mut rows = 0u64;
+    let mut buckets = 0u64;
+    while let Some(event) = rx.recv().await {
+        match event {
+            hash::ChunkHashEvent::Item((_bucket, count, _hash)) => {
+                rows += count;
+                buckets += 1;
+            }
+            hash::ChunkHashEvent::Error(e) => return Err(e),
+        }
+    }
+    scan.await.context("Benchmark-Task abgebrochen")??;
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(BenchStats { rows, buckets, ms })
+}
+
 pub async fn run_table_task(
     cfg: Config,
     session: std::sync::Arc<crate::transport::Session>,
@@ -424,7 +521,7 @@ async fn run_inner(
         if let Some(diff) = local_profile.difference(&remote_profile) {
             bail!(
                 "{label}: Raw-Hashing abgelehnt — MySQL-Profil weicht ab: {diff}. \
-                 Nutze --hash-via-select oder --hash-via-dump."
+                 Nutze --hash-select oder --hash-dump."
             );
         }
         if hash_via == HashVia::RawTsv {

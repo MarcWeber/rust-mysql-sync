@@ -1,13 +1,13 @@
 -- Seed für den mysql-sync End-to-End-Test.
 -- Ausführen auf der QUELLE:  mysql -h <src> -u root < seed.sql
 -- 2 Datenbanken:
---   db_skywings : Plain-Tabelle (kein Binary)
---   db_airwings : Tabelle mit BLOB (binärsicher testen: \0, \n, \t, 0xFF)
+--   db1 : Plain-Tabelle (kein Binary)
+--   db2 : Tabelle mit BLOB (binärsicher testen: \0, \n, \t, 0xFF)
 
-CREATE DATABASE IF NOT EXISTS db_skywings CHARACTER SET utf8mb4;
-CREATE DATABASE IF NOT EXISTS db_airwings CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS db1 CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS db2 CHARACTER SET utf8mb4;
 
-USE db_skywings;
+USE db1;
 DROP TABLE IF EXISTS flights;
 CREATE TABLE flights (
   id INT NOT NULL AUTO_INCREMENT,
@@ -51,7 +51,7 @@ FROM (
 ) nums
 WHERE n <= 5000;
 
-USE db_airwings;
+USE db2;
 DROP TABLE IF EXISTS payloads;
 CREATE TABLE payloads (
   id INT NOT NULL AUTO_INCREMENT,

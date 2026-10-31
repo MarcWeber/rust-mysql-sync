@@ -1,7 +1,7 @@
 version: "3.8"
 
 # mysql-sync Testumgebung: 2 MySQL-8-Container (Quelle + Ziel)
-#   Quelle : localhost:3306  (db_skywings, db_airwings mit Seed-Daten)
+#   Quelle : localhost:3306  (db1, db2 mit Seed-Daten)
 #   Ziel   : localhost:3307
 # Start:   docker compose up -d
 # Test:    python3 test.py          (im selben Verzeichnis)
@@ -12,7 +12,7 @@ services:
     container_name: mysqlsync-src
     environment:
       MYSQL_ROOT_PASSWORD: syncroot
-      MYSQL_DATABASE: db_skywings
+      MYSQL_DATABASE: db1
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
     ports:
       - "${MSYNC_SRC_PORT:-7012}:3306"

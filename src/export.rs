@@ -591,6 +591,24 @@ fn parse_sql_value(s: &str, i: usize) -> Result<(Value, usize)> {
             Ok((Value::Bytes(vec![byte]), j))
         }
         b'N' if s[i..].starts_with("NULL") => Ok((Value::NULL, i + 4)),
+        b'_' => {
+            // Charset-Introducer, z.B. `_binary '...'` oder `_utf8mb4'...'`.
+            // Ohne diese Behandlung würde der Default-Zweig am ersten Komma
+            // innerhalb der Binärdaten abschneiden.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'\'' {
+                j += 1;
+            }
+            if j < bytes.len() {
+                parse_sql_value(s, j)
+            } else {
+                let mut k = i;
+                while k < bytes.len() && bytes[k] != b',' {
+                    k += 1;
+                }
+                Ok((Value::Bytes(s[i..k].trim().as_bytes().to_vec()), k))
+            }
+        }
         _ => {
             let mut j = i;
             while j < bytes.len() && bytes[j] != b',' {
@@ -756,4 +774,18 @@ async fn fetch_raw_tsv(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_insert_binary_with_comma_and_quote() {
+        let stmt = "INSERT INTO `t` VALUES (1,'x',_binary '\\0\\0,\\0\\'',2)";
+        let values = parse_insert_values(stmt).unwrap().unwrap();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[2], Value::Bytes(b"\0\0,\0'".to_vec()));
+        assert_eq!(values[3], Value::Bytes(b"2".to_vec()));
+    }
 }

@@ -1,5 +1,5 @@
 //! Selector A.B: A = DB-Liste (oder *), B = Tabellen-Liste (oder *).
-//! Beispiel: "db_skywings,db_airwings.*" oder "*" oder "db1.t1,db1.t2"
+//! Beispiel: "db1,db2.*" oder "*" oder "db1.t1,db1.t2"
 
 use anyhow::{Context, Result};
 
@@ -83,15 +83,15 @@ mod tests {
 
     #[test]
     fn parse_full() {
-        let s = Selector::parse(Some("db_skywings,db_airwings.*")).unwrap();
-        assert_eq!(s.dbs, vec!["db_skywings", "db_airwings"]);
+        let s = Selector::parse(Some("db1,db2.*")).unwrap();
+        assert_eq!(s.dbs, vec!["db1", "db2"]);
         assert_eq!(s.tables, vec!["*"]);
     }
 
     #[test]
     fn parse_db_only() {
-        let s = Selector::parse(Some("db_skywings")).unwrap();
-        assert_eq!(s.dbs, vec!["db_skywings"]);
+        let s = Selector::parse(Some("db1")).unwrap();
+        assert_eq!(s.dbs, vec!["db1"]);
         assert_eq!(s.tables, vec!["*"]);
     }
 
@@ -112,11 +112,11 @@ mod tests {
     #[test]
     fn parse_qualified_wildcards() {
         // "db1.*,db2.*" muss beide DBs liefern (Tabellen-Wildcard)
-        let s = Selector::parse(Some("db_skywings.*,db_airwings.*")).unwrap();
-        assert_eq!(s.dbs, vec!["db_skywings", "db_airwings"]);
+        let s = Selector::parse(Some("db1.*,db2.*")).unwrap();
+        assert_eq!(s.dbs, vec!["db1", "db2"]);
         assert_eq!(s.tables, vec!["*"]);
-        assert!(s.matches_db("db_skywings"));
-        assert!(s.matches_db("db_airwings"));
+        assert!(s.matches_db("db1"));
+        assert!(s.matches_db("db2"));
     }
 
     #[test]
