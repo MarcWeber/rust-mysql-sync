@@ -1053,8 +1053,8 @@ async def write_docker_compose():
         return yaml.parse(y)
 
     dcy = {}
-    for i, m in enumerate(DOCKER_MYSQL_INSTANCES):
-        dcy = {**docker, **kv(m["name"], m["version"], START_PORT + i)}
+    for m in DOCKER_MYSQL_INSTANCES:
+        dcy = {**docker, **kv(m["name"], m["version"], m['port'])}
     Path("docker-compose.yml").write_text(yaml.dumps(dcy))
 
 ACTIONS = {
