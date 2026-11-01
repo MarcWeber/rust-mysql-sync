@@ -170,7 +170,7 @@ impl SqlHashAlgo {
     fn group_hash(self, inner: &str) -> String {
         match self {
             SqlHashAlgo::Sha2 => {
-                format!("LOWER(LEFT(SHA2(CONCAT_WS('|', LEFT(SHA2(bucket, 256), 32), {inner})), 256), 32)")
+                format!("LOWER(LEFT(SHA2(CONCAT_WS('|', LEFT(SHA2(bucket, 256), 32), {inner}), 256), 32))")
             }
             SqlHashAlgo::Crc32 => {
                 format!("LPAD(CAST(CRC32(CONCAT_WS('|', LPAD(CAST(CRC32(bucket) AS CHAR), 10, '0'), {inner})) AS CHAR), 10, '0')")
@@ -302,7 +302,7 @@ pub async fn stream_chunk_hashes(
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
     let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo)?;
-    log::debug!("SQL group hashes (stream): {sql}");
+    log::warn!("SQL group hashes (stream): {sql}");
     let mut result = conn
         .query_iter(&sql)
         .await
@@ -335,7 +335,7 @@ pub async fn chunk_hashes(
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
     let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo)?;
-    log::debug!("SQL group hashes: {sql}");
+    log::warn!("SQL group hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)
         .await
@@ -366,7 +366,7 @@ pub async fn row_hashes(
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
     let sql = row_query(db, table, pks, &columns, opts, mode, chunked, buckets, algo)?;
-    log::debug!("SQL row hashes: {sql}");
+    log::warn!("SQL row hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)
         .await

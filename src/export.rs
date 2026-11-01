@@ -373,6 +373,7 @@ async fn fetch_mysql_e(
     }
     let mut cmd = tokio::process::Command::new("mysql");
     cmd.arg("--batch")
+        .arg("--quick")
         .arg("--skip-column-names")
         .arg("-h")
         .arg(&mysql.host)
@@ -418,6 +419,7 @@ async fn fetch_mysqldump(
         .arg("--skip-triggers")
         .arg("--skip-lock-tables")
         .arg("--single-transaction")
+        .arg("--quick")
         .arg("--skip-extended-insert") // ein INSERT pro Zeile = einfaches, stromfähiges Parsing
         .arg("--order-by-primary")
         .arg("--compact")

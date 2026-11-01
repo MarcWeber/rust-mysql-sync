@@ -275,6 +275,11 @@ pub struct Config {
     #[serde(default, alias = "quic_port", alias = "port")]
     pub quic_port: Option<u16>,
 
+    /// Optionaler TCP-Port (Server). Wenn gesetzt, lauscht der Server zusätzlich
+    /// auf diesem Port im Klartext-Modus (benötigt allow_plaintext: true).
+    #[serde(default, alias = "tcp_port")]
+    pub tcp_port: Option<u16>,
+
     /// Zeilen pro Batch beim SQL-REPLACE-Transfer (kein Diff-Kurzschluss).
     /// Alter Name `dump_threshold` wird als Alias akzeptiert.
     #[serde(
@@ -423,6 +428,13 @@ impl Config {
     pub fn listen_addr(&self) -> Result<std::net::SocketAddr> {
         let host = self.listen.clone().unwrap_or_else(|| "0.0.0.0".into());
         Ok(format!("{}:{}", host, self.quic_port.unwrap_or(DEFAULT_SERVER_PORT)).parse()?)
+    }
+
+    pub fn tcp_listen_addr(&self) -> Option<Result<std::net::SocketAddr>> {
+        self.tcp_port.map(|port| {
+            let host = self.listen.clone().unwrap_or_else(|| "0.0.0.0".into());
+            Ok(format!("{}:{}", host, port).parse()?)
+        })
     }
 }
 

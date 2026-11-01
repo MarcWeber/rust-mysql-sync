@@ -80,10 +80,9 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
         config_path.to_path_buf()
     };
 
-    let plaintext = cfg.plaintext_tcp();
     let pool = mysqlutil::new_pool(&cfg.mysql, None)?;
     let state = Arc::new(ServerState { cfg, pool });
-    let addr = state.cfg.listen_addr()?;
+    let quic_addr = state.cfg.listen_addr()?;
 
     log::info!(
         "chunked={} ({} Buckets), transfer_batch_rows={}, diff_threshold_percent={}%",
@@ -93,27 +92,21 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
         state.cfg.diff_threshold_percent
     );
 
-    if plaintext {
-        eprintln!("WARNING: PLAINTEXT transport=tcp — encryption disabled");
-        let listener = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("TCP-Listener auf {addr}"))?;
-        eprintln!("mysql-sync Server lauscht auf {addr} (tcp, plaintext)");
-        loop {
-            let (stream, remote) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            let (recv, send) = stream.into_split();
-            let state = state.clone();
-            let hello_done = Arc::new(AtomicBool::new(false));
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_stream(Box::new(send), Box::new(recv), state, hello_done).await
-                {
-                    log::error!("Verbindungsfehler von {remote}: {e:#}");
-                }
-            });
+    // Optional TCP listener alongside QUIC (when tcp_port is configured)
+    let tcp_listener = if let Some(tcp_result) = state.cfg.tcp_listen_addr() {
+        if !state.cfg.allow_plaintext {
+            anyhow::bail!("tcp_port erfordert \"allow_plaintext\": true");
         }
-    }
+        let tcp_addr = tcp_result?;
+        eprintln!("WARNING: PLAINTEXT tcp_port={tcp_addr} — encryption disabled");
+        let listener = TcpListener::bind(tcp_addr)
+            .await
+            .with_context(|| format!("TCP-Listener auf {tcp_addr}"))?;
+        eprintln!("mysql-sync Server lauscht auf {tcp_addr} (tcp, plaintext)");
+        Some((listener, tcp_addr))
+    } else {
+        None
+    };
 
     let (certs, key, fingerprint) = tls::server_identity(&state.cfg, &cert_base)?;
     let provider = tls::ring_provider();
@@ -130,12 +123,41 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
             .context("QUIC-TLS-Konfiguration")?,
     ));
     quinn_cfg.transport_config(Arc::new(crate::transport::quic_transport()?));
-    let endpoint = quinn::Endpoint::server(quinn_cfg, addr)
-        .with_context(|| format!("QUIC-Listener auf {addr}"))?;
+    let endpoint = quinn::Endpoint::server(quinn_cfg, quic_addr)
+        .with_context(|| format!("QUIC-Listener auf {quic_addr}"))?;
 
-    eprintln!("mysql-sync Server lauscht auf {addr} (quic/tls)");
+    eprintln!("mysql-sync Server lauscht auf {quic_addr} (quic/tls)");
     eprintln!("TLS-Fingerprint: {fingerprint}");
     eprintln!("→ Fingerprints in config-client.json → \"server_fingerprint\" (Pinning empfohlen)");
+
+    // Run both QUIC and optional TCP listeners concurrently
+    let tcp_handle = if let Some((listener, tcp_addr)) = tcp_listener {
+        let state = state.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, remote)) => {
+                        let _ = stream.set_nodelay(true);
+                        let (recv, send) = stream.into_split();
+                        let state = state.clone();
+                        let hello_done = Arc::new(AtomicBool::new(false));
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                handle_stream(Box::new(send), Box::new(recv), state, hello_done).await
+                            {
+                                log::error!("TCP-Verbindungsfehler von {remote}: {e:#}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("TCP-Accept-Fehler: {e:#}");
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     while let Some(incoming) = endpoint.accept().await {
         let state = state.clone();
@@ -149,6 +171,11 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
                 Err(e) => log::warn!("Handshake fehlgeschlagen: {e}"),
             }
         });
+    }
+
+    // QUIC loop exited; cancel TCP listener if running
+    if let Some(handle) = tcp_handle {
+        handle.abort();
     }
     Ok(std::process::ExitCode::SUCCESS)
 }

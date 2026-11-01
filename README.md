@@ -600,3 +600,65 @@ Source: `src/sync.rs` (diff engine), `src/sqlhash.rs` (SQL group/row hashes),
 `src/hash.rs` (Rust hashing/buckets), `src/hash_binary.rs` (raw binary rows),
 `src/hash_tsv.rs` (raw TSV lines), `src/export.rs` (export strategies),
 `src/server.rs` (target side), `vendor/mysql_async` (patched `next_raw()`).
+
+## BENCHMARKS
+TC2* -> more columns thus somewhat realistic
+
+This was done with -concurrency12 so they could be wrong .. but the tendency is clear:
+rust is is 4x faster
+10.000 rows on XEON intel CPU within incus->docker
+
+TC201-mixed-tuple-no_binary	8.0:9.7	1785	pt clean=- drift=1075 total=2860 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	1577	pt clean=- drift=1240 total=2818 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	1240	mysqldump/none clean=- drift=- total=1240 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	1215	mysqldump/zstd clean=- drift=- total=1215 ok
+TC201-mixed-tuple-no_binary	8.0:9.7	1121	mysqldump/none clean=- drift=- total=1121 ok
+TC201-mixed-tuple-no_binary	8.0:9.7	1108	mysqldump/zstd clean=- drift=- total=1108 ok
+
+TC201-mixed-tuple-no_binary	8.0:8.0	215	rust/dump clean=182 drift=233 total=630 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	243	rust/raw-binary-vec clean=114 drift=175 total=532 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	297	rust/select-crc32 clean=79 drift=125 total=501 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	299	rust/raw-binary clean=128 drift=110 total=537 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	362	rust/select-sha2 clean=149 drift=170 total=681 ok
+TC201-mixed-tuple-no_binary	8.0:8.0	793	rust/raw-tsv clean=367 drift=957 total=2117 ok
+TC201-mixed-tuple-no_binary	8.0:9.7	180	rust/select-crc32 clean=128 drift=124 total=432 ok
+TC201-mixed-tuple-no_binary	8.0:9.7	212	rust/select-sha2 clean=209 drift=159 total=579 ok
+TC201-mixed-tuple-no_binary	8.0:9.7	323	rust/raw-binary-vec clean=101 drift=180 total=604 ok
+TC201-mixed-tuple-no_binary	8.0:9.7	374	rust/dump clean=159 drift=186 total=720 ok
+
+
+
+TC202-mixed-tuple-bin	8.0:8.0	2612	mysqldump/none clean=- drift=- total=2612 ok
+TC202-mixed-tuple-bin	8.0:8.0	2474	mysqldump/zstd clean=- drift=- total=2474 ok
+TC202-mixed-tuple-bin	8.0:8.0	2414	pt clean=- drift=1271 total=3685 ok
+TC202-mixed-tuple-bin	8.0:9.7	1652	pt clean=- drift=1227 total=2878 ok
+TC202-mixed-tuple-bin	8.0:9.7	1550	mysqldump/none clean=- drift=- total=1550 ok
+TC202-mixed-tuple-bin	8.0:9.7	1504	mysqldump/zstd clean=- drift=- total=1504 ok
+
+TC202-mixed-tuple-bin	8.0:8.0	1449	rust/select-sha2 clean=301 drift=307 total=2056 ok
+TC202-mixed-tuple-bin	8.0:8.0	1361	rust/select-crc32 clean=135 drift=139 total=1636 ok
+TC202-mixed-tuple-bin	8.0:9.7	279 Y	rust/select-crc32 clean=79 drift=285 total=642 ok
+TC202-mixed-tuple-bin	8.0:9.7	388 Y	rust/select-sha2 clean=202 drift=328 total=917 ok
+
+TC202-mixed-tuple-bin	8.0:8.0	1117	rust/raw-binary clean=97 drift=210 total=1423 ok
+TC202-mixed-tuple-bin	8.0:8.0	146	rust/raw-binary-vec clean=59 drift=114 total=319 ok
+TC202-mixed-tuple-bin	8.0:8.0	765	rust/dump clean=249 drift=537 total=1551 ok
+TC202-mixed-tuple-bin	8.0:9.7	192	rust/raw-binary-vec clean=124 drift=116 total=431 ok
+TC202-mixed-tuple-bin	8.0:9.7	718	rust/dump clean=333 drift=1892 total=2943 ok
+
+
+### Why select modes are faster on 8.0→9.7
+
+With only 10,000 rows, the select modes' sync time is dominated by the time to
+start the hash query and wait for the first results — not by the actual hashing
+computation. Both source and destination must compute checksums for all chunks,
+so the total time is mostly waiting for the slower side to finish.
+
+The `select-sha2` and `select-crc32` modes run SQL on both servers:
+`SHA2(CONCAT(...))` or `CRC32()` chains with `GROUP BY` aggregation. MySQL 9.7
+has a faster query optimizer for these, so on 8.0→9.7 the destination side
+returns hashes quickly. On 8.0→8.0 both sides use the slower optimizer, making
+select modes 10× slower than `raw-binary-vec`.
+
+To see real differences between hash algorithms, the table needs millions of
+rows so the actual computation dominates over query startup latency.
