@@ -114,8 +114,6 @@ else:
     BIN = _default_bin()
 
 PASS, FAIL = chalk.green("PASS"), chalk.red("FAIL")
-SKIP = chalk.yellow("SKIP")
-results = []
 CONCURRENCY = 1
 
 @dataclass()
@@ -369,10 +367,6 @@ def _matrix_mysql_json(m):
     })
 
 
-def step(name, ok, detail=""):
-    results.append((name, ok, detail))
-    print(f"  [{PASS if ok else FAIL}] {name}" + (f" — {detail}" if detail else ""))
-    return ok
 
 
 def run(cmd, check=True, input=None, capture=True, quiet=False):
@@ -686,14 +680,14 @@ async def _timed(cmd, stdin_data=None):
         *[str(c) for c in cmd],
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
         cwd=WORK,
     )
-    stdout, stderr = await asyncio.wait_for(
+    stdout, _ = await asyncio.wait_for(
         proc.communicate(input=stdin_data), timeout=MATRIX_TIMEOUT
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    return elapsed_ms, (stdout, stderr, proc.returncode)
+    return elapsed_ms, (stdout, b"", proc.returncode)
 
 
 @dataclass
@@ -721,9 +715,7 @@ class MatrixResult:
             tool = "rust"
             mode = c.tool_opts.mode
             algo, chunk, comp, trans = c.tool_opts.hash_algo, c.tool_opts.chunked, c.tool_opts.compression, c.tool_opts.transport
-            cfg = ""
-            if algo != "xxh3" or chunk != 3 or comp != "none" or trans != "quic":
-                cfg = f"({algo},c{chunk},{comp},{trans})"
+            cfg = f"({algo},c{chunk},{comp},{trans})"
             label = f"{tool}/{mode or ''}{cfg}"
         st = 'error' if isinstance(self.status, BaseException) else self.status
         return {
@@ -758,7 +750,7 @@ async def _run_rust_case(cfg_json, case):
     stdin_data = cfg_json.encode()
 
     if mode == "raw-tsv" and case.binary == "bin":
-        ms, (stdout, stderr, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
+        ms, (stdout, _, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
         if rc != 0:
             out.update(total_ms=ms, status="reject", detail=f"rc={rc}")
             return out
@@ -767,17 +759,17 @@ async def _run_rust_case(cfg_json, case):
     # prepare_tables has already removed chunks from both sides. With the
     # default CHUNK_SIZE=2 and 10k rows there are 100 chunks, so the drops are
     # real differences and the first check must report drift.
-    drift_ms, (stdout, stderr, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
+    drift_ms, (stdout, _, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
     if rc != 1:
-        raise RuntimeError(f"drift check: expected rc=1, got rc={rc}: {(stdout.decode('utf8','replace') + stderr.decode('utf8','replace'))[-300:]}")
+        raise RuntimeError(f"drift check: expected rc=1, got rc={rc}: {stdout.decode('utf8','replace')[-300:]}")
 
-    sync_ms, (stdout, stderr, rc) = await _timed([*base, "--sync", selector], stdin_data)
+    sync_ms, (stdout, _, rc) = await _timed([*base, "--sync", selector], stdin_data)
     if rc != 0:
-        raise RuntimeError(f"sync: expected rc=0, got rc={rc}: {(stdout.decode('utf8','replace') + stderr.decode('utf8','replace'))[-300:]}")
+        raise RuntimeError(f"sync: expected rc=0, got rc={rc}: {stdout.decode('utf8','replace')[-300:]}")
 
-    clean_ms, (stdout, stderr, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
+    clean_ms, (stdout, _, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
     if rc != 0:
-        raise RuntimeError(f"clean check: expected rc=0, got rc={rc}: {(stdout.decode('utf8','replace') + stderr.decode('utf8','replace'))[-300:]}")
+        raise RuntimeError(f"clean check: expected rc=0, got rc={rc}: {stdout.decode('utf8','replace')[-300:]}")
 
     a = await src.scalar(_matrix_checksum_sql(case, src_table), quiet=True)
     b = await dst.scalar(_matrix_checksum_sql(case, dst_table), quiet=True)
@@ -854,19 +846,19 @@ async def _run_pt_case(cfg_json, case):
 
     # pt always runs against the drifted tables (no clean pass):
     # --print is the drift detection, --execute applies the differences.
-    drift_ms, (stdout, stderr, rc) = await _timed([*common, "--print", src_dsn, dst_dsn])
+    drift_ms, (stdout, _, rc) = await _timed([*common, "--print", src_dsn, dst_dsn])
     if rc not in (0, 2):
-        raise RuntimeError(f"pt --print: expected rc=0|2, got rc={rc}: {(stdout.decode('utf8','replace') + stderr.decode('utf8','replace'))[-300:]}")
+        raise RuntimeError(f"pt --print: expected rc=0|2, got rc={rc}: {stdout.decode('utf8','replace')[-300:]}")
 
-    sync_ms, (stdout, stderr, rc) = await _timed([*common, "--execute", src_dsn, dst_dsn])
+    sync_ms, (stdout, _, rc) = await _timed([*common, "--execute", src_dsn, dst_dsn])
     if rc not in (0, 2):
-        raise RuntimeError(f"pt --execute: expected rc=0|2, got rc={rc}: {(stdout.decode('utf8','replace') + stderr.decode('utf8','replace'))[-300:]}")
+        raise RuntimeError(f"pt --execute: expected rc=0|2, got rc={rc}: {stdout.decode('utf8','replace')[-300:]}")
 
-    _, (stdout, stderr, rc) = await _timed(
+    _, (stdout, _, rc) = await _timed(
         [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{MATRIX_DB}.{src_table}"],
         cfg_json.encode()
     )
-    out_text = stdout.decode('utf8','replace') + stderr.decode('utf8','replace')
+    out_text = stdout.decode('utf8','replace')
     a = await src.scalar(_matrix_checksum_sql(case, src_table), quiet=True)
     b = await dst.scalar(_matrix_checksum_sql(case, dst_table), quiet=True)
     if rc != 0 or a != b:
@@ -959,6 +951,11 @@ def _report_matrix(rows, wall_ms):
     print(f"concurrency={CONCURRENCY} rows={MATRIX_ROWS} "
           f"wall={wall_ms:.0f} ms")
     print("  Sorted by case, mysqls, sync. Errors grouped by case below.")
+    print("  Legend (all times in ms):")
+    print("    drift = ms spent hashing chunks and finding which differ")
+    print("    sync  = ms spent copying the differing chunks")
+    print("    clean = ms spent re-hashing chunks and confirming none differ")
+    print("    total = drift + sync + clean")
     cols_list = [r.columns() for r in rows]
     def ms(v):
         return "-" if v is None else f"{v:.0f}"
@@ -966,13 +963,14 @@ def _report_matrix(rows, wall_ms):
         return f"{d['schema']}-{d['key']}-{d['binary']}"
 
     # Sort by case, then mysqls, then sync time descending
-    cols_list.sort(key=lambda d: (case_key(d), d['mysqls'], -(d['sync_ms'] or 0), d['label']))
+    cols_list.sort(key=lambda d: (case_key(d), -(d['sync_ms'] or 0), d['mysqls'], d['label']))
 
     print("case\tmysqls\tsync\tdetails\tcase_hash")
     for d in cols_list:
         parts = [d['label'], f"clean={ms(d['clean_ms'])}", f"drift={ms(d['drift_ms'])}", f"total={ms(d['total_ms'])}", d['status']]
-        if d['detail']:
-            parts.append(d['detail'][:100])
+        detail = d['detail'].replace('\n', ' ').replace('\r', ' ')
+        if detail:
+            parts.append(detail[:100])
         print(f"{case_key(d)}\t{d['mysqls']}\t{ms(d['sync_ms'])}\t{' '.join(parts)}\t{d['case_hash']}")
 
     # Print errors grouped by case, with full traceback for exceptions
@@ -988,7 +986,7 @@ def _report_matrix(rows, wall_ms):
                 exc_info = ""
                 if isinstance(r.status, BaseException):
                     exc_info = "\n".join(traceback.format_exception(r.status))
-                print(f"  {ck} | {d['mysqls']} | {d['label']} | {type(r.status).__name__}: {d['detail'][:200]}")
+                print(f"  {ck} | {d['case_hash']} | {d['mysqls']} | {d['label']} | {type(r.status).__name__}: {d['detail'][:200]}")
                 if exc_info:
                     print(f"    {exc_info.strip()}")
 

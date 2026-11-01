@@ -259,7 +259,7 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
 
     // ---- Summary ----
     let ok_count = results.iter().filter(|r| r.ok).count();
-    let err_count = results.len() - ok_count;
+    let err_count = results.iter().filter(|r| !r.ok).count();
     eprintln!();
     eprintln!("──────────────── Zusammenfassung ────────────────");
     for r in &results {

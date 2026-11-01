@@ -604,10 +604,12 @@ Source: `src/sync.rs` (diff engine), `src/sqlhash.rs` (SQL group/row hashes),
 ## BENCHMARKS
 TC2* -> more columns thus somewhat realistic
 
-This was done with -concurrency12 so they could be wrong .. but the tendency is clear:
-rust is is 4x faster
+
 10.000 rows on XEON intel CPU within incus->docker
 
+test mysqls sync  details
+
+SLOW mysqlump and perl
 TC201-mixed-tuple-no_binary	8.0:9.7	1785	pt clean=- drift=1075 total=2860 ok
 TC201-mixed-tuple-no_binary	8.0:8.0	1577	pt clean=- drift=1240 total=2818 ok
 TC201-mixed-tuple-no_binary	8.0:8.0	1240	mysqldump/none clean=- drift=- total=1240 ok
@@ -615,6 +617,7 @@ TC201-mixed-tuple-no_binary	8.0:8.0	1215	mysqldump/zstd clean=- drift=- total=12
 TC201-mixed-tuple-no_binary	8.0:9.7	1121	mysqldump/none clean=- drift=- total=1121 ok
 TC201-mixed-tuple-no_binary	8.0:9.7	1108	mysqldump/zstd clean=- drift=- total=1108 ok
 
+SAME FAST -> rust ...
 TC201-mixed-tuple-no_binary	8.0:8.0	215	rust/dump clean=182 drift=233 total=630 ok
 TC201-mixed-tuple-no_binary	8.0:8.0	243	rust/raw-binary-vec clean=114 drift=175 total=532 ok
 TC201-mixed-tuple-no_binary	8.0:8.0	297	rust/select-crc32 clean=79 drift=125 total=501 ok
@@ -628,12 +631,16 @@ TC201-mixed-tuple-no_binary	8.0:9.7	374	rust/dump clean=159 drift=186 total=720 
 
 
 
+Other table
+same are slow (dump and perl)
 TC202-mixed-tuple-bin	8.0:8.0	2612	mysqldump/none clean=- drift=- total=2612 ok
 TC202-mixed-tuple-bin	8.0:8.0	2474	mysqldump/zstd clean=- drift=- total=2474 ok
 TC202-mixed-tuple-bin	8.0:8.0	2414	pt clean=- drift=1271 total=3685 ok
 TC202-mixed-tuple-bin	8.0:9.7	1652	pt clean=- drift=1227 total=2878 ok
 TC202-mixed-tuple-bin	8.0:9.7	1550	mysqldump/none clean=- drift=- total=1550 ok
 TC202-mixed-tuple-bin	8.0:9.7	1504	mysqldump/zstd clean=- drift=- total=1504 ok
+
+rust are al fast 2 outliers expected because .. well I ran 12 in parallel
 
 TC202-mixed-tuple-bin	8.0:8.0	1449	rust/select-sha2 clean=301 drift=307 total=2056 ok
 TC202-mixed-tuple-bin	8.0:8.0	1361	rust/select-crc32 clean=135 drift=139 total=1636 ok
@@ -646,6 +653,45 @@ TC202-mixed-tuple-bin	8.0:8.0	765	rust/dump clean=249 drift=537 total=1551 ok
 TC202-mixed-tuple-bin	8.0:9.7	192	rust/raw-binary-vec clean=124 drift=116 total=431 ok
 TC202-mixed-tuple-bin	8.0:9.7	718	rust/dump clean=333 drift=1892 total=2943 ok
 
+
+Example run 100000 rows
+TC201-mixed-tuple-bin   8.0:8.0 -       rust/raw-tsv(xxh3,c3,none,quic) clean=- drift=- total
+TC201-mixed-tuple-bin   8.0:8.0 22600   pt clean=- drift=7524 total=30124 ok    8745da64
+TC201-mixed-tuple-bin   8.0:9.7 11663   pt clean=- drift=8092 total=19755 ok    1f422a98
+TC201-mixed-tuple-bin   8.0:8.0 10473   mysqldump/none clean=- drift=- total=10473 ok   32759
+TC201-mixed-tuple-bin   8.0:8.0 5842    rust/dump(xxh3,c3,none,quic) clean=1915 drift=7487 to
+TC201-mixed-tuple-bin   8.0:9.7 5270    rust/dump(xxh3,c3,none,quic) clean=881 drift=9471 tot
+TC201-mixed-tuple-bin   8.0:8.0 4701    mysqldump/zstd clean=- drift=- total=4701 ok    ed988
+TC201-mixed-tuple-bin   8.0:9.7 3756    mysqldump/zstd clean=- drift=- total=3756 ok    a0d95
+TC201-mixed-tuple-bin   8.0:9.7 2912    mysqldump/none clean=- drift=- total=2912 ok    0b2ba
+TC201-mixed-tuple-bin   8.0:8.0 2438    rust/raw-binary(xxh3,c3,none,quic) clean=423 drift=90
+TC201-mixed-tuple-bin   8.0:8.0 2427    rust/select-crc32(xxh3,c3,none,quic) clean=648 drift=
+TC201-mixed-tuple-bin   8.0:9.7 1737    rust/select-sha2(xxh3,c3,none,quic) clean=1412 drift=
+TC201-mixed-tuple-bin   8.0:8.0 1244    rust/select-sha2(xxh3,c3,none,quic) clean=1121 drift=
+TC201-mixed-tuple-bin   8.0:8.0 1277    rust/raw-binary-vec(xxh3,c3,none,quic) clean=475 drif
+TC201-mixed-tuple-bin   8.0:9.7 941     rust/select-crc32(xxh3,c3,none,quic) clean=705 drift=
+TC201-mixed-tuple-bin   8.0:9.7 669     rust/raw-binary-vec(xxh3,c3,none,quic) clean=353 drif
+TC201-mixed-tuple-bin   8.0:8.0 22600   pt clean=- drift=7524 total=30124 ok    8745da64
+TC201-mixed-tuple-bin   8.0:9.7 11663   pt clean=- drift=8092 total=19755 ok    1f422a98
+TC201-mixed-tuple-bin   8.0:8.0 10473   mysqldump/none clean=- drift=- total=10473 ok   32759
+TC201-mixed-tuple-bin   8.0:8.0 5842    rust/dump(xxh3,c3,none,quic) clean=1915 drift=7487 to
+TC201-mixed-tuple-bin   8.0:9.7 5270    rust/dump(xxh3,c3,none,quic) clean=881 drift=9471 tot
+TC201-mixed-tuple-bin   8.0:8.0 4701    mysqldump/zstd clean=- drift=- total=4701 ok    ed988
+TC201-mixed-tuple-bin   8.0:9.7 3756    mysqldump/zstd clean=- drift=- total=3756 ok    a0d95
+TC201-mixed-tuple-bin   8.0:9.7 2912    mysqldump/none clean=- drift=- total=2912 ok    0b2ba
+TC201-mixed-tuple-bin   8.0:8.0 2438    rust/raw-binary(xxh3,c3,none,quic) clean=423 drift=90
+TC201-mixed-tuple-bin   8.0:8.0 2427    rust/select-crc32(xxh3,c3,none,quic) clean=648 drift=
+TC201-mixed-tuple-bin   8.0:9.7 1737    rust/select-sha2(xxh3,c3,none,quic) clean=1412 drift=
+TC201-mixed-tuple-bin   8.0:8.0 1244    rust/select-sha2(xxh3,c3,none,quic) clean=1121 drift=
+TC201-mixed-tuple-bin   8.0:8.0 1277    rust/raw-binary-vec(xxh3,c3,none,quic) clean=475 drif
+TC201-mixed-tuple-bin   8.0:9.7 941     rust/select-crc32(xxh3,c3,none,quic) clean=705 drift=
+TC201-mixed-tuple-bin   8.0:9.7 669     rust/raw-binary-vec(xxh3,c3,none,quic) clean=353 drif
+bin expected can't be run through TSV export
+TC201-mixed-tuple-bin   8.0:9.7 -       rust/raw-binary(xxh3,c3,none,quic) clean=- drift=- to
+TC201-mixed-tuple-bin   8.0:9.7 -       rust/raw-tsv(xxh3,c3,none,quic) clean=- drift=- total
+TC201-mixed-tuple-bin   8.0:9.7 -       rust/raw-binary(xxh3,c3,none,quic) clean=- drift=- to
+TC201-mixed-tuple-bin   8.0:8.0 -       rust/raw-tsv(xxh3,c3,none,quic) clean=- drift=- total
+TC201-mixed-tuple-bin   8.0:9.7 -       rust/raw-tsv(xxh3,c3,none,quic) clean=- drift=- total
 
 ### Why select modes are faster on 8.0→9.7
 
