@@ -1,7 +1,7 @@
 //! Server-seitiger Import: TSV-Stream -> batched REPLACE INTO, PK-Löschungen,
 //! SQL-Dump-Ausführung (gefiltert), Trigger-Handling.
 
-use crate::hash::{tsv_unescape_field, PK_SEP};
+use crate::hash::tsv_unescape_field;
 use crate::mysqlutil::{self, qualified};
 use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
@@ -14,7 +14,7 @@ const IMPORT_BATCH: usize = 1000;
 pub struct TsvBatcher {
     pub columns: Vec<String>,
     pub hex_indexes: HashSet<usize>,
-    buf: Vec<u8>,      // unvollständige Zeile
+    buf: Vec<u8>,        // unvollständige Zeile
     batch: Vec<Vec<u8>>, // fertige Zeilen (roh)
 }
 
@@ -26,7 +26,12 @@ impl TsvBatcher {
             .filter(|(_, c)| hex_columns.contains(c))
             .map(|(i, _)| i)
             .collect();
-        TsvBatcher { columns, hex_indexes, buf: Vec::new(), batch: Vec::new() }
+        TsvBatcher {
+            columns,
+            hex_indexes,
+            buf: Vec::new(),
+            batch: Vec::new(),
+        }
     }
 
     /// BIN-Frame in den Parser schieben; liefert fertige Zeilen zurück.
@@ -57,7 +62,10 @@ impl TsvBatcher {
             return Ok(Vec::new());
         }
         let rows = std::mem::take(&mut self.batch);
-        let parsed = rows.iter().map(|l| self.parse_line(l)).collect::<Result<Vec<_>>>()?;
+        let parsed = rows
+            .iter()
+            .map(|l| self.parse_line(l))
+            .collect::<Result<Vec<_>>>()?;
         Ok(parsed)
     }
 
@@ -87,7 +95,8 @@ impl TsvBatcher {
                 None => out.push(Value::NULL),
                 Some(bytes) => {
                     if self.hex_indexes.contains(&i) {
-                        let decoded = hex::decode(&bytes).context("Hex-Spalte enthält ungültiges Hex")?;
+                        let decoded =
+                            hex::decode(&bytes).context("Hex-Spalte enthält ungültiges Hex")?;
                         out.push(Value::Bytes(decoded));
                     } else {
                         out.push(Value::Bytes(bytes));
@@ -103,7 +112,13 @@ impl TsvBatcher {
 ///
 /// Mehrere Zeilen pro Statement: ein Round-Trip und eine Transaktion pro Batch
 /// statt einem Round-Trip/Commit pro Zeile (vorher ~10 ms/Zeile).
-pub async fn import_rows(conn: &mut Conn, db: &str, table: &str, columns: &[String], rows: Vec<Vec<Value>>) -> Result<u64> {
+pub async fn import_rows(
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    columns: &[String],
+    rows: Vec<Vec<Value>>,
+) -> Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
@@ -128,12 +143,12 @@ pub async fn import_rows(conn: &mut Conn, db: &str, table: &str, columns: &[Stri
     Ok(total)
 }
 
-/// PKs löschen (kanonische Strings, numerische Spalten als Literale).
-pub async fn delete_pks(
+/// PKs löschen (Komponenten je PK, numerische Spalten als Literale).
+pub async fn delete_pks<S: AsRef<str> + std::fmt::Debug>(
     conn: &mut Conn,
     db: &str,
     table: &str,
-    pks: &[String],
+    pks: &[Vec<S>],
 ) -> Result<u64> {
     use crate::mysqlutil::PkCol;
     if pks.is_empty() {
@@ -145,8 +160,14 @@ pub async fn delete_pks(
     let mut deleted = 0u64;
     for chunk in pks.chunks(500) {
         let where_clause = crate::mysqlutil::pk_in_where(&meta, chunk)?;
-        let sql = format!("DELETE FROM {} WHERE {}", qualified(db, table), where_clause);
-        conn.query_drop(sql).await.context("DELETE fehlgeschlagen")?;
+        let sql = format!(
+            "DELETE FROM {} WHERE {}",
+            qualified(db, table),
+            where_clause
+        );
+        conn.query_drop(sql)
+            .await
+            .context("DELETE fehlgeschlagen")?;
         deleted += chunk.len() as u64;
     }
     Ok(deleted)
@@ -158,7 +179,9 @@ pub async fn execute_dump(conn: &mut Conn, sql: &str) -> Result<u64> {
     let statements = split_sql_statements(sql);
     // Eine Transaktion für den ganzen Dump: sonst committet jedes Statement
     // einzeln (~10 ms/Zeile bei fsync=1).
-    conn.query_drop("START TRANSACTION").await.context("START TRANSACTION fehlgeschlagen")?;
+    conn.query_drop("START TRANSACTION")
+        .await
+        .context("START TRANSACTION fehlgeschlagen")?;
     let mut executed = 0u64;
     for st in statements {
         let trimmed = st.trim();
@@ -166,18 +189,26 @@ pub async fn execute_dump(conn: &mut Conn, sql: &str) -> Result<u64> {
             continue;
         }
         if !is_allowed_statement(trimmed) {
-            log::debug!("Dump-Statement gefiltert: {}", &trimmed[..trimmed.len().min(60)]);
+            log::debug!(
+                "Dump-Statement gefiltert: {}",
+                &trimmed[..trimmed.len().min(60)]
+            );
             continue;
         }
         if let Err(e) = conn.query_drop(trimmed).await {
             let _ = conn.query_drop("ROLLBACK").await;
             return Err(e).with_context(|| {
-                format!("Dump-Statement fehlgeschlagen: {}", &trimmed[..trimmed.len().min(120)])
+                format!(
+                    "Dump-Statement fehlgeschlagen: {}",
+                    &trimmed[..trimmed.len().min(120)]
+                )
             });
         }
         executed += 1;
     }
-    conn.query_drop("COMMIT").await.context("COMMIT fehlgeschlagen")?;
+    conn.query_drop("COMMIT")
+        .await
+        .context("COMMIT fehlgeschlagen")?;
     Ok(executed)
 }
 
@@ -272,7 +303,11 @@ pub struct TriggerDef {
     pub create_sql: String,
 }
 
-pub async fn snapshot_and_drop_triggers(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<TriggerDef>> {
+pub async fn snapshot_and_drop_triggers(
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+) -> Result<Vec<TriggerDef>> {
     let q = format!(
         "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS \
          WHERE TRIGGER_SCHEMA = ? AND EVENT_OBJECT_TABLE = ?"
@@ -280,14 +315,32 @@ pub async fn snapshot_and_drop_triggers(conn: &mut Conn, db: &str, table: &str) 
     let names: Vec<String> = conn.exec(q, (db, table)).await?;
     let mut defs = Vec::new();
     for name in names {
-        let q2 = format!("SHOW CREATE TRIGGER {}.{}", mysqlutil::quote_ident(db), mysqlutil::quote_ident(&name));
-        let row: Option<(String, mysql_async::Value, mysql_async::Value, String, String, mysql_async::Value, mysql_async::Value)> =
-            conn.query_first(q2).await?;
+        let q2 = format!(
+            "SHOW CREATE TRIGGER {}.{}",
+            mysqlutil::quote_ident(db),
+            mysqlutil::quote_ident(&name)
+        );
+        let row: Option<(
+            String,
+            mysql_async::Value,
+            mysql_async::Value,
+            String,
+            String,
+            mysql_async::Value,
+            mysql_async::Value,
+        )> = conn.query_first(q2).await?;
         if let Some(r) = row {
             let sql = r.3;
-            conn.query_drop(format!("DROP TRIGGER IF EXISTS {}.{}", mysqlutil::quote_ident(db), mysqlutil::quote_ident(&name)))
-                .await?;
-            defs.push(TriggerDef { name, create_sql: sql });
+            conn.query_drop(format!(
+                "DROP TRIGGER IF EXISTS {}.{}",
+                mysqlutil::quote_ident(db),
+                mysqlutil::quote_ident(&name)
+            ))
+            .await?;
+            defs.push(TriggerDef {
+                name,
+                create_sql: sql,
+            });
         }
     }
     if !defs.is_empty() {
@@ -299,17 +352,15 @@ pub async fn snapshot_and_drop_triggers(conn: &mut Conn, db: &str, table: &str) 
 pub async fn restore_triggers(conn: &mut Conn, db: &str, defs: &[TriggerDef]) -> Result<()> {
     for t in defs {
         if let Err(e) = conn.query_drop(&t.create_sql).await {
-            log::warn!("[{db}] Trigger {} konnte nicht wiederhergestellt werden: {e}", t.name);
+            log::warn!(
+                "[{db}] Trigger {} konnte nicht wiederhergestellt werden: {e}",
+                t.name
+            );
         } else {
             log::info!("[{db}] Trigger {} wiederhergestellt", t.name);
         }
     }
     Ok(())
-}
-
-/// Kanonische PK-Komponenten zurückgeben (Helper für DeletePks-Requests).
-pub fn split_pk(canonical: &str) -> Vec<String> {
-    canonical.split(PK_SEP).map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -324,7 +375,13 @@ mod tests {
         let _ = b.push(line).unwrap();
         let rows = b.finish().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], vec![Value::Bytes(b"hello".to_vec()), Value::Bytes(b"world".to_vec())]);
+        assert_eq!(
+            rows[0],
+            vec![
+                Value::Bytes(b"hello".to_vec()),
+                Value::Bytes(b"world".to_vec())
+            ]
+        );
     }
 
     #[test]
@@ -351,7 +408,8 @@ mod tests {
 
     #[test]
     fn split_statements() {
-        let sql = "INSERT INTO `t` VALUES (1,'a;b'); -- comment\nREPLACE INTO `t` VALUES (2,'x\\'y');";
+        let sql =
+            "INSERT INTO `t` VALUES (1,'a;b'); -- comment\nREPLACE INTO `t` VALUES (2,'x\\'y');";
         let st = split_sql_statements(sql);
         assert_eq!(st.len(), 2);
         assert!(st[0].starts_with("INSERT"));

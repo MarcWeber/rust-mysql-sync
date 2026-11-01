@@ -19,7 +19,10 @@ pub fn fingerprint_of(der: &[u8]) -> String {
 }
 
 fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
-    let t = s.trim().trim_start_matches("sha256:").trim_start_matches("SHA256:");
+    let t = s
+        .trim()
+        .trim_start_matches("sha256:")
+        .trim_start_matches("SHA256:");
     let bytes = hex::decode(t).context("Fingerprint ist kein gültiges Hex")?;
     bytes
         .try_into()
@@ -27,7 +30,10 @@ fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
 }
 
 /// Lädt oder erzeugt Server-Identität. Liefert (certs, key, fingerprint).
-pub fn server_identity(cfg: &Config, config_path: &std::path::Path) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)> {
+pub fn server_identity(
+    cfg: &Config,
+    config_path: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)> {
     if let (Some(cp), Some(kp)) = (&cfg.tls_cert, &cfg.tls_key) {
         let (certs, key) = load_pem(std::path::Path::new(cp), std::path::Path::new(kp))?;
         let fp = fingerprint_of(certs[0].as_ref());
@@ -38,7 +44,9 @@ pub fn server_identity(cfg: &Config, config_path: &std::path::Path) -> Result<(V
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "config".into());
-    let dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let cert_path = dir.join(format!("{stem}-cert.pem"));
     let key_path = dir.join(format!("{stem}-key.pem"));
 
@@ -51,8 +59,8 @@ pub fn server_identity(cfg: &Config, config_path: &std::path::Path) -> Result<(V
     }
 
     log::info!("Erzeuge neues Self-signed-Zertifikat …");
-    let mut params = rcgen::CertificateParams::new(vec!["mysql-sync".to_string()])
-        .context("rcgen-Params")?;
+    let mut params =
+        rcgen::CertificateParams::new(vec!["mysql-sync".to_string()]).context("rcgen-Params")?;
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "mysql-sync");
@@ -63,8 +71,10 @@ pub fn server_identity(cfg: &Config, config_path: &std::path::Path) -> Result<(V
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-    std::fs::write(&cert_path, &cert_pem).with_context(|| format!("Schreiben {}", cert_path.display()))?;
-    std::fs::write(&key_path, &key_pem).with_context(|| format!("Schreiben {}", key_path.display()))?;
+    std::fs::write(&cert_path, &cert_pem)
+        .with_context(|| format!("Schreiben {}", cert_path.display()))?;
+    std::fs::write(&key_path, &key_pem)
+        .with_context(|| format!("Schreiben {}", key_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -80,9 +90,14 @@ pub fn server_identity(cfg: &Config, config_path: &std::path::Path) -> Result<(V
     Ok((certs, key, fp))
 }
 
-fn load_pem(cert_path: &std::path::Path, key_path: &std::path::Path) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_pem = std::fs::read(cert_path).with_context(|| format!("Lesen {}", cert_path.display()))?;
-    let key_pem = std::fs::read(key_path).with_context(|| format!("Lesen {}", key_path.display()))?;
+fn load_pem(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_pem =
+        std::fs::read(cert_path).with_context(|| format!("Lesen {}", cert_path.display()))?;
+    let key_pem =
+        std::fs::read(key_path).with_context(|| format!("Lesen {}", key_path.display()))?;
     let mut cr = &cert_pem[..];
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cr)
         .collect::<std::result::Result<_, _>>()
@@ -140,7 +155,9 @@ impl ServerCertVerifier for PinVerifier {
             }
             None => {
                 log::warn!("TOFU: Server-Fingerprint unbeprüft akzeptiert: {fp}");
-                log::warn!("→ Für Produktion in config-client.json unter \"server_fingerprint\" pinnen!");
+                log::warn!(
+                    "→ Für Produktion in config-client.json unter \"server_fingerprint\" pinnen!"
+                );
                 Ok(ServerCertVerified::assertion())
             }
         }

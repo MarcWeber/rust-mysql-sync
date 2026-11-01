@@ -144,7 +144,7 @@ reproduce them on your own hardware.
 **Reproducing the benchmark** (test data is generated, not shipped):
 
 ```bash
-# 1) create the 100k-row table on the source (see deploy/ or your own data)
+# 1) create the 100k-row table on the source (see test.py TableSchema or your own data)
 # 2) benchmark all hash paths locally (no server required)
 mysql-sync -C config-client.json --benchmark db_bench.big
 
@@ -377,7 +377,74 @@ Other keys: `transport` (`quic`/`tcp`), `allow_plaintext`, `compression`
 `allow_csv` (`false` = SQL REPLACE dumps), `dump_strategies` (ordered with
 fallback), `transfer_batch_rows` (alias `dump_threshold`), `chunked` (1–6), `concurrent_processes`,
 `diff_threshold_percent`, `disable_triggers`, `database_mappings`,
-`database_table_mappings`. Chunk mode is automatic and is not a config key.
+`database_table_mappings`, `hash_strategies`, `float_precision`, `tables`.
+Chunk mode is automatic and is not a config key.
+
+### Hash path, tables and fields
+
+`hash_strategies` is an ordered try-list; the first usable path wins. A CLI
+`--hash-*` flag forces exactly one path and skips the list. Valid names:
+`raw-binary`, `raw-binary-vec`, `select`, `dump`, `raw-tsv`. Default is
+`["select"]`.
+
+`tables` overrides apply per table. The key is a glob over `"db.table"`:
+`*` matches any run of characters, `?` exactly one. The **first matching entry
+in config order wins** — entries are not merged. Format the JSON so the more
+specific selectors come first.
+
+```json
+{
+  "hash-strategies": ["raw-binary", "raw-binary-vec", "select"],
+  "float-precision": "auto",
+  "tables": {
+    "*.orders": {
+      "strategies": ["raw-binary-vec", "select"],
+      "fields": {
+        "price":    { "float-precision": 2 },
+        "currency": { "transform": "ignore" },
+        "email":    { "transform": "lower" }
+      }
+    },
+    "shop.*": {
+      "fields": { "ratio": { "float-precision": 6 } }
+    }
+  }
+}
+```
+
+Field options are looked up by column name (case-insensitive):
+
+- `float-precision`: `"off"`, `"auto"` (default) or `0..=30`.
+- `transform`: `"trim"`, `"lower"` or `"ignore"`. Transforms change row
+  equality, so they restrict the table to paths that decode values:
+  `select`, `dump` or `raw-binary-vec`. `raw-binary`/`raw-tsv` are skipped
+  automatically (forced CLI paths then fail with an error).
+- Overrides on primary-key columns are rejected.
+
+Precedence: field override > global `float_precision` > built-in default
+(`auto`). DECIMAL/NUMERIC is exact and is never rounded; an explicit numeric
+`float-precision` on a non-FLOAT/DOUBLE column is an error.
+
+The resolved path, field options and float precision are logged per table, e.g.
+`[shop.orders] Feld-Optionen: 2 fuer price (Feld), lower fuer email`.
+
+#### DETAILS ABOUT TYPES
+
+| Column type | `auto` on text paths | Explicit `float-precision` | `trim`/`lower` |
+|---|---|---|---|
+| `FLOAT(M,D)`, `DOUBLE(M,D)` | round to `D` | round to `N` | rejected |
+| `FLOAT`, `DOUBLE` without `(M,D)` | off | round to `N` | rejected |
+| `DECIMAL`, `NUMERIC` | exact, never rounded | rejected (error) | rejected |
+| `CHAR`, `VARCHAR`, `TEXT`, `ENUM`, `SET` | unchanged | rejected (error) | allowed |
+| `BINARY`, `VARBINARY`, `BLOB` | unchanged | rejected (error) | rejected |
+| integers, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, JSON, … | unchanged | rejected (error) | rejected |
+
+Rounding applies to text rendering only. `raw-binary` and `raw-tsv` hash raw
+bytes and ignore `float-precision`; `raw-binary-vec` decodes values and applies
+it like `select`/`dump`. Use `"off"` for bit-exact FLOAT/DOUBLE comparison on
+text paths. Two servers with the same schema otherwise format floats
+identically, so for same-version migrations prefer `raw-binary` and leave
+precision at `auto`.
 
 On first server start, the certificate and `<config>.fingerprint` are created
 next to the config; pin the fingerprint in the client as
@@ -397,9 +464,11 @@ working directory.
   every frame is compressed — no size threshold, no heuristics —
   `compression_level` 1–22 (default 3). Frames are self-describing, so each
   side may choose its own setting.
-- **Wire format v4**: `U<len>\n<body>` (uncompressed) or `C<len>\n<body>`
+- **Wire format v7**: `U<len>\n<body>` (uncompressed) or `C<len>\n<body>`
   (zstd), `<body>` = rkyv-serialized `Request`/`Response`; ALPN
-  `mysql-sync/4`. Client and server must be built from the same version.
+  `mysql-sync/7`. Client and server must be built from the same version.
+  Primary keys travel as structured component lists (`Vec<String>`), never as
+  separator-joined strings.
 
 ## TRUST MODEL
 
@@ -439,21 +508,16 @@ and the selector, the default selector `*` is used.
 
 ## TESTING
 
+Docker only. `test.py` starts two MySQL containers and runs the matrix
+(source vs target, rust modes vs pt-table-sync, with chunks deliberately
+removed from both sides).
+
 ```bash
-MSYNC_DST_PORT=3317 docker compose up -d
-MSYNC_DST_PORT=3317 python3 test.py
+python3 test.py up matrix
 ```
 
-`test.py` covers scenarios A–L with 69 checks: schema, differential sync, drift
-with exact row counts, repair, force-recreate, SQL dump, select/dump/raw-binary/
-raw-tsv hashing (clean, drift, sync, and chunked range/mod fallback), raw profile
-gating, raw-tsv rejection of binary columns, hash mismatch + blake3, zstd
-compression, plaintext TCP, automatic range chunking for numeric/CHAR/BINARY
-PKs, mod fallback for DATE/composite PKs, and rejection of tables without a PK
-— including binary poison data (`\0\0\0`, invalid UTF-8). Docker mode installs
-a temporary `mysql` wrapper in `.test-run/bin` so raw-tsv can scan through the
-containers.
-Without Docker: `MSYNC_LOCAL=1 MSYNC_SRC_PORT=… MSYNC_DST_PORT=… python3 test.py`.
+Everything needed is set in `test.py`; no environment variables have to be
+exported.
 
 ## ALTERNATIVES
 

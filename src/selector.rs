@@ -13,11 +13,19 @@ impl Selector {
     /// None -> "*.*"
     pub fn parse(sel: Option<&str>) -> Result<Selector> {
         let sel = match sel {
-            None => return Ok(Selector { dbs: vec!["*".into()], tables: vec!["*".into()] }),
+            None => {
+                return Ok(Selector {
+                    dbs: vec!["*".into()],
+                    tables: vec!["*".into()],
+                })
+            }
             Some(s) => s.trim(),
         };
         if sel.is_empty() {
-            return Ok(Selector { dbs: vec!["*".into()], tables: vec!["*".into()] });
+            return Ok(Selector {
+                dbs: vec!["*".into()],
+                tables: vec!["*".into()],
+            });
         }
         // Letzten Punkt als Trenner nehmen: "db1,db2.t1,t2" -> A="db1,db2" B="t1,t2"
         let (a, b) = match sel.rsplit_once('.') {
@@ -125,7 +133,13 @@ mod tests {
         db_map.insert("db".to_string(), "target_db".to_string());
         let mut t_map = std::collections::HashMap::new();
         t_map.insert("a.b".to_string(), "x.y".to_string());
-        assert_eq!(map_remote("a", "b", &db_map, &t_map), ("x".into(), "y".into()));
-        assert_eq!(map_remote("db", "t", &db_map, &t_map), ("target_db".into(), "t".into()));
+        assert_eq!(
+            map_remote("a", "b", &db_map, &t_map),
+            ("x".into(), "y".into())
+        );
+        assert_eq!(
+            map_remote("db", "t", &db_map, &t_map),
+            ("target_db".into(), "t".into())
+        );
     }
 }

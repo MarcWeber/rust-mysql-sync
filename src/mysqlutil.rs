@@ -163,6 +163,54 @@ pub async fn column_names(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<
     Ok(rows)
 }
 
+/// Spalten-Metadaten in ordinaler Reihenfolge (fuer Feld-Overrides).
+#[derive(Debug, Clone)]
+pub struct ColumnMeta {
+    pub name: String,
+    pub data_type: String,
+    pub column_type: String,
+}
+
+impl ColumnMeta {
+    pub fn is_float(&self) -> bool {
+        matches!(
+            self.data_type.to_ascii_lowercase().as_str(),
+            "float" | "double" | "real"
+        )
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(
+            self.data_type.to_ascii_lowercase().as_str(),
+            "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
+        )
+    }
+
+    /// Deklarierter Nachkomma-Anteil aus `FLOAT(M,D)`/`DOUBLE(M,D)`.
+    pub fn declared_scale(&self) -> Option<u8> {
+        let ct = self.column_type.to_ascii_lowercase();
+        let (_, rest) = ct.split_once('(')?;
+        let (m, _) = rest.split_once(')')?;
+        let d = m.split_once(',')?.1.trim();
+        d.parse::<u8>().ok()
+    }
+}
+
+pub async fn column_meta(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<ColumnMeta>> {
+    let q = "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
+    let rows: Vec<(String, String, String)> = conn.exec(q, (db, table)).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, data_type, column_type)| ColumnMeta {
+            name,
+            data_type: data_type.to_ascii_lowercase(),
+            column_type: column_type.to_ascii_lowercase(),
+        })
+        .collect())
+}
+
 pub async fn table_count(conn: &mut Conn, db: &str, table: &str) -> Result<u64> {
     let q = format!("SELECT COUNT(*) FROM {}", qualified(db, table));
     let (c,): (u64,) = conn.query_first(q).await?.unwrap_or((0,));
@@ -500,36 +548,44 @@ fn pk_component_literal(pk: &PkCol, part: &str, out: &mut Vec<u8>) -> Result<()>
     Ok(())
 }
 
-/// WHERE-Klausel für konkrete PK-Werte (kanonische Strings) — zum Zeilen-Nachladen.
-pub fn pk_in_where(pks: &[PkCol], canonical_pks: &[String]) -> Result<String> {
+/// WHERE-Klausel für konkrete PK-Komponenten — zum Zeilen-Nachladen.
+pub fn pk_in_where<S: AsRef<str> + std::fmt::Debug>(
+    pks: &[PkCol],
+    rows: &[Vec<S>],
+) -> Result<String> {
     if pks.is_empty() {
         bail!("Tabelle hat keinen Primary Key");
     }
-    if canonical_pks.is_empty() {
+    if rows.is_empty() {
         return Ok("FALSE".to_string());
+    }
+    for row in rows {
+        if row.len() != pks.len() {
+            bail!(
+                "PK-Komponentenanzahl {} passt nicht zu {} Spalten: {row:?}",
+                row.len(),
+                pks.len()
+            );
+        }
     }
     let mut buf = Vec::new();
     if pks.len() == 1 {
         let col = quote_ident(&pks[0].name);
-        let mut items = Vec::with_capacity(canonical_pks.len());
-        for cp in canonical_pks {
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
             buf.clear();
-            pk_component_literal(&pks[0], cp, &mut buf)?;
+            pk_component_literal(&pks[0], row[0].as_ref(), &mut buf)?;
             items.push(String::from_utf8_lossy(&buf).to_string());
         }
         Ok(format!("{col} IN ({})", items.join(", ")))
     } else {
         // Composite: (k1,k2) IN ((v1,v2), ...)
-        let mut tuples = Vec::with_capacity(canonical_pks.len());
-        for cp in canonical_pks {
-            let parts: Vec<&str> = cp.split(crate::hash::PK_SEP).collect();
-            if parts.len() != pks.len() {
-                bail!("PK-Komponentenanzahl passt nicht: {cp}");
-            }
-            let mut vals = Vec::with_capacity(parts.len());
-            for (i, part) in parts.iter().enumerate() {
+        let mut tuples = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut vals = Vec::with_capacity(row.len());
+            for (i, part) in row.iter().enumerate() {
                 buf.clear();
-                pk_component_literal(&pks[i], part, &mut buf)?;
+                pk_component_literal(&pks[i], part.as_ref(), &mut buf)?;
                 vals.push(String::from_utf8_lossy(&buf).to_string());
             }
             tuples.push(format!("({})", vals.join(",")));
@@ -540,13 +596,16 @@ pub fn pk_in_where(pks: &[PkCol], canonical_pks: &[String]) -> Result<String> {
 }
 
 /// Keyset-Paginierung: WHERE (k1,k2,…) > (letzte PK-Werte) für die nächste Page.
-pub fn pk_gt_where(pks: &[PkCol], last_canonical: &str) -> Result<String> {
+pub fn pk_gt_where(pks: &[PkCol], parts: &[String]) -> Result<String> {
     if pks.is_empty() {
         bail!("Tabelle hat keinen Primary Key");
     }
-    let parts: Vec<&str> = last_canonical.split(crate::hash::PK_SEP).collect();
     if parts.len() != pks.len() {
-        bail!("PK-Komponentenanzahl passt nicht für Keyset: {last_canonical}");
+        bail!(
+            "PK-Komponentenanzahl {} passt nicht zu {} Spalten: {parts:?}",
+            parts.len(),
+            pks.len()
+        );
     }
     let mut buf = Vec::new();
     let mut vals = Vec::with_capacity(parts.len());
@@ -559,9 +618,9 @@ pub fn pk_gt_where(pks: &[PkCol], last_canonical: &str) -> Result<String> {
     Ok(format!("({}) > ({})", cols.join(","), vals.join(",")))
 }
 
-/// Kanonischer PK-String eines Zeilenwerts via PK-Metadaten.
-pub fn pk_of_row(values: &[Value], pk_indexes: &[usize], pks: &[PkCol]) -> String {
-    crate::hash::pk_canonical(values, pk_indexes, pks)
+/// Kanonische PK-Komponenten eines Zeilenwerts via PK-Metadaten.
+pub fn pk_of_row(values: &[Value], pk_indexes: &[usize], pks: &[PkCol]) -> Vec<String> {
+    crate::hash::pk_components(values, pk_indexes, pks)
 }
 
 /// SHOW CREATE TABLE normalisieren (für Schema-Vergleich).
@@ -572,6 +631,15 @@ pub fn normalize_schema(sql: &str) -> String {
         if l.starts_with("/*") || l.is_empty() {
             continue;
         }
+        // Der Tabellenname darf sich durch database_table_mappings unterscheiden.
+        let l = if let Some(rest) = l.strip_prefix("CREATE TABLE ") {
+            match rest.find('(') {
+                Some(i) => format!("CREATE TABLE {}", &rest[i..]),
+                None => l.to_string(),
+            }
+        } else {
+            l.to_string()
+        };
         // AUTO_INCREMENT=12345 ignorieren (Änderungsalarm sonst bei jedem Insert)
         let mut parts: Vec<&str> = Vec::new();
         for piece in l.split_whitespace() {

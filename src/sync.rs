@@ -14,7 +14,7 @@ use crate::export::{self, RowMsg};
 use crate::hash::{self, ChunkMode};
 use crate::mysqlutil::{self, PkCol};
 use crate::progress::Progress;
-use crate::proto::{self, ChunkHash, Framing, Request, Response};
+use crate::proto::{self, ArchivedResponse, ChunkHash, Framing, Request};
 use crate::sqlhash;
 use crate::transport::{RecvHalf, SendHalf};
 use crate::{hash_binary, hash_tsv};
@@ -59,6 +59,187 @@ impl HashVia {
             HashVia::RawBinary | HashVia::RawBinaryVec | HashVia::RawTsv
         )
     }
+
+    /// Ob der Weg dekodierte `Value`s sieht und damit Feld-Overrides anwenden
+    /// kann. Byte-Pfade (`raw-binary`, `raw-tsv`) koennen das nicht.
+    pub fn supports_field_opts(self) -> bool {
+        matches!(
+            self,
+            HashVia::Select | HashVia::Dump | HashVia::RawBinaryVec
+        )
+    }
+}
+
+impl std::str::FromStr for HashVia {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let t = s.trim().to_ascii_lowercase().replace('_', "-");
+        match t.as_str() {
+            "select" | "sql" => Ok(HashVia::Select),
+            "dump" | "export" => Ok(HashVia::Dump),
+            "raw-binary" | "raw-binary-row" | "packet" => Ok(HashVia::RawBinary),
+            "raw-binary-vec" | "raw-binary-row-vec" | "vec" => Ok(HashVia::RawBinaryVec),
+            "raw-tsv" | "tsv" => Ok(HashVia::RawTsv),
+            _ => bail!(
+                "Unbekannter Hash-Weg {s:?} (erlaubt: select, dump, raw-binary, \
+                 raw-binary-vec, raw-tsv)"
+            ),
+        }
+    }
+}
+
+/// Ergebnis der Config-Aufloesung fuer eine Tabelle.
+#[derive(Debug, Clone)]
+pub struct TablePlan {
+    /// Hash-Wege in Try-Order (bereits nach Feld-Transform gefiltert).
+    pub candidates: Vec<HashVia>,
+    /// Nur Overrides, die vom Default abweichen (Ordinal = SELECT-Reihenfolge).
+    pub field_opts: Vec<proto::FieldOpt>,
+    /// Passender `tables`-Selektor (fuer Logging).
+    pub matched: Option<String>,
+    /// Menschliche Notizen zu aufgeloesten Feld-Optionen.
+    pub notes: Vec<String>,
+}
+
+/// Loest `tables`/`float_precision` fuer eine Tabelle auf.
+///
+/// Regeln:
+/// - erster passender `tables`-Selektor gewinnt (keine Merge-Logik)
+/// - CLI-Weg hat Vorrang vor Config-Listen
+/// - `trim`/`lower`/`ignore` schliessen `raw-binary`/`raw-tsv` aus
+/// - `float-precision` gilt nur fuer FLOAT/DOUBLE; DECIMAL bleibt exakt
+/// - Default fuer FLOAT/DOUBLE: `auto` = deklarierte Skala aus `(M,D)`, sonst aus
+pub fn plan_table(
+    cfg: &Config,
+    db: &str,
+    table: &str,
+    columns: &[mysqlutil::ColumnMeta],
+    pk_names: &[String],
+    forced: Option<HashVia>,
+) -> Result<TablePlan> {
+    use crate::config::FloatPrecision;
+    use crate::proto::{FieldOpt, FieldTransform};
+
+    let matched = cfg.table_override(db, table);
+    let configured: Vec<String> = match forced {
+        Some(v) => vec![v.name().to_string()],
+        None => matched
+            .and_then(|(_, ov)| ov.strategies.clone())
+            .unwrap_or_else(|| cfg.hash_strategy_list()),
+    };
+    let mut candidates: Vec<HashVia> = Vec::new();
+    for s in &configured {
+        let via: HashVia = s
+            .parse()
+            .with_context(|| format!("{db}.{table}: hash-strategies"))?;
+        if !candidates.contains(&via) {
+            candidates.push(via);
+        }
+    }
+    if candidates.is_empty() {
+        bail!("{db}.{table}: hash-strategies ist leer");
+    }
+
+    let is_pk = |name: &str| pk_names.iter().any(|p| p.eq_ignore_ascii_case(name));
+    let mut field_opts = Vec::new();
+    let mut notes = Vec::new();
+
+    for (ordinal, col) in columns.iter().enumerate() {
+        let fo = matched.and_then(|(_, ov)| ov.field(&col.name));
+        let transform = match fo.and_then(|f| f.transform.as_deref()) {
+            None => None,
+            Some(t) => Some(match t.trim().to_ascii_lowercase().as_str() {
+                "trim" => FieldTransform::Trim,
+                "lower" => FieldTransform::Lower,
+                "ignore" => FieldTransform::Ignore,
+                other => bail!("{db}.{table}.{}: unbekannter transform {other:?}", col.name),
+            }),
+        };
+        let field_precision = fo.and_then(|f| f.float_precision);
+
+        if is_pk(&col.name) && (transform.is_some() || field_precision.is_some()) {
+            bail!(
+                "{db}.{table}: Feld-Override auf PK-Spalte {} ist nicht erlaubt",
+                col.name
+            );
+        }
+        if transform.is_some() && !col.is_text() {
+            bail!(
+                "{db}.{table}.{}: transform ist nur fuer Textspalten erlaubt (Typ {})",
+                col.name,
+                col.data_type
+            );
+        }
+
+        let requested = field_precision.unwrap_or(cfg.float_precision);
+        let source = if field_precision.is_some() {
+            "Feld"
+        } else {
+            "global"
+        };
+        let mut precision = None;
+        if col.is_float() && !is_pk(&col.name) {
+            match requested {
+                FloatPrecision::Off => {}
+                FloatPrecision::Auto => precision = col.declared_scale(),
+                FloatPrecision::Fixed(n) => precision = Some(n),
+            }
+            if requested != FloatPrecision::Off {
+                let shown = precision
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "aus".to_string());
+                let how = if precision.is_some() {
+                    source
+                } else {
+                    "auto, keine (M,D)"
+                };
+                notes.push(format!("{shown} fuer {} ({how})", col.name));
+            }
+        } else if let Some(FloatPrecision::Fixed(_)) = field_precision {
+            bail!(
+                "{db}.{table}.{}: float-precision gilt nur fuer FLOAT/DOUBLE (Typ {})",
+                col.name,
+                col.data_type
+            );
+        }
+
+        if let Some(t) = transform {
+            let name = match t {
+                FieldTransform::Trim => "trim",
+                FieldTransform::Lower => "lower",
+                FieldTransform::Ignore => "ignore",
+            };
+            notes.push(format!("{name} fuer {}", col.name));
+        }
+
+        if transform.is_some() || precision.is_some() {
+            field_opts.push(FieldOpt {
+                ordinal: ordinal as u32,
+                transform,
+                float_precision: precision,
+            });
+        }
+    }
+
+    let has_transforms = field_opts.iter().any(|o| o.transform.is_some());
+    if has_transforms {
+        let configured_names: Vec<&str> = candidates.iter().map(|v| v.name()).collect();
+        candidates.retain(|v| v.supports_field_opts());
+        if candidates.is_empty() {
+            bail!(
+                "{db}.{table}: trim/lower/ignore brauchen select, dump oder \
+                 raw-binary-vec (konfiguriert: {configured_names:?})"
+            );
+        }
+    }
+
+    Ok(TablePlan {
+        candidates,
+        field_opts,
+        matched: matched.map(|(pattern, _)| pattern.to_string()),
+        notes,
+    })
 }
 
 fn hash_via_source(via: HashVia) -> Option<String> {
@@ -77,10 +258,16 @@ async fn fetch_server_profile(
     f: &Framing,
 ) -> Result<proto::MysqlProfile> {
     proto::write_request(send, &Request::MysqlVersion {}, f).await?;
-    match read_response(recv, f).await? {
-        Response::MysqlVersion { profile, .. } => Ok(profile),
-        Response::Err { message } => {
-            bail!("MySQL-Version/Profil abrufen fehlgeschlagen: {message}")
+    let buf = read_response(recv, f).await?;
+    match proto::access_response(&buf)? {
+        ArchivedResponse::MysqlVersion { profile, .. } => {
+            Ok(proto::MysqlProfile::from_archived(profile))
+        }
+        ArchivedResponse::Err { message } => {
+            bail!(
+                "MySQL-Version/Profil abrufen fehlgeschlagen: {}",
+                message.as_str()
+            )
         }
         _ => bail!("Unerwartete Antwort auf MysqlVersion"),
     }
@@ -106,6 +293,7 @@ async fn run_local_chunk_stream(
     pk_names: &[String],
     hash_via: HashVia,
     mode: ChunkMode,
+    field_opts: &[proto::FieldOpt],
 ) -> Result<()> {
     let mut conn = mysqlutil::session_conn(pool).await?;
     let names = mysqlutil::column_names(&mut conn, &task.local_db, &task.local_table).await?;
@@ -118,6 +306,7 @@ async fn run_local_chunk_stream(
                 &task.local_db,
                 &task.local_table,
                 pks,
+                field_opts,
                 mode,
                 cfg.chunked,
             )
@@ -136,6 +325,7 @@ async fn run_local_chunk_stream(
                 mode,
                 cfg.chunked,
                 strategies,
+                field_opts,
             )
             .await?;
         }
@@ -164,6 +354,7 @@ async fn run_local_chunk_stream(
                 mode,
                 cfg.chunked,
                 cfg.hash_algo(),
+                field_opts,
             )
             .await?;
         }
@@ -190,21 +381,22 @@ async fn read_remote_chunk_stream(
     tx: mpsc::Sender<hash::ChunkHashEvent>,
 ) -> Result<()> {
     loop {
-        let resp = read_response(&mut recv, &f).await?;
-        match resp {
-            Response::ChunkHashes { items } => {
-                for it in items {
-                    if tx
-                        .send(hash::ChunkHashEvent::Item((it.bucket, it.count, it.hash)))
-                        .await
-                        .is_err()
-                    {
+        let buf = read_response(&mut recv, &f).await?;
+        match proto::access_response(&buf)? {
+            ArchivedResponse::ChunkHashes { items } => {
+                for it in items.iter() {
+                    let event = hash::ChunkHashEvent::Item((
+                        it.bucket.as_str().to_owned(),
+                        it.count.to_native(),
+                        it.hash.as_str().to_owned(),
+                    ));
+                    if tx.send(event).await.is_err() {
                         return Ok(());
                     }
                 }
             }
-            Response::Ok { .. } => return Ok(()),
-            Response::Err { message } => bail!("{message}"),
+            ArchivedResponse::Ok { .. } => return Ok(()),
+            ArchivedResponse::Err { message } => bail!("{}", message.as_str()),
             _ => bail!("Unerwartete Antwort auf Hashes"),
         }
     }
@@ -220,6 +412,7 @@ async fn start_chunk_stream(
     pk_names: &[String],
     hash_via: HashVia,
     mode: ChunkMode,
+    field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
     mut chunk_send: SendHalf,
@@ -238,6 +431,7 @@ async fn start_chunk_stream(
             hash_source: hash_via_source(hash_via),
             profile: raw_profile,
             schema_hash,
+            field_opts: field_opts.to_vec(),
         },
         &f,
     )
@@ -251,6 +445,7 @@ async fn start_chunk_stream(
     let job_task = (*task).clone();
     let job_pks = local_pks.to_vec();
     let job_pk_names = pk_names.to_vec();
+    let job_field_opts = field_opts.to_vec();
     let local_task = tokio::spawn(async move {
         let err_tx = local_tx.clone();
         let res = run_local_chunk_stream(
@@ -262,6 +457,7 @@ async fn start_chunk_stream(
             &job_pk_names,
             hash_via,
             mode,
+            &job_field_opts,
         )
         .await;
         if let Err(e) = res {
@@ -404,6 +600,7 @@ pub async fn benchmark_table(
             &job_pk_names,
             hash_via,
             mode,
+            &[],
         )
         .await
     });
@@ -433,7 +630,7 @@ pub async fn run_table_task(
     mode: Mode,
     check_examples: u32,
     progress: Progress,
-    hash_via: HashVia,
+    forced_via: Option<HashVia>,
 ) -> TableResult {
     let label = format!("{}.{}", task.local_db, task.local_table);
     match run_inner(
@@ -445,7 +642,7 @@ pub async fn run_table_task(
         mode,
         check_examples,
         &progress,
-        hash_via,
+        forced_via,
     )
     .await
     {
@@ -491,7 +688,7 @@ async fn run_inner(
     mode: Mode,
     check_examples: u32,
     progress: &Progress,
-    hash_via: HashVia,
+    forced_via: Option<HashVia>,
 ) -> Result<SyncStats> {
     let label = format!("{}.{}", task.local_db, task.local_table);
     let (mut send, mut recv) = session.open(cfg).await?;
@@ -510,6 +707,23 @@ async fn run_inner(
     let pk_names: Vec<String> = local_pks.iter().map(|p| p.name.clone()).collect();
     let local_info =
         mysqlutil::table_info(&mut local_conn, &task.local_db, &task.local_table).await?;
+    let column_meta =
+        mysqlutil::column_meta(&mut local_conn, &task.local_db, &task.local_table).await?;
+    let plan = plan_table(
+        cfg,
+        &task.local_db,
+        &task.local_table,
+        &column_meta,
+        &pk_names,
+        forced_via,
+    )?;
+    let field_opts = plan.field_opts.clone();
+    if let Some(pattern) = &plan.matched {
+        log::info!("[{label}] tables-Selektor {pattern:?} passt");
+    }
+    if !plan.notes.is_empty() {
+        log::info!("[{label}] Feld-Optionen: {}", plan.notes.join(", "));
+    }
 
     proto::write_request(
         &mut send,
@@ -520,56 +734,87 @@ async fn run_inner(
         &f,
     )
     .await?;
-    let remote_info = match read_response(&mut recv, &f).await? {
-        Response::SchemaInfo {
+    let buf = read_response(&mut recv, &f).await?;
+    let remote_info = match proto::access_response(&buf)? {
+        ArchivedResponse::SchemaInfo {
             create_sql,
             columns,
             count,
-        } => Some((create_sql, columns, count)),
-        Response::Err { message }
-            if message.contains("nicht gefunden")
-                || message.contains("doesn't exist")
-                || message.to_lowercase().contains("unknown database") =>
+        } => Some((
+            create_sql.as_str().to_owned(),
+            columns
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect::<Vec<String>>(),
+            *count,
+        )),
+        ArchivedResponse::Err { message }
+            if message.as_str().contains("nicht gefunden")
+                || message.as_str().contains("doesn't exist")
+                || message.as_str().to_lowercase().contains("unknown database") =>
         {
             None
         }
-        Response::Err { message } => bail!("{message}"),
+        ArchivedResponse::Err { message } => bail!("{}", message.as_str()),
         _ => bail!("Unerwartete Antwort auf DescribeCount"),
     };
 
-    // ---- Raw-Hash-Gate: exact MySQL representation profile must match ----
-    let raw_profile = if hash_via.is_raw() {
-        let local_profile = mysqlutil::mysql_profile(&mut local_conn).await?;
-        let remote_profile = fetch_server_profile(&mut send, &mut recv, &f).await?;
-        let diff = if hash_via == HashVia::RawBinaryVec {
-            local_profile.difference_ignoring_version(&remote_profile)
-        } else {
-            local_profile.difference(&remote_profile)
-        };
-        if let Some(diff) = diff {
-            bail!(
-                "{label}: Raw-Hashing abgelehnt — MySQL-Profil weicht ab: {diff}. \
-                 Nutze --hash-select oder --hash-dump."
-            );
-        }
-        if hash_via == HashVia::RawTsv {
-            let binary = mysqlutil::binary_column_indexes(
-                &mut local_conn,
-                &task.local_db,
-                &task.local_table,
-            )
-            .await?;
-            if !binary.is_empty() {
-                bail!(
-                    "{label}: raw-tsv unterstützt keine binären Spalten (Indizes {binary:?}); \
-                     nutze raw-binary, select oder dump."
-                );
-            }
-        }
-        Some(local_profile)
+    // ---- Hash-Weg waehlen + Raw-Hash-Gate (Profil muss exakt passen) ----
+    let local_profile = if plan.candidates.iter().any(|v| v.is_raw()) {
+        Some(mysqlutil::mysql_profile(&mut local_conn).await?)
     } else {
         None
     };
+    let mut raw_profile = None;
+    let mut skips: Vec<String> = Vec::new();
+    let mut chosen: Option<HashVia> = None;
+    for candidate in &plan.candidates {
+        if candidate.is_raw() {
+            let local_profile = local_profile.as_ref().expect("Profil geladen");
+            let remote_profile = fetch_server_profile(&mut send, &mut recv, &f).await?;
+            let diff = if *candidate == HashVia::RawBinaryVec {
+                local_profile.difference_ignoring_version(&remote_profile)
+            } else {
+                local_profile.difference(&remote_profile)
+            };
+            if let Some(diff) = diff {
+                skips.push(format!("{}: Profil weicht ab ({diff})", candidate.name()));
+                continue;
+            }
+            if *candidate == HashVia::RawTsv {
+                let binary = mysqlutil::binary_column_indexes(
+                    &mut local_conn,
+                    &task.local_db,
+                    &task.local_table,
+                )
+                .await?;
+                if !binary.is_empty() {
+                    skips.push(format!("raw-tsv: binäre Spalten {binary:?}"));
+                    continue;
+                }
+            }
+            raw_profile = Some(local_profile.clone());
+        }
+        chosen = Some(*candidate);
+        break;
+    }
+    let hash_via = match chosen {
+        Some(v) => v,
+        None => bail!("{label}: kein Hash-Weg möglich — {}", skips.join("; ")),
+    };
+    if !skips.is_empty() {
+        log::warn!("[{label}] Hash-Weg-Fallback: {}", skips.join("; "));
+    }
+    let planned: Vec<&str> = plan.candidates.iter().map(|v| v.name()).collect();
+    log::info!("[{label}] Hash-Weg {} (Plan: {planned:?})", hash_via.name());
+    if matches!(hash_via, HashVia::RawBinary | HashVia::RawTsv)
+        && field_opts.iter().any(|o| o.float_precision.is_some())
+    {
+        log::warn!(
+            "[{label}] {} ignoriert float-precision (Binärpfad)",
+            hash_via.name()
+        );
+    }
     let schema_hash = if hash_via.is_raw() {
         Some(hash::hash_bytes(
             mysqlutil::normalize_schema(&local_info.create_sql).as_bytes(),
@@ -645,6 +890,7 @@ async fn run_inner(
             check_examples,
             &bar,
             hash_via,
+            &field_opts,
             raw_profile,
             schema_hash,
         )
@@ -672,13 +918,21 @@ async fn run_inner(
                 &f,
             )
             .await?;
-            match read_response(&mut recv, &f).await? {
-                Response::SchemaInfo {
+            let buf = read_response(&mut recv, &f).await?;
+            match proto::access_response(&buf)? {
+                ArchivedResponse::SchemaInfo {
                     create_sql,
                     columns,
                     count,
-                } => Some((create_sql, columns, count)),
-                Response::Err { message } => bail!("{message}"),
+                } => Some((
+                    create_sql.as_str().to_owned(),
+                    columns
+                        .iter()
+                        .map(|c| c.as_str().to_owned())
+                        .collect::<Vec<String>>(),
+                    *count,
+                )),
+                ArchivedResponse::Err { message } => bail!("{}", message.as_str()),
                 _ => bail!("Unerwartete Antwort"),
             }
         }
@@ -727,6 +981,7 @@ async fn run_inner(
         &pk_names,
         hash_via,
         chunk_mode,
+        &field_opts,
         raw_profile.clone(),
         schema_hash.clone(),
         send,
@@ -817,6 +1072,7 @@ async fn run_inner(
                 &local_info.columns,
                 &batch,
                 hash_via,
+                &field_opts,
                 raw_profile.clone(),
                 schema_hash.clone(),
                 &bar,
@@ -847,6 +1103,7 @@ async fn run_inner(
             &local_info.columns,
             &batch,
             hash_via,
+            &field_opts,
             raw_profile,
             schema_hash,
             &bar,
@@ -883,17 +1140,19 @@ async fn run_inner(
     Ok((sent_total, deleted_total, Some(differ_total), examples))
 }
 
-async fn read_response(recv: &mut RecvHalf, f: &Framing) -> Result<Response> {
-    match proto::read_response(recv, f).await? {
-        Some(resp) => Ok(resp),
-        None => bail!("Server hat den Stream geschlossen"),
-    }
+async fn read_response(recv: &mut RecvHalf, f: &Framing) -> Result<rkyv::util::AlignedVec> {
+    proto::read_response_bytes(recv, f)
+        .await?
+        .context("Server hat den Stream geschlossen")
 }
 
 async fn expect_ok(recv: &mut RecvHalf, f: &Framing, what: &str) -> Result<()> {
-    match read_response(recv, f).await? {
-        Response::Ok { .. } => Ok(()),
-        Response::Err { message } => bail!("{what} fehlgeschlagen: {message}"),
+    let buf = read_response(recv, f).await?;
+    match proto::access_response(&buf)? {
+        ArchivedResponse::Ok { .. } => Ok(()),
+        ArchivedResponse::Err { message } => {
+            bail!("{what} fehlgeschlagen: {}", message.as_str())
+        }
         _ => bail!("{what}: unerwartete Antwort"),
     }
 }
@@ -942,9 +1201,10 @@ async fn compute_chunk_hashes(
     pks: &[PkCol],
     mode: ChunkMode,
     chunked: u32,
+    opts: &[proto::FieldOpt],
     bar: Option<&crate::progress::TableBar>,
 ) -> Result<HashMap<String, (u64, String)>> {
-    let out = sqlhash::chunk_hashes(conn, db, table, pks, mode, chunked).await?;
+    let out = sqlhash::chunk_hashes(conn, db, table, pks, opts, mode, chunked).await?;
     if let Some(b) = bar {
         b.set_total(out.len() as u64, "Lokale SQL-Gruppen-Hashes");
         b.inc(out.len() as u64);
@@ -960,10 +1220,12 @@ async fn compute_row_hashes(
     mode: ChunkMode,
     chunked: u32,
     buckets: &[String],
+    opts: &[proto::FieldOpt],
     bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, String>> {
-    let rows = sqlhash::row_hashes(conn, db, table, pks, mode, chunked, Some(buckets)).await?;
-    let out: HashMap<String, String> = rows.into_iter().map(|r| (r.pk, r.hash)).collect();
+) -> Result<HashMap<Vec<String>, String>> {
+    let rows =
+        sqlhash::row_hashes(conn, db, table, pks, opts, mode, chunked, Some(buckets)).await?;
+    let out: HashMap<Vec<String>, String> = rows.into_iter().map(|r| (r.pk, r.hash)).collect();
     if let Some(b) = bar {
         b.set_total(out.len() as u64, "SQL-Zeilen-Hashes");
         b.inc(out.len() as u64);
@@ -981,6 +1243,7 @@ async fn compute_chunk_hashes_via_export(
     pk_names: &[String],
     mode: ChunkMode,
     chunked: u32,
+    opts: &[proto::FieldOpt],
     bar: Option<&crate::progress::TableBar>,
 ) -> Result<HashMap<String, (u64, String)>> {
     let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
@@ -1000,7 +1263,7 @@ async fn compute_chunk_hashes_via_export(
         match msg {
             RowMsg::Row(values) => {
                 let bucket = hash::chunk_key_for_row(&values, &pk_indexes, pks, mode, chunked)?;
-                let rh = hash::row_hash(&values, algo);
+                let rh = hash::row_hash_opts(&values, algo, opts);
                 push_row_hash_to_bucket(&mut acc, algo, bucket, &rh);
                 if let Some(b) = bar {
                     b.inc(1);
@@ -1023,8 +1286,9 @@ async fn compute_row_hashes_via_export(
     mode: ChunkMode,
     chunked: u32,
     buckets: &[String],
+    opts: &[proto::FieldOpt],
     bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<Vec<String>, String>> {
     let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
     let pk_indexes = pk_indexes_for(&names, pk_names)?;
     let where_clause = mysqlutil::chunk_where(pks, mode, chunked, buckets)?;
@@ -1039,7 +1303,7 @@ async fn compute_row_hashes_via_export(
         Some(mysqlutil::order_by(pks)),
         strategies,
     );
-    let mut out: HashMap<String, String> = HashMap::new();
+    let mut out: HashMap<Vec<String>, String> = HashMap::new();
     while let Some(msg) = rx.recv().await {
         match msg {
             RowMsg::Row(values) => {
@@ -1047,8 +1311,8 @@ async fn compute_row_hashes_via_export(
                 if !wanted.contains(&bucket) {
                     continue;
                 }
-                let pk = hash::pk_canonical(&values, &pk_indexes, pks);
-                let rh = hash::row_hash(&values, algo);
+                let pk = hash::pk_components(&values, &pk_indexes, pks);
+                let rh = hash::row_hash_opts(&values, algo, opts);
                 out.insert(pk, rh);
                 if let Some(b) = bar {
                     b.inc(1);
@@ -1101,7 +1365,7 @@ async fn compute_row_hashes_raw_binary(
     buckets: &[String],
     algo: hash::HashAlgo,
     bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<Vec<String>, String>> {
     let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
     let pk_indexes = pk_indexes_for(&names, pk_names)?;
     let items = hash_binary::row_hashes(
@@ -1131,8 +1395,9 @@ async fn compute_row_hashes_raw_binary_vec(
     chunked: u32,
     buckets: &[String],
     algo: hash::HashAlgo,
+    opts: &[proto::FieldOpt],
     bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<Vec<String>, String>> {
     let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
     let pk_indexes = pk_indexes_for(&names, pk_names)?;
     let items = hash_binary::row_hashes_vec(
@@ -1145,6 +1410,7 @@ async fn compute_row_hashes_raw_binary_vec(
         chunked,
         buckets,
         algo,
+        opts,
     )
     .await?;
     if let Some(b) = bar {
@@ -1192,7 +1458,7 @@ async fn compute_row_hashes_raw_tsv(
     chunked: u32,
     buckets: &[String],
     bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<Vec<String>, String>> {
     let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
     let pk_indexes = pk_indexes_for(&names, pk_names)?;
     let items = hash_tsv::row_hashes(
@@ -1213,8 +1479,8 @@ async fn compute_row_hashes_raw_tsv(
 }
 
 struct RowDiff {
-    to_send: Vec<String>,
-    to_delete: Vec<String>,
+    to_send: Vec<Vec<String>>,
+    to_delete: Vec<Vec<String>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1227,6 +1493,7 @@ async fn row_diff_for_buckets(
     task: &TableTask,
     buckets: &[String],
     hash_via: HashVia,
+    field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
     bar: &crate::progress::TableBar,
@@ -1246,6 +1513,7 @@ async fn row_diff_for_buckets(
                 mode,
                 chunked,
                 buckets,
+                field_opts,
                 Some(bar),
             )
             .await?
@@ -1260,6 +1528,7 @@ async fn row_diff_for_buckets(
                 mode,
                 chunked,
                 buckets,
+                field_opts,
                 Some(bar),
             )
             .await?
@@ -1288,6 +1557,7 @@ async fn row_diff_for_buckets(
                 chunked,
                 buckets,
                 cfg.hash_algo(),
+                field_opts,
                 Some(bar),
             )
             .await?
@@ -1320,27 +1590,30 @@ async fn row_diff_for_buckets(
             hash_source: hash_via_source(hash_via),
             profile: raw_profile,
             schema_hash,
+            field_opts: field_opts.to_vec(),
         },
         &f,
     )
     .await?;
-    let mut remote_rows: HashMap<String, String> = HashMap::new();
+    let mut remote_rows: HashMap<Vec<String>, String> = HashMap::new();
     loop {
-        match read_response(recv, &f).await? {
-            Response::RowHashes { items } => {
+        let buf = read_response(recv, &f).await?;
+        match proto::access_response(&buf)? {
+            ArchivedResponse::RowHashes { items } => {
                 bar.inc(items.len() as u64);
-                for it in items {
-                    remote_rows.insert(it.pk, it.hash);
+                for it in items.iter() {
+                    let pk = it.pk.iter().map(|s| s.as_str().to_owned()).collect();
+                    remote_rows.insert(pk, it.hash.as_str().to_owned());
                 }
             }
-            Response::Ok { .. } => break,
-            Response::Err { message } => bail!("{message}"),
+            ArchivedResponse::Ok { .. } => break,
+            ArchivedResponse::Err { message } => bail!("{}", message.as_str()),
             _ => bail!("Unerwartete Antwort auf RowHashes"),
         }
     }
 
-    let mut to_send: Vec<String> = Vec::new();
-    let mut to_delete: Vec<String> = Vec::new();
+    let mut to_send: Vec<Vec<String>> = Vec::new();
+    let mut to_delete: Vec<Vec<String>> = Vec::new();
     for (pk, lh) in &local_rows {
         match remote_rows.get(pk) {
             None => to_send.push(pk.clone()),
@@ -1463,6 +1736,7 @@ async fn sync_diff_batch(
     columns: &[String],
     buckets: &[String],
     hash_via: HashVia,
+    field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
     bar: &crate::progress::TableBar,
@@ -1477,6 +1751,7 @@ async fn sync_diff_batch(
         task,
         buckets,
         hash_via,
+        field_opts,
         raw_profile,
         schema_hash,
         bar,
@@ -1488,7 +1763,7 @@ async fn sync_diff_batch(
         if examples.len() >= check_examples as usize {
             break;
         }
-        examples.push(pk.clone());
+        examples.push(hash::pk_display(pk));
     }
     let (sent, deleted) = apply_row_diff(
         cfg,
@@ -1516,6 +1791,7 @@ async fn check_diff_batch(
     task: &TableTask,
     buckets: &[String],
     hash_via: HashVia,
+    field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
     bar: &crate::progress::TableBar,
@@ -1530,6 +1806,7 @@ async fn check_diff_batch(
         task,
         buckets,
         hash_via,
+        field_opts,
         raw_profile,
         schema_hash,
         bar,
@@ -1541,7 +1818,7 @@ async fn check_diff_batch(
         if examples.len() >= check_examples as usize {
             break;
         }
-        examples.push(pk.clone());
+        examples.push(hash::pk_display(pk));
     }
     Ok((differ, examples))
 }
@@ -1691,18 +1968,25 @@ async fn send_rows_csv(
         proto::write_bulk(send, &buf, &f).await?;
     }
     proto::write_request(send, &Request::CsvEnd {}, &f).await?;
-    match read_response(recv, &f).await? {
-        Response::Ok { count: Some(n), .. } => {
-            if n != count {
-                log::warn!(
-                    "[{}.{}] Server importierte {n} Zeilen, Client erzeugte {count}",
-                    task.local_db,
-                    task.local_table
-                );
+    let buf = read_response(recv, &f).await?;
+    match proto::access_response(&buf)? {
+        ArchivedResponse::Ok {
+            count: server_count,
+            ..
+        } => {
+            if let Some(n) = server_count.as_ref() {
+                if n.to_native() != count {
+                    log::warn!(
+                        "[{}.{}] Server importierte {n} Zeilen, Client erzeugte {count}",
+                        task.local_db,
+                        task.local_table
+                    );
+                }
             }
         }
-        Response::Ok { .. } => {}
-        Response::Err { message } => bail!("CSV-Import fehlgeschlagen: {message}"),
+        ArchivedResponse::Err { message } => {
+            bail!("CSV-Import fehlgeschlagen: {}", message.as_str())
+        }
         _ => bail!("Unerwartete Antwort nach CsvEnd"),
     }
     Ok(count)
@@ -1785,9 +2069,12 @@ async fn send_rows_dump(
         bar.inc(batch.len() as u64);
     }
     proto::write_request(send, &Request::DumpEnd {}, &f).await?;
-    match read_response(recv, &f).await? {
-        Response::Ok { .. } => {}
-        Response::Err { message } => bail!("Dump-Import fehlgeschlagen: {message}"),
+    let buf = read_response(recv, &f).await?;
+    match proto::access_response(&buf)? {
+        ArchivedResponse::Ok { .. } => {}
+        ArchivedResponse::Err { message } => {
+            bail!("Dump-Import fehlgeschlagen: {}", message.as_str())
+        }
         _ => bail!("Unerwartete Antwort nach DumpEnd"),
     }
     Ok(count)
@@ -1805,7 +2092,7 @@ async fn send_changed_rows(
     pks: &[PkCol],
     hex_indexes: &[usize],
     columns: &[String],
-    to_send: &[String],
+    to_send: &[Vec<String>],
     bar: &crate::progress::TableBar,
 ) -> Result<u64> {
     let mut sent = 0u64;
@@ -1849,6 +2136,7 @@ async fn diff_and_report(
     check_examples: u32,
     bar: &crate::progress::TableBar,
     hash_via: HashVia,
+    field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
 ) -> Result<(u64, Vec<String>)> {
@@ -1866,6 +2154,7 @@ async fn diff_and_report(
         &pk_names,
         hash_via,
         mode,
+        field_opts,
         raw_profile.clone(),
         schema_hash.clone(),
         send,
@@ -1962,6 +2251,7 @@ async fn diff_and_report(
                     task,
                     &batch,
                     hash_via,
+                    field_opts,
                     raw_profile.clone(),
                     schema_hash.clone(),
                     bar,
@@ -1995,6 +2285,7 @@ async fn diff_and_report(
                 task,
                 &batch,
                 hash_via,
+                field_opts,
                 raw_profile,
                 schema_hash,
                 bar,
@@ -2028,11 +2319,12 @@ async fn diff_and_report(
             diff_pct,
             tbl = task.local_table
         );
-        if examples.is_empty() {
-            examples = (0..check_examples.min(differ as u32))
-                .map(|i| format!("?#{i}"))
-                .collect();
-        }
+        log::info!(
+            "[{}.{tbl}] Drill-Down uebersprungen (diff-threshold-percent={}%) — keine PK-Beispiele",
+            task.local_db,
+            cfg.diff_threshold_percent,
+            tbl = task.local_table
+        );
     }
     Ok((differ, examples))
 }
@@ -2041,4 +2333,116 @@ async fn diff_and_report(
 #[allow(dead_code)]
 pub fn v_int(i: i64) -> Value {
     Value::Int(i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{parse, Config};
+    use crate::mysqlutil::ColumnMeta;
+
+    fn load_cfg(raw: &str) -> Config {
+        parse(raw, "test").unwrap()
+    }
+
+    fn col(name: &str, data_type: &str, column_type: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            data_type: data_type.into(),
+            column_type: column_type.into(),
+        }
+    }
+
+    #[test]
+    fn plan_uses_first_table_match_and_field_precision() {
+        let cfg = load_cfg(
+            r#"{"mysql":{"user":"u"},
+                "tables":{
+                  "*.orders":{"fields":{"price":{"float-precision":2}}},
+                  "shop.*":{"fields":{"price":{"float-precision":4}}}
+                }}"#,
+        );
+        let cols = vec![
+            col("id", "int", "int"),
+            col("price", "float", "float(10,2)"),
+        ];
+        let pks = vec!["id".to_string()];
+        let plan = plan_table(&cfg, "shop", "orders", &cols, &pks, None).unwrap();
+        assert_eq!(plan.matched.as_deref(), Some("*.orders"));
+        assert_eq!(plan.field_opts.len(), 1);
+        assert_eq!(plan.field_opts[0].ordinal, 1);
+        assert_eq!(plan.field_opts[0].float_precision, Some(2));
+        assert_eq!(plan.candidates, vec![HashVia::Select]);
+    }
+
+    #[test]
+    fn plan_auto_uses_declared_scale() {
+        let cfg = load_cfg(r#"{"mysql":{"user":"u"}}"#);
+        let cols = vec![
+            col("id", "int", "int"),
+            col("price", "double", "double(10,3)"),
+        ];
+        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).unwrap();
+        assert_eq!(plan.field_opts[0].float_precision, Some(3));
+        assert!(plan.notes.iter().any(|n| n.contains("price")));
+    }
+
+    #[test]
+    fn plan_decimal_stays_exact_and_rejects_explicit_precision() {
+        let cols = vec![
+            col("id", "int", "int"),
+            col("price", "decimal", "decimal(10,2)"),
+        ];
+        let cfg = load_cfg(r#"{"mysql":{"user":"u"}}"#);
+        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).unwrap();
+        assert!(plan.field_opts.is_empty());
+
+        let cfg = load_cfg(
+            r#"{"mysql":{"user":"u"},"tables":{"d.t":{"fields":{"price":{"float-precision":2}}}}}"#,
+        );
+        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).is_err());
+    }
+
+    #[test]
+    fn plan_transforms_exclude_byte_paths() {
+        let cfg = load_cfg(
+            r#"{"mysql":{"user":"u"},
+                "hash-strategies":["raw-binary","dump","select"],
+                "tables":{"d.t":{"fields":{"name":{"transform":"lower"}}}}}"#,
+        );
+        let cols = vec![
+            col("id", "int", "int"),
+            col("name", "varchar", "varchar(20)"),
+        ];
+        let pks = vec!["id".to_string()];
+        let plan = plan_table(&cfg, "d", "t", &cols, &pks, None).unwrap();
+        assert_eq!(plan.candidates, vec![HashVia::Dump, HashVia::Select]);
+        assert!(plan_table(&cfg, "d", "t", &cols, &pks, Some(HashVia::RawBinary)).is_err());
+    }
+
+    #[test]
+    fn plan_rejects_pk_and_non_text_overrides() {
+        let cfg = load_cfg(
+            r#"{"mysql":{"user":"u"},"tables":{"d.t":{"fields":{"id":{"transform":"trim"}}}}}"#,
+        );
+        let cols = vec![col("id", "int", "int")];
+        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).is_err());
+
+        let cfg = load_cfg(
+            r#"{"mysql":{"user":"u"},"tables":{"d.t":{"fields":{"n":{"transform":"lower"}}}}}"#,
+        );
+        let cols = vec![col("id", "int", "int"), col("n", "int", "int")];
+        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).is_err());
+    }
+
+    #[test]
+    fn plan_off_disables_rounding() {
+        let cfg = load_cfg(r#"{"mysql":{"user":"u"},"float-precision":"off"}"#);
+        let cols = vec![
+            col("id", "int", "int"),
+            col("price", "float", "float(10,2)"),
+        ];
+        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).unwrap();
+        assert!(plan.field_opts.is_empty());
+    }
 }

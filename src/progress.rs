@@ -15,15 +15,25 @@ pub struct Progress {
 impl Progress {
     pub fn new(enabled: bool) -> Self {
         if enabled {
-            Progress { multi: Some(Arc::new(MultiProgress::new())), enabled: true }
+            Progress {
+                multi: Some(Arc::new(MultiProgress::new())),
+                enabled: true,
+            }
         } else {
-            Progress { multi: None, enabled: false }
+            Progress {
+                multi: None,
+                enabled: false,
+            }
         }
     }
 
     pub fn bar(&self, label: &str, total: u64) -> TableBar {
         if !self.enabled {
-            return TableBar { pb: None, label: label.to_string(), quiet_log: true };
+            return TableBar {
+                pb: None,
+                label: label.to_string(),
+                quiet_log: true,
+            };
         }
         let multi = self.multi.as_ref().unwrap();
         let pb = multi.add(ProgressBar::new(total));
@@ -34,7 +44,11 @@ impl Progress {
         );
         pb.set_prefix(format!("[{label}]"));
         pb.set_message("start");
-        TableBar { pb: Some(pb), label: label.to_string(), quiet_log: false }
+        TableBar {
+            pb: Some(pb),
+            label: label.to_string(),
+            quiet_log: false,
+        }
     }
 }
 

@@ -291,7 +291,7 @@ where
         }
         f(RowHash {
             bucket,
-            pk: hash::pk_canonical_from_pk_values(&pk_values, pks),
+            pk: hash::pk_components_from_values(&pk_values, pks),
             hash: hash_packet(&packet, columns.len(), algo)?,
         })
         .await?;
@@ -338,6 +338,7 @@ pub async fn stream_chunk_hashes_vec(
     mode: ChunkMode,
     chunked: u32,
     algo: hash::HashAlgo,
+    opts: &[crate::proto::FieldOpt],
 ) -> Result<u64> {
     let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
     let sql = row_sql(db, table, None, Some(&order));
@@ -354,7 +355,7 @@ pub async fn stream_chunk_hashes_vec(
     {
         let values = row.unwrap();
         let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
-        let rh = hash::row_hash(&values, algo);
+        let rh = hash::row_hash_opts(&values, algo, opts);
         if let Some(item) = acc.push(bucket, &rh) {
             send_chunk(&tx, item).await?;
             total += 1;
@@ -379,6 +380,7 @@ pub async fn chunk_hashes_vec<F>(
     mode: ChunkMode,
     chunked: u32,
     algo: hash::HashAlgo,
+    opts: &[crate::proto::FieldOpt],
     mut on_row: F,
 ) -> Result<HashMap<String, (u64, String)>>
 where
@@ -388,7 +390,7 @@ where
     let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
     for_each_value_sync(conn, sql, |values| {
         let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
-        let rh = hash::row_hash(&values, algo);
+        let rh = hash::row_hash_opts(&values, algo, opts);
         hash::add_row_hash(&mut acc, algo, bucket, &rh);
         on_row();
         Ok(())
@@ -409,6 +411,7 @@ pub async fn row_hashes_vec(
     chunked: u32,
     buckets: &[String],
     algo: hash::HashAlgo,
+    opts: &[crate::proto::FieldOpt],
 ) -> Result<Vec<RowHash>> {
     let where_clause = mysqlutil::chunk_where(pks, mode, chunked, buckets)?;
     let wanted: HashSet<String> = buckets.iter().cloned().collect();
@@ -426,8 +429,8 @@ pub async fn row_hashes_vec(
         }
         out.push(RowHash {
             bucket,
-            pk: hash::pk_canonical(&values, pk_indexes, pks),
-            hash: hash::row_hash(&values, algo),
+            pk: hash::pk_components(&values, pk_indexes, pks),
+            hash: hash::row_hash_opts(&values, algo, opts),
         });
         Ok(())
     })

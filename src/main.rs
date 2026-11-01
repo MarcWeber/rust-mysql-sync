@@ -17,6 +17,7 @@ mod selector;
 mod server;
 mod sqlhash;
 mod sync;
+mod testing;
 mod tls;
 mod transport;
 
@@ -57,6 +58,17 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "*")]
     benchmark: Option<String>,
 
+    /// Nur fuer Tests: ab Chunk S die Chunks S..S+3 in der lokalen DB loeschen
+    /// (alle / erste / letzte / zufaellige Zeile). Optionaler Selector A.B.
+    #[arg(
+        long = "testing-drop-chunks",
+        alias = "testing-drop-chunks-source",
+        alias = "testing-drop-chunks-dest",
+        num_args = 0..=1,
+        default_missing_value = "0"
+    )]
+    testing_drop_chunks: Option<String>,
+
     /// Selector A.B (z.B. "db1.*" oder "db1,db2.t1,t2")
     selector: Option<String>,
 
@@ -69,28 +81,33 @@ struct Cli {
     log_level: String,
 
     /// Diff-/Check-Hashes als gruppierte MD5-Aggregate in MySQL berechnen (Default)
-    #[arg(long, alias = "check-select")]
+    #[arg(
+        long = "hash-select",
+        alias = "hash-via-select",
+        alias = "check-select"
+    )]
     hash_via_select: bool,
 
     /// Diff-/Check-Hashes über Export/Parser berechnen (transfer_all-Strategien)
-    #[arg(long, alias = "check-dump")]
+    #[arg(long = "hash-dump", alias = "hash-via-dump", alias = "check-dump")]
     hash_via_dump: bool,
 
     /// Diff-/Check-Hashes über rohe MySQL-Binary-Protokoll-Pakete berechnen (streng versionsgleich)
-    #[arg(long, alias = "check-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary_vec", "hash_via_raw_tsv"])]
+    #[arg(long = "hash-raw-binary-row", alias = "hash-via-raw-binary", alias = "check-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary_vec", "hash_via_raw_tsv"])]
     hash_via_raw_binary: bool,
 
     /// Diff-/Check-Hashes über dekorierte Binary-Protokoll-Zeilen berechnen (versionsübergreifend)
     #[arg(
-        long = "hash-raw-binary-vec",
-        alias = "hash-raw-binary-row-vec",
+        long = "hash-raw-binary-row-vec",
+        alias = "hash-raw-binary-vec",
+        alias = "hash-via-raw-binary-vec",
         alias = "check-raw-binary-vec",
         conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary", "hash_via_raw_tsv"]
     )]
     hash_via_raw_binary_vec: bool,
 
     /// Diff-/Check-Hashes über rohe `mysql --batch`-TSV-Zeilen berechnen
-    #[arg(long, alias = "check-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary", "hash_via_raw_binary_vec"])]
+    #[arg(long = "hash-raw-tsv", alias = "hash-via-raw-tsv", alias = "check-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary", "hash_via_raw_binary_vec"])]
     hash_via_raw_tsv: bool,
 }
 
@@ -114,7 +131,8 @@ async fn main() -> ExitCode {
     let is_client = cli.force.is_some()
         || cli.sync.is_some()
         || cli.force_schema.is_some()
-        || cli.check.is_some();
+        || cli.check.is_some()
+        || cli.testing_drop_chunks.is_some();
 
     let bench_modes: Vec<sync::HashVia> = if cli.hash_via_raw_tsv {
         vec![sync::HashVia::RawTsv]
@@ -130,7 +148,14 @@ async fn main() -> ExitCode {
         sync::HashVia::ALL.to_vec()
     };
 
-    let result = if let Some(selector) = cli.benchmark.clone() {
+    let result = if let Some(start) = cli.testing_drop_chunks.as_deref() {
+        match start.parse::<u32>() {
+            Ok(start) => testing::run(&cfg, cli.selector.as_deref(), start).await,
+            Err(e) => Err(anyhow::anyhow!(
+                "--testing-drop-chunks erwartet eine Chunk-Nummer: {e}"
+            )),
+        }
+    } else if let Some(selector) = cli.benchmark.clone() {
         benchmark::run(&cfg, Some(&selector), &bench_modes).await
     } else if is_client {
         client::run(client::ClientArgs {

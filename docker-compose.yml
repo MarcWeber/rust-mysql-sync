@@ -1,16 +1,13 @@
 services:
-  mysql-src:
+  mysql80:
     image: mysql:8.0
-    container_name: mysqlsync-src
+    container_name: mysql80
     environment:
       MYSQL_ROOT_PASSWORD: syncroot
-      MYSQL_DATABASE: db1
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
       --local_infile=1
     ports:
-    - ${MSYNC_SRC_PORT:-7012}:3306
-    volumes:
-    - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    - 7012:3306
     healthcheck:
       test:
       - CMD
@@ -23,16 +20,15 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
-  mysql-dst:
+  mysql97:
     image: mysql:9.7
-    container_name: mysqlsync-dst
+    container_name: mysql97
     environment:
       MYSQL_ROOT_PASSWORD: syncroot
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
       --local_infile=1
     ports:
-    - ${MSYNC_DST_PORT:-7013}:3306
-    volumes: []
+    - 7013:3306
     healthcheck:
       test:
       - CMD

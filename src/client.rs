@@ -32,7 +32,7 @@ struct PlannedTask {
     force: bool,
     mode: Mode,
     check_examples: u32,
-    hash_via: HashVia,
+    hash_via: Option<HashVia>,
 }
 
 pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
@@ -64,7 +64,7 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
         seen: &mut std::collections::HashSet<(String, String, u8)>,
         local_conn: &mut mysql_async::Conn,
         check_examples: u32,
-        hash_via: HashVia,
+        hash_via: Option<HashVia>,
     ) -> Result<()> {
         let sel = Selector::parse(selector_str)?;
         for db in dbs {
@@ -104,15 +104,17 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
     }
 
     let hash_via = if args.hash_via_raw_tsv {
-        HashVia::RawTsv
+        Some(HashVia::RawTsv)
     } else if args.hash_via_raw_binary_vec {
-        HashVia::RawBinaryVec
+        Some(HashVia::RawBinaryVec)
     } else if args.hash_via_raw_binary {
-        HashVia::RawBinary
+        Some(HashVia::RawBinary)
     } else if args.hash_via_dump {
-        HashVia::Dump
+        Some(HashVia::Dump)
+    } else if args.hash_via_select {
+        Some(HashVia::Select)
     } else {
-        HashVia::Select
+        None
     };
 
     // Reihenfolge: force-schema → (force+sync gemerged) → sync → check

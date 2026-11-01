@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-pub const PK_SEP: char = '\x1f';
-
 /// Automatisch gewaehlter Chunk-Modus (keine User-Konfiguration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkMode {
@@ -232,11 +230,72 @@ pub fn hash_field(h: &mut RowHasher, v: &Value) {
     }
 }
 
+fn hash_rounded(h: &mut RowHasher, v: f64, scale: u8) {
+    let s = format!("{:.*}", scale as usize, v);
+    h.update(&[8u8]);
+    h.update(&(s.len() as u32).to_le_bytes());
+    h.update(s.as_bytes());
+}
+
+fn transform_bytes(v: &Value, trim: bool, lower: bool) -> Option<Vec<u8>> {
+    let Value::Bytes(b) = v else {
+        return None;
+    };
+    let mut out = if lower {
+        String::from_utf8_lossy(b).to_lowercase().into_bytes()
+    } else {
+        b.clone()
+    };
+    if trim {
+        let start = out.iter().position(|&c| c != b' ').unwrap_or(out.len());
+        let end = out
+            .iter()
+            .rposition(|&c| c != b' ')
+            .map_or(start, |i| i + 1);
+        out = out[start..end].to_vec();
+    }
+    Some(out)
+}
+
+/// Kanonische Kodierung mit Per-Spalte-Overrides (Trim/Lower/Ignore/Runden).
+pub fn hash_field_opts(h: &mut RowHasher, v: &Value, opt: Option<&crate::proto::FieldOpt>) {
+    use crate::proto::FieldTransform;
+    let Some(opt) = opt else {
+        return hash_field(h, v);
+    };
+    if opt.transform == Some(FieldTransform::Ignore) {
+        return;
+    }
+    let trim = opt.transform == Some(FieldTransform::Trim);
+    let lower = opt.transform == Some(FieldTransform::Lower);
+    if (trim || lower) && v != &Value::NULL {
+        if let Some(bytes) = transform_bytes(v, trim, lower) {
+            h.update(&[1u8]);
+            h.update(&(bytes.len() as u32).to_le_bytes());
+            h.update(&bytes);
+            return;
+        }
+    }
+    if let Some(scale) = opt.float_precision {
+        match v {
+            Value::Float(f) => return hash_rounded(h, *f as f64, scale),
+            Value::Double(d) => return hash_rounded(h, *d, scale),
+            _ => {}
+        }
+    }
+    hash_field(h, v);
+}
+
 /// Hash einer einzelnen Zeile (Werte inkl. PK).
 pub fn row_hash(values: &[Value], algo: HashAlgo) -> String {
+    row_hash_opts(values, algo, &[])
+}
+
+/// Wie `row_hash`, aber mit Per-Spalte-Overrides (Index = Ordinal).
+pub fn row_hash_opts(values: &[Value], algo: HashAlgo, opts: &[crate::proto::FieldOpt]) -> String {
     let mut h = RowHasher::new(algo);
-    for v in values {
-        hash_field(&mut h, v);
+    for (i, v) in values.iter().enumerate() {
+        hash_field_opts(&mut h, v, crate::proto::field_opt(opts, i));
     }
     h.finalize_hex()
 }
@@ -290,7 +349,10 @@ pub enum ChunkHashEvent {
 
 impl ChunkAccumulator {
     pub fn new(algo: HashAlgo) -> Self {
-        Self { algo, current: None }
+        Self {
+            algo,
+            current: None,
+        }
     }
 
     pub fn push(&mut self, bucket: String, row_hash: &str) -> Option<ChunkHashValue> {
@@ -344,13 +406,9 @@ pub fn finalize_chunk(bucket: &str, count: u64, hasher: RowHasher) -> String {
     h.finalize_hex()
 }
 
-/// Kanonischer PK-String: Komponenten mit \x1f joined.
+/// PK-Komponenten in PRIMARY-KEY-Reihenfolge (typabhaengig kanonisiert).
 /// BINARY/VARBINARY werden hex-kodiert, damit keine Bytes verloren gehen.
-pub fn pk_canonical(
-    values: &[Value],
-    pk_indexes: &[usize],
-    pks: &[crate::mysqlutil::PkCol],
-) -> String {
+pub fn pk_components(values: &[Value], pk_indexes: &[usize], pks: &[PkCol]) -> Vec<String> {
     let mut parts: Vec<String> = Vec::with_capacity(pk_indexes.len());
     for (pos, &i) in pk_indexes.iter().enumerate() {
         let part = match pks.get(pos) {
@@ -359,7 +417,12 @@ pub fn pk_canonical(
         };
         parts.push(part);
     }
-    parts.join(&PK_SEP.to_string())
+    parts
+}
+
+/// Nur fuer Logs/Beispiele: PK-Komponenten lesbar darstellen.
+pub fn pk_display(parts: &[String]) -> String {
+    format!("{parts:?}")
 }
 
 /// Wie `value_to_pk_component`, aber typabhaengig: BINARY als hex, DATE ohne
@@ -556,13 +619,13 @@ pub fn chunk_key_for_pk_values(
     chunk_key_from_value(pk.kind, &values[0], mode, chunked)
 }
 
-/// Canonical PK string from PK values in PRIMARY KEY order.
-pub fn pk_canonical_from_pk_values(values: &[Value], pks: &[crate::mysqlutil::PkCol]) -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(values.len());
-    for (v, pk) in values.iter().zip(pks) {
-        parts.push(value_to_pk_component_for(v, pk));
-    }
-    parts.join(&PK_SEP.to_string())
+/// PK-Komponenten aus PK-Werten in PRIMARY-KEY-Reihenfolge.
+pub fn pk_components_from_values(values: &[Value], pks: &[PkCol]) -> Vec<String> {
+    values
+        .iter()
+        .zip(pks)
+        .map(|(v, pk)| value_to_pk_component_for(v, pk))
+        .collect()
 }
 
 pub fn chunk_key_for_row(
@@ -910,10 +973,95 @@ mod tests {
     }
 
     #[test]
+    fn pk_components_preserve_separators() {
+        let pks = vec![
+            crate::mysqlutil::PkCol {
+                name: "a".into(),
+                column_type: "varchar".into(),
+                kind: PkKind::Char,
+                numeric: false,
+                sub_part: 0,
+            },
+            crate::mysqlutil::PkCol {
+                name: "b".into(),
+                column_type: "varchar".into(),
+                kind: PkKind::Char,
+                numeric: false,
+                sub_part: 0,
+            },
+        ];
+        let values = vec![
+            Value::Bytes(b"a\x1fb".to_vec()),
+            Value::Bytes(b"12:34".to_vec()),
+        ];
+        assert_eq!(
+            pk_components(&values, &[0, 1], &pks),
+            vec!["a\x1fb".to_string(), "12:34".to_string()]
+        );
+        assert_eq!(pk_display(&["a".into(), "b".into()]), "[\"a\", \"b\"]");
+    }
+
+    #[test]
     fn hash_algo_from_str_aliases() {
         assert_eq!("xxh3".parse::<HashAlgo>().unwrap(), HashAlgo::Xxh3);
         assert_eq!("XXH64".parse::<HashAlgo>().unwrap(), HashAlgo::Xxh64);
         assert_eq!("sha-256".parse::<HashAlgo>().unwrap(), HashAlgo::Sha256);
         assert!("nope".parse::<HashAlgo>().is_err());
+    }
+
+    #[test]
+    fn row_hash_opts_trim_lower_ignore() {
+        use crate::proto::{FieldOpt, FieldTransform};
+        let algo = HashAlgo::Xxh3;
+        let opt = |ordinal, transform, float_precision| FieldOpt {
+            ordinal,
+            transform,
+            float_precision,
+        };
+        assert_eq!(
+            row_hash_opts(
+                &[Value::Bytes(b"  AbC  ".to_vec())],
+                algo,
+                &[opt(0, Some(FieldTransform::Trim), None)]
+            ),
+            row_hash(&[Value::Bytes(b"AbC".to_vec())], algo)
+        );
+        assert_eq!(
+            row_hash_opts(
+                &[Value::Bytes(b"AbC".to_vec())],
+                algo,
+                &[opt(0, Some(FieldTransform::Lower), None)]
+            ),
+            row_hash(&[Value::Bytes(b"abc".to_vec())], algo)
+        );
+        assert_eq!(
+            row_hash_opts(
+                &[Value::Int(1), Value::Int(2)],
+                algo,
+                &[opt(0, Some(FieldTransform::Ignore), None)]
+            ),
+            row_hash(&[Value::Int(2)], algo)
+        );
+    }
+
+    #[test]
+    fn row_hash_opts_rounds_floats() {
+        use crate::proto::FieldOpt;
+        let algo = HashAlgo::Xxh3;
+        let opt = FieldOpt {
+            ordinal: 0,
+            transform: None,
+            float_precision: Some(2),
+        };
+        let a = row_hash_opts(&[Value::Double(1.2341)], algo, &[opt]);
+        let b = row_hash_opts(&[Value::Double(1.2342)], algo, &[opt]);
+        assert_eq!(a, b);
+        assert_ne!(
+            row_hash(&[Value::Double(1.2341)], algo),
+            row_hash(&[Value::Double(1.2342)], algo)
+        );
+        let f = row_hash_opts(&[Value::Float(3.25)], algo, &[opt]);
+        let d = row_hash_opts(&[Value::Double(3.25)], algo, &[opt]);
+        assert_eq!(f, d);
     }
 }

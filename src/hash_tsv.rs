@@ -217,7 +217,7 @@ where
                 }
                 let item = RowHash {
                     bucket,
-                    pk: hash::pk_canonical_from_pk_values(&pk_values, pks),
+                    pk: hash::pk_components_from_values(&pk_values, pks),
                     hash: hash::hash_bytes(&line, algo),
                 };
                 f(item).await?;

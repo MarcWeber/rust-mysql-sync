@@ -9,7 +9,9 @@
 //! probiert (mid-stream-Fehler können nicht sicher wiederholt werden).
 
 use crate::config::{Config, MysqlCfg};
-use crate::hash::{self, tsv_unescape_field, value_to_sql, ChunkAccumulator, ChunkHashEvent, ChunkMode};
+use crate::hash::{
+    self, tsv_unescape_field, value_to_sql, ChunkAccumulator, ChunkHashEvent, ChunkMode,
+};
 use crate::mysqlutil::{self, qualified, PkCol};
 use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
@@ -154,6 +156,7 @@ pub async fn stream_chunk_hashes(
     mode: ChunkMode,
     chunked: u32,
     strategies: Vec<String>,
+    opts: &[crate::proto::FieldOpt],
 ) -> Result<u64> {
     let algo = cfg.hash_algo();
     let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
@@ -171,7 +174,7 @@ pub async fn stream_chunk_hashes(
         match msg {
             RowMsg::Row(values) => {
                 let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
-                let rh = hash::row_hash(&values, algo);
+                let rh = hash::row_hash_opts(&values, algo, opts);
                 if let Some(item) = acc.push(bucket, &rh) {
                     tx.send(ChunkHashEvent::Item(item))
                         .await

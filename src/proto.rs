@@ -49,6 +49,28 @@ impl Framing {
     }
 }
 
+/// Per-column hashing option, sent with `Hashes` so client and server apply the
+/// same transformation. Ordinals refer to the `SELECT *` column order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+pub enum FieldTransform {
+    Trim,
+    Lower,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+pub struct FieldOpt {
+    pub ordinal: u32,
+    pub transform: Option<FieldTransform>,
+    /// Round FLOAT/DOUBLE to this many decimals before hashing.
+    pub float_precision: Option<u8>,
+}
+
+/// Look up a field option by column ordinal.
+pub fn field_opt(opts: &[FieldOpt], ordinal: usize) -> Option<&FieldOpt> {
+    opts.iter().find(|o| o.ordinal as usize == ordinal)
+}
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct ChunkHash {
     pub bucket: String,
@@ -59,7 +81,9 @@ pub struct ChunkHash {
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct RowHash {
     pub bucket: String,
-    pub pk: String,
+    /// Primary-key components in PK order. Structured (not a joined string) so
+    /// rkyv can preserve/expose them without a custom codec.
+    pub pk: Vec<String>,
     pub hash: String,
 }
 
@@ -81,6 +105,21 @@ pub struct MysqlProfile {
 }
 
 impl MysqlProfile {
+    pub fn from_archived(a: &ArchivedMysqlProfile) -> Self {
+        Self {
+            version: a.version.as_str().to_owned(),
+            version_comment: a.version_comment.as_str().to_owned(),
+            version_compile_os: a.version_compile_os.as_str().to_owned(),
+            version_compile_machine: a.version_compile_machine.as_str().to_owned(),
+            character_set_client: a.character_set_client.as_str().to_owned(),
+            character_set_connection: a.character_set_connection.as_str().to_owned(),
+            character_set_results: a.character_set_results.as_str().to_owned(),
+            collation_connection: a.collation_connection.as_str().to_owned(),
+            time_zone: a.time_zone.as_str().to_owned(),
+            sql_mode: a.sql_mode.as_str().to_owned(),
+        }
+    }
+
     pub fn difference(&self, other: &MysqlProfile) -> Option<String> {
         let mut diffs = Vec::new();
         macro_rules! check {
@@ -167,6 +206,8 @@ pub enum Request {
         profile: Option<MysqlProfile>,
         /// Required for raw sources: hash of normalized SHOW CREATE TABLE.
         schema_hash: Option<String>,
+        /// Per-column transforms/rounding; must be identical on both sides.
+        field_opts: Vec<FieldOpt>,
     },
     DumpBegin {
         db: String,
@@ -185,11 +226,11 @@ pub enum Request {
         hex_columns: Vec<String>,
     },
     CsvEnd {},
-    /// Delete primary keys (canonical form, components joined with \x1f).
+    /// Delete primary keys (each entry = PK components in PK order).
     DeletePks {
         db: String,
         table: String,
-        pks: Vec<String>,
+        pks: Vec<Vec<String>>,
     },
     DisableTriggers {
         db: String,
@@ -338,29 +379,29 @@ where
     Ok(Some(out))
 }
 
-pub async fn read_request<R>(r: &mut R, f: &Framing) -> Result<Option<Request>>
+/// Reads one raw frame. The caller validates it with [`access_request`] and
+/// works on the archived view, avoiding an owned copy.
+pub async fn read_request_bytes<R>(r: &mut R, f: &Framing) -> Result<Option<AlignedVec>>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
-    match read_body(r, f).await? {
-        None => Ok(None),
-        Some(buf) => Ok(Some(
-            rkyv::from_bytes::<Request, rancor::Error>(&buf).context("Request-Binary ungültig")?,
-        )),
-    }
+    read_body(r, f).await
 }
 
-pub async fn read_response<R>(r: &mut R, f: &Framing) -> Result<Option<Response>>
+/// See [`read_request_bytes`].
+pub async fn read_response_bytes<R>(r: &mut R, f: &Framing) -> Result<Option<AlignedVec>>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
-    match read_body(r, f).await? {
-        None => Ok(None),
-        Some(buf) => Ok(Some(
-            rkyv::from_bytes::<Response, rancor::Error>(&buf)
-                .context("Response-Binary ungültig")?,
-        )),
-    }
+    read_body(r, f).await
+}
+
+pub fn access_request(buf: &[u8]) -> Result<&ArchivedRequest> {
+    rkyv::access::<ArchivedRequest, rancor::Error>(buf).context("Request-Binary ungültig")
+}
+
+pub fn access_response(buf: &[u8]) -> Result<&ArchivedResponse> {
+    rkyv::access::<ArchivedResponse, rancor::Error>(buf).context("Response-Binary ungültig")
 }
 
 /// Writes a large blob as a series of `Bulk` frames.

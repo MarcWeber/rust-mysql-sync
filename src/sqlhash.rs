@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 pub struct SqlRowHash {
     pub bucket: String,
-    pub pk: String,
+    pub pk: Vec<String>,
     pub hash: String,
 }
 
@@ -121,31 +121,51 @@ pub fn bucket_expr(pks: &[PkCol], mode: ChunkMode, chunked: u32) -> Result<Strin
     }
 }
 
-pub fn pk_expr(pks: &[PkCol]) -> Result<String> {
-    if pks.is_empty() {
-        anyhow::bail!("Tabelle hat keinen Primary Key");
+/// Wertausdruck inkl. optionalem Transform/Runden (None = Spalte ignorieren).
+fn field_value_expr(name: &str, opt: Option<&crate::proto::FieldOpt>) -> Option<String> {
+    use crate::proto::FieldTransform;
+    let mut expr = mysqlutil::quote_ident(name);
+    if let Some(opt) = opt {
+        if opt.transform == Some(FieldTransform::Ignore) {
+            return None;
+        }
+        if opt.transform == Some(FieldTransform::Lower) {
+            expr = format!("LOWER({expr})");
+        }
+        if opt.transform == Some(FieldTransform::Trim) {
+            expr = format!("TRIM({expr})");
+        }
+        if let Some(scale) = opt.float_precision {
+            expr = format!("ROUND({expr}, {scale})");
+        }
     }
-    let parts: Vec<String> = pks.iter().map(pk_component_expr).collect();
-    if parts.len() == 1 {
-        Ok(parts[0].clone())
-    } else {
-        Ok(format!("CONCAT_WS(CHAR(31), {})", parts.join(", ")))
-    }
+    Some(expr)
 }
 
-pub fn row_md5_expr(columns: &[String]) -> String {
+/// MySQL 9.x loest Built-ins wie MD5/SHA1 nur mit Default-Datenbank auf.
+/// Die Queries sind zwar voll qualifiziert, aber `USE` macht den Select-Pfad
+/// unabhaengig davon (und ist pro Tabellen-Task-Connection ohnehin eindeutig).
+async fn use_database(conn: &mut Conn, db: &str) -> Result<()> {
+    conn.query_drop(format!("USE {}", mysqlutil::quote_ident(db)))
+        .await
+        .context("USE Datenbank fehlgeschlagen")
+}
+
+pub fn row_hash_expr(columns: &[String], opts: &[crate::proto::FieldOpt]) -> String {
     let parts: Vec<String> = columns
         .iter()
-        .map(|name| {
+        .enumerate()
+        .filter_map(|(i, name)| {
             let col = mysqlutil::quote_ident(name);
-            format!(
+            let expr = field_value_expr(name, crate::proto::field_opt(opts, i))?;
+            Some(format!(
                 "IF({col} IS NULL, 0x00, CONCAT(0x01, \
-                 UNHEX(LPAD(HEX(OCTET_LENGTH(CAST({col} AS BINARY))), 8, '0')), \
-                 CAST({col} AS BINARY)))"
-            )
+                 UNHEX(LPAD(HEX(OCTET_LENGTH(CAST({expr} AS BINARY))), 8, '0')), \
+                 CAST({expr} AS BINARY)))"
+            ))
         })
         .collect();
-    format!("MD5(CONCAT({}))", parts.join(", "))
+    format!("LEFT(SHA2(CONCAT({}), 256), 32)", parts.join(", "))
 }
 
 fn group_query(
@@ -153,17 +173,18 @@ fn group_query(
     table: &str,
     pks: &[PkCol],
     columns: &[String],
+    opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
 ) -> Result<String> {
     let bucket = bucket_expr(pks, mode, chunked)?;
-    let row_md5 = row_md5_expr(columns);
+    let row_hash = row_hash_expr(columns, opts);
     Ok(format!(
         "SELECT bucket, COUNT(*) AS cnt, \
-         LOWER(MD5(CONCAT_WS('|', MD5(bucket), COUNT(*), \
-         IFNULL(SUM(CAST(CONV(SUBSTR(row_md5, 1, 16), 16, 10) AS UNSIGNED)), 0), \
-         IFNULL(SUM(CAST(CONV(SUBSTR(row_md5, 17, 16), 16, 10) AS UNSIGNED)), 0)))) AS hash \
-         FROM (SELECT {bucket} AS bucket, {row_md5} AS row_md5 FROM {}) AS x \
+         LOWER(LEFT(SHA2(CONCAT_WS('|', LEFT(SHA2(bucket, 256), 32), COUNT(*), \
+         IFNULL(SUM(CAST(CONV(SUBSTR(row_hash, 1, 16), 16, 10) AS UNSIGNED)), 0), \
+         IFNULL(SUM(CAST(CONV(SUBSTR(row_hash, 17, 16), 16, 10) AS UNSIGNED)), 0))))) AS hash \
+         FROM (SELECT {bucket} AS bucket, {row_hash} AS row_hash FROM {}) AS x \
          GROUP BY bucket ORDER BY BINARY bucket",
         mysqlutil::qualified(db, table)
     ))
@@ -174,16 +195,22 @@ fn row_query(
     table: &str,
     pks: &[PkCol],
     columns: &[String],
+    opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
     buckets: Option<&[String]>,
 ) -> Result<String> {
     let bucket = bucket_expr(pks, mode, chunked)?;
-    let pk = pk_expr(pks)?;
-    let row_md5 = row_md5_expr(columns);
+    let pk_cols: Vec<String> = pks
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{} AS pk_{i}", pk_component_expr(p)))
+        .collect();
+    let row_hash = row_hash_expr(columns, opts);
     let mut sql = format!(
-        "SELECT {pk} AS pk, {bucket} AS bucket, {row_md5} AS hash \
+        "SELECT {}, {bucket} AS bucket, {row_hash} AS hash \
          FROM {}",
+        pk_cols.join(", "),
         mysqlutil::qualified(db, table)
     );
     if let Some(buckets) = buckets {
@@ -212,11 +239,11 @@ pub fn order_by_bucket(pks: &[PkCol], mode: ChunkMode, chunked: u32) -> Result<S
         ChunkMode::Range => Ok(mysqlutil::order_by(pks)),
         ChunkMode::Mod => {
             let bucket = bucket_expr(pks, mode, chunked)?;
-            let cols: Vec<String> = pks.iter().map(|p| mysqlutil::quote_ident(&p.name)).collect();
-            Ok(format!(
-                " ORDER BY BINARY ({bucket}), {}",
-                cols.join(", ")
-            ))
+            let cols: Vec<String> = pks
+                .iter()
+                .map(|p| mysqlutil::quote_ident(&p.name))
+                .collect();
+            Ok(format!(" ORDER BY BINARY ({bucket}), {}", cols.join(", ")))
         }
     }
 }
@@ -228,11 +255,13 @@ pub async fn stream_chunk_hashes(
     db: &str,
     table: &str,
     pks: &[PkCol],
+    opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
 ) -> Result<u64> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
-    let sql = group_query(db, table, pks, &columns, mode, chunked)?;
+    use_database(conn, db).await?;
+    let sql = group_query(db, table, pks, &columns, opts, mode, chunked)?;
     log::debug!("SQL group hashes (stream): {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -258,11 +287,13 @@ pub async fn chunk_hashes(
     db: &str,
     table: &str,
     pks: &[PkCol],
+    opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
 ) -> Result<HashMap<String, (u64, String)>> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
-    let sql = group_query(db, table, pks, &columns, mode, chunked)?;
+    use_database(conn, db).await?;
+    let sql = group_query(db, table, pks, &columns, opts, mode, chunked)?;
     log::debug!("SQL group hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -285,12 +316,14 @@ pub async fn row_hashes(
     db: &str,
     table: &str,
     pks: &[PkCol],
+    opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
     buckets: Option<&[String]>,
 ) -> Result<Vec<SqlRowHash>> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
-    let sql = row_query(db, table, pks, &columns, mode, chunked, buckets)?;
+    use_database(conn, db).await?;
+    let sql = row_query(db, table, pks, &columns, opts, mode, chunked, buckets)?;
     log::debug!("SQL row hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -302,7 +335,23 @@ pub async fn row_hashes(
         .await
         .context("Fehler beim Lesen der Zeilen-Hashes")?
     {
-        let (pk, bucket, hash): (String, String, String) = mysql_async::from_row(row);
+        let n = pks.len();
+        let mut pk = Vec::with_capacity(n);
+        for i in 0..n {
+            pk.push(
+                row.get_opt::<String, _>(i)
+                    .with_context(|| format!("PK-Spalte {i} fehlt"))?
+                    .map_err(|e| anyhow::anyhow!("PK-Spalte {i}: {e:?}"))?,
+            );
+        }
+        let bucket = row
+            .get_opt::<String, _>(n)
+            .context("Bucket-Spalte fehlt")?
+            .map_err(|e| anyhow::anyhow!("Bucket-Spalte: {e:?}"))?;
+        let hash = row
+            .get_opt::<String, _>(n + 1)
+            .context("Hash-Spalte fehlt")?
+            .map_err(|e| anyhow::anyhow!("Hash-Spalte: {e:?}"))?;
         out.push(SqlRowHash { bucket, pk, hash });
     }
     Ok(out)

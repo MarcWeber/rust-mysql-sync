@@ -5,7 +5,7 @@
 //!   - TCP:  a dedicated TCP connection (plaintext, explicit opt-in).
 
 use crate::config::{Config, ALPN};
-use crate::proto::{self, Framing, Request, Response};
+use crate::proto::{self, Framing, Request};
 use crate::tls;
 use anyhow::{bail, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,13 +142,18 @@ where
         &f,
     )
     .await?;
-    match proto::read_response(recv, &f).await? {
-        Some(Response::Ok { .. }) => {
+    let buf = match proto::read_response_bytes(recv, &f).await? {
+        Some(buf) => buf,
+        None => bail!("Keine Handshake-Antwort"),
+    };
+    match proto::access_response(&buf)? {
+        proto::ArchivedResponse::Ok { .. } => {
             log::debug!("Server-Handshake ok");
             Ok(())
         }
-        Some(Response::Err { message }) => bail!("Server lehnt ab: {message}"),
-        Some(_) => bail!("Unerwartete Handshake-Antwort"),
-        None => bail!("Keine Handshake-Antwort"),
+        proto::ArchivedResponse::Err { message } => {
+            bail!("Server lehnt ab: {}", message.as_str())
+        }
+        _ => bail!("Unerwartete Handshake-Antwort"),
     }
 }

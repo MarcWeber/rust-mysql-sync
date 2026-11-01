@@ -1,51 +1,20 @@
 #!/usr/bin/env python3
 """
 
-Docker only so that test is portable.
-table names have prefixes
+Docker only. test.py starts two MySQL containers, creates/fills tables from
+the Python TableSchema class, deliberately removes chunks on both sides and
+runs the rust-sync vs pt-table-sync matrix.
 
-src_XXXX -> can be reused
-dst_YYYY -> where YYYY is a specific test case so each test case gets its own rw target table
+Each case gets its own table in db_matrix, derived from its dimension hash.
 
-The docker mysql instances are both read and write targets
+Actions:
+  up     : start the Docker MySQL containers and wait until they answer
+  matrix : run the comparison matrix (rust modes vs pt-table-sync)
+  down   : stop/remove the containers
+  clean  : stop/remove the containers and their volumes
 
-to keep it simpsle the database is called 
-rust_mysql_sync.* for now
-
-mysql-sync End-to-End-Test.
-
-Aufruf:
-Modi:
-  1. Docker (Standard):  startet 2 MySQL-8-Container via docker compose,
-     baut/startet den Server-Binary auf dem Host und spielt alle Szenarien durch.
-
-Szenarien (Aktion old):
-  A) --force-schema  : Schema auf Ziel erzwingen
-  B) --sync          : differentieller Abgleich, danach Zähler + BLOB-Prüfsummen gleich
-  C) --check 10      : Exit 0 wenn identisch (select/dump/raw-binary/raw-tsv)
-  D) Drift + --check 5  : Exit 1, erwartete Diff-Anzahl (49 plain / 19 binary) gemeldet
-  E) --sync          : Drift behoben (raw-tsv + raw-binary), wieder identisch
-  F) --force --sync  : Tabelle neu erstellen + Vollkopie, wieder identisch
-  G) SQL-Dump-Modus  : allow_csv=false, binärsicher
-  H) hash_algo       : Mismatch wird abgelehnt, blake3 funktioniert
-  I) zstd            : Kompression auf beiden Seiten
-  J) TCP             : Klartext-Transport (Opt-in) + Ablehnung ohne allow_plaintext
-  K) Chunking        : Range fuer INTEGER/CHAR/BINARY, automatischer Mod-Fallback fuer
-                       DATE/Composite, select/dump/raw, exakte Drift-Zahlen, Fehler ohne PK
-  L) Raw-Profil-Gate : raw-binary/raw-tsv lehnen abweichendes MySQL-Profil ab
-
-Matrix (Aktion matrix):
-  Produkt aus Tool (rust-sync, pt-table-sync), Key (int, str, int-tuple,
-  str-tuple, mixed-tuple) und Binärspalte (nein, ja). "-tuple" heißt
-  zusammengesetzter Primary Key (id, id2); mixed-tuple ist str-int
-  (id VARCHAR, id2 INT). rust-sync zusätzlich pro Read-Mode (select, dump,
-  raw-binary, raw-tsv). Jeder Fall bekommt aus seinem Dimensions-Hash eine eigene Tabelle
-  in db_matrix, damit parallele Fälle sich nicht beeinflussen. Gemessen werden
-  Clean-Check, Drift-Check und Sync (pt-table-sync: --print und --execute).
-  Globale Matrix-Parameter: MATRIX_ROWS=100000, MATRIX_JOBS=4, MATRIX_TIMEOUT=300.
-  MSYNC_PT_TABLE_SYNC (sonst PATH-Suche) steuert den pt-table-sync-Pfad.
-
-Exit 0 = alle aufgerufenen Aktionen bestanden.
+python3 test.py up matrix
+Exit 0 = all executed actions passed.
 """
 
 from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Iterable, Optional, List, Dict, Literal, TypedDict, Unpack, Concatenate, Tuple, NotRequired
@@ -74,13 +43,17 @@ from asyncio import create_task, to_thread, sleep, timeout, timeout_at, Semaphor
 import asyncio
 
 from collections import defaultdict
+from contextlib import AsyncExitStack, asynccontextmanager
+import threading
 
 from u_redirect_logging import with_logging
 from u_asyncio import run_show_out_tail_on_error, task
 
+ROOT_PW = "syncroot"
+SERVER_PORT_OFFSET = 100
+
 TEST_TEXT = "A\nB\n\\\BinärmüllÄß"
 
-# START_PORT = 7012
 MYSQL_INSTANCES_CONFIG = [
     # name version port
     ["mysql80", "8.0", 7012],
@@ -105,6 +78,26 @@ TABLE_SCHEMA_CASES = {
 }
 
 
+HERE = Path(__file__).resolve().parent
+WORK = HERE / ".test-run"
+
+
+def _cargo_target_dir():
+    override = os.environ.get("CARGO_TARGET_DIR")
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_absolute() else HERE / path
+    if shutil.which("cargo"):
+        try:
+            meta = subprocess.check_output(
+                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                cwd=HERE, text=True, stderr=subprocess.DEVNULL,
+            )
+            return Path(json.loads(meta)["target_directory"])
+        except (OSError, subprocess.CalledProcessError, KeyError, ValueError):
+            pass
+    return HERE / "target"
+
 def _default_bin():
     return _cargo_target_dir() / "release" / "mysql-sync"
 
@@ -113,14 +106,6 @@ if os.environ.get("MSYNC_BIN"):
     BIN = Path(os.environ["MSYNC_BIN"]).expanduser().resolve()
 else:
     BIN = _default_bin()
-
-E = os.environ
-
-DOCKER = E["MSYNC_DOCKER"]
-SRC_PORT = int(E["MSYNC_SRC_PORT"])
-DST_PORT = int(E["MSYNC_DST_PORT"])
-ROOT_PW = E["MSYNC_ROOT_PW"] # "syncroot"
-MYSQL_SYNC_SERVER_PORT = int(E["MYSQL_SYNC_SERVER_PORT"])
 
 PASS, FAIL = chalk.green("PASS"), chalk.red("FAIL")
 SKIP = chalk.yellow("SKIP")
@@ -133,23 +118,53 @@ LOG_PATH = Path(os.environ.get("MSYNC_LOG") or (HERE / "test.log"))
 @dataclass()
 class TableSchemaField:
     type: str
-    def sql_value_from_n(self, n):
-        global TEST_TEXT
-        t = self.type
+
+    def sql_type(self):
+        t = self.type.lower()
+        if t.startswith("int"):
+            return t.upper()
+        if t.startswith("varchar"):
+            return t.upper()
+        if t.startswith("text"):
+            return "TEXT"
+        if t.startswith("blob"):
+            return "VARBINARY(128)"
+        if t.startswith("float"):
+            return "FLOAT"
+        if t.startswith("currency"):
+            return "DECIMAL(10,2)"
+        raise ValueError(f"unbekannter Feldtyp: {self.type}")
+
+    def sql_value_from_n(self, n="n"):
+        t = self.type.lower()
         if t.startswith("int"):
             return n
         if t.startswith("varchar"):
-            return 'CONCAT("LINE", n)'
+            return f"CONCAT('LINE', {n})"
         if t.startswith("text"):
-            t = f"{TEST_TEXT} " * 150
-            return f"CONCAT(\"{t}\", n)"
+            text = (TEST_TEXT + " ") * 150
+            return f"CONCAT(CONVERT(UNHEX('{text.encode().hex()}') USING utf8mb4), {n})"
         if t.startswith("blob"):
-            return 'BIN(n)'
+            return f"BIN({n})"
         if t.startswith("float"):
-            return '(n / 10)'
+            return f"({n} / 10)"
         if t.startswith("currency"):
-            return '(n / 10)'
-        assert False
+            return f"({n} / 10)"
+        raise ValueError(f"unbekannter Feldtyp: {self.type}")
+
+
+
+
+@dataclass()
+class TableSchema:
+    primary_key_fields: int
+    fields: list[TableSchemaField]
+
+    @staticmethod
+    def from_str(s):
+        x = s.split(':')
+        pkf = int(x[0])
+        return TableSchema(pkf, [TableSchemaField(t) for t in x[1:]])
 
     def drop_recreate_sql(self, name, row_count):
         """
@@ -188,9 +203,13 @@ class TableSchemaField:
 
         """
         letters = "abcdefghijklmnopqrstuvwxyz"
-        cols = ", ".join(letters[:len(self)])
+        cols = ", ".join(letters[:len(self.fields)])
+        col_defs = ", ".join(
+            f"`{letters[i]}` {self.fields[i].sql_type()}"
+            for i in range(len(self.fields))
+        )
         pk_cols = ", ".join(letters[:self.primary_key_fields])
-        values = ",\n  ".join(self[i].sql_value_from_n("n") for i in range(len(self)))
+        values = ",\n  ".join(f.sql_value_from_n("n") for f in self.fields)
         # digit-series generator: n ranges 1 .. row_count
         digits = max(1, (row_count // 10 + 1).bit_length())  # enough single-digit factors
         factors = ",\n               ".join(
@@ -199,11 +218,11 @@ class TableSchemaField:
             f" {letters[i]}"
             for i in range(digits)
         )
-        terms = " + ".join(f"{letters[i]} .N * {10 ** i}" for i in range(digits - 1)) + f" + {letters[-1]}.N + 1"
-        return [f"DROP TABLE IF EXISTS `{name}`",
+        terms = " + ".join(f"{letters[i]}.N * {10 ** i}" for i in range(digits)) + " + 1"
+        return [f"DROP TABLE IF EXISTS {name}",
 f"""
-CREATE TABLE `{name}` ({cols}) ENGINE=InnoDB;
-INSERT INTO `{name}` ({cols})
+CREATE TABLE {name} ({col_defs}, PRIMARY KEY ({pk_cols})) ENGINE=InnoDB;
+INSERT INTO {name} ({cols})
 SELECT
   {values}
 FROM (
@@ -211,18 +230,6 @@ FROM (
   FROM {factors}
 ) nums
 WHERE n <= {row_count};"""]
-
-
-@dataclass()
-class TableSchema:
-    primary_key_fields: int
-    fields: list[TableSchemaField]
-
-    @staticmethod
-    def from_str(s):
-        x = s.split(':')
-        pkf = int(x[0])
-        return TableSchema(pkf, x[1:])
 
 TABLE_SCHEMAS = {k: TableSchema.from_str(s) for k, s in TABLE_SCHEMA_CASES.items()}
 
@@ -250,18 +257,12 @@ class Mysql:
     version: str
     port: int
 
-    async def sql(self, *queries, database=None, check=True, quiet=False):
-        """SQL auf Quelle (which='src') oder Ziel (which='dst') ausführen."""
-        if DOCKER:
-
-            cmd = ["docker", "compose", "-f", HERE / "docker-compose.yml", "exec", "-T", self.name,
-                   "mysql", "-uroot", f"-p{ROOT_PW}"]
-        else:
-            cli = os.environ.get("MSYNC_MYSQL_CLI", "mysql")
-            cmd = [cli, "--no-defaults", "-h", "127.0.0.1",
-                   "-P", self.port, "-uroot"]
-            if ROOT_PW:
-                cmd.append(f"-p{ROOT_PW}")
+    def sql(self, *queries, database=None, check=True, quiet=False):
+        """SQL auf die MySQL-Instanz dieses Objekts ausführen."""
+        cli = os.environ.get("MSYNC_MYSQL_CLI", "mysql")
+        cmd = [cli, "-h", "127.0.0.1", "-P", str(self.port), "-uroot"]
+        if ROOT_PW:
+            cmd.append(f"-p{ROOT_PW}")
         if database:
             cmd.append(database)
         r = None
@@ -275,10 +276,56 @@ class Mysql:
         out = self.sql(query, database = database, quiet=quiet).strip().splitlines()
         return out[-1] if out else None
 
-    def _pt_dsn(self, case, table):
+    def table_exists(self, table):
+        return self.scalar(
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            f"WHERE TABLE_SCHEMA='{MATRIX_DB}' AND TABLE_NAME='{table}'",
+            quiet=True,
+        ) == "1"
+
+    @property
+    def server_port(self):
+        return self.port + SERVER_PORT_OFFSET
+
+    def server_config(self):
+        cfg = WORK / f"config-server-{self.name}.json"
+        cfg.write_text(json.dumps({
+            "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": self.port},
+            "listen": "127.0.0.1",
+            "port": self.server_port,
+        }, indent=2))
+        return cfg
+
+    @asynccontextmanager
+    async def server_running(self):
+        cfg = self.server_config()
+        fp_file = cfg.with_suffix(".fingerprint")
+        fp_file.unlink(missing_ok=True)
+        log = open(WORK / f"server-{self.name}.log", "w")
+        proc = subprocess.Popen([str(BIN), "-C", str(cfg)], stdout=log, stderr=log)
+        log.close()
+        try:
+            fingerprint = None
+            for _ in range(50):
+                if fp_file.exists():
+                    fingerprint = fp_file.read_text().strip()
+                    break
+                await sleep(0.2)
+            if not fingerprint:
+                raise RuntimeError(f"{self.name}: kein Server-Fingerprint")
+            yield fingerprint
+        finally:
+            proc.terminate()
+            try:
+                await to_thread(proc.wait, 5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                await to_thread(proc.wait)
+
+    def _pt_dsn(self, table):
         parts = [
             "h=127.0.0.1",
-            f"P={case.port}",
+            f"P={self.port}",
             "u=root",
             f"D={MATRIX_DB}",
             f"t={table}",
@@ -289,24 +336,33 @@ class Mysql:
 
 MYSQL_INSTANCES = {a[0]: Mysql(*a) for a in MYSQL_INSTANCES_CONFIG}
 
-HERE = Path(__file__).resolve().parent
-WORK = HERE / ".test-run"
 
-def _cargo_target_dir():
-    override = os.environ.get("CARGO_TARGET_DIR")
-    if override:
-        path = Path(override).expanduser()
-        return path if path.is_absolute() else HERE / path
-    if shutil.which("cargo"):
-        try:
-            meta = subprocess.check_output(
-                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-                cwd=HERE, text=True, stderr=subprocess.DEVNULL,
-            )
-            return Path(json.loads(meta)["target_directory"])
-        except (OSError, subprocess.CalledProcessError, KeyError, ValueError):
-            pass
-    return HERE / "target"
+def write_docker_compose():
+    services = {}
+    for name, version, port in MYSQL_INSTANCES_CONFIG:
+        services[name] = {
+            "image": f"mysql:{version}",
+            "container_name": name,
+            "environment": {"MYSQL_ROOT_PASSWORD": ROOT_PW},
+            "command": "--character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1",
+            "ports": [f"{port}:3306"],
+            "healthcheck": {
+                "test": ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", f"-p{ROOT_PW}"],
+                "interval": "3s",
+                "timeout": "3s",
+                "retries": 30,
+            },
+        }
+    (HERE / "docker-compose.yml").write_text(
+        yaml.safe_dump({"services": services}, sort_keys=False)
+    )
+
+
+def _matrix_mysql_json(m):
+    return json.dumps({
+        "mysql": {"user": "root", "password": ROOT_PW,
+                  "host": "127.0.0.1", "port": m.port},
+    })
 
 
 def step(name, ok, detail=""):
@@ -344,24 +400,24 @@ def _binary_kind(path):
 
 
 def ensure_binary():
-    # if BIN.exists():
-    #     kind = _binary_kind(BIN)
-    #     if kind == "macos":
-    #         raise SystemExit(
-    #             f"Binary ist für macOS gebaut: {BIN}\n"
-    #             "Auf Linux neu bauen: cargo build --release"
-    #         )
-    #     if not os.access(BIN, os.X_OK):
-    #         raise SystemExit(f"Binary nicht ausführbar: {BIN}")
-    #     return
+    if BIN.exists():
+        kind = _binary_kind(BIN)
+        if kind == "macos":
+            raise SystemExit(
+                f"Binary ist für macOS gebaut: {BIN}\n"
+                "Auf Linux neu bauen: cargo build --release"
+            )
+        if not os.access(BIN, os.X_OK):
+            raise SystemExit(f"Binary nicht ausführbar: {BIN}")
+        return
     if os.environ.get("MSYNC_BIN"):
         raise SystemExit(f"MSYNC_BIN gesetzt, aber Binary fehlt: {BIN}")
     if os.environ.get("MSYNC_NO_BUILD"):
         raise SystemExit(f"Binary fehlt: {BIN} (MSYNC_NO_BUILD gesetzt)")
     if shutil.which("cargo") is None:
         raise SystemExit(f"Binary fehlt: {BIN}; cargo nicht im PATH")
-    print(f"== Build ==\n  Binary fehlt: {BIN}\n  cargo build --release")
-    r = subprocess.run(["cargo", "build", "--release"], cwd=HERE)
+    print(f"== Build ==\n  Binary fehlt: {BIN}\n  cargo +nightly build --release")
+    r = subprocess.run(["cargo", "+nightly", "build", "--release"], cwd=HERE)
     if r.returncode != 0:
         raise SystemExit("cargo build --release fehlgeschlagen")
     if not BIN.exists():
@@ -423,74 +479,104 @@ class MatrixCasePTOpts:
 class MatrixCaseRustOpts:
     mode: str
 
-# @dataclass()
-# class PrimaryKeyTypes:
-#     """ primary keys """
-#     types: str
-
-#     def kind(self):
-#         return self.types.split("-")[0]
-
-#     def types(self):
-#         """(id_type, id2_type) — id2_type ist None ohne zusammengesetzten Key."""
-#         id_type = "BIGINT" if _key_kind(self.types) == "int" else "VARCHAR(32)"
-#         if not _is_tuple(self.types):
-#             return id_type, None
-#         return id_type, "VARCHAR(32)" if _key_kind(self.types) == "str" else "INT"
-
-#     def is_tuple(self):
-#         return self.types.endswith("-tuple")
-
 Binary = Tuple["binary", "no_binary"]
 
-@dataclass_json
 @dataclass()
 class MatrixCase:
-    table_schema_case: TableSchema # key of TABLE_SCHEMA_CASES
+    table_schema_case: str  # key of TABLE_SCHEMA_CASES
+    schema: TableSchema
     binary: Binary
-    mysqls: Tuple[Mysql, Mysql] # from to mysqls connections
+    mysqls: Tuple[Mysql, Mysql]  # from, to
     tool_opts: MatrixCasePTOpts | MatrixCaseRustOpts
 
     def __post_init__(self):
-        self.hash = hashlib.sha256(self.to_json().encode()).hexdigest()[:16]
+        raw = f"{self.table_schema_case}|{self.binary}|{self.mysqls}|{self.tool_opts}"
+        self.hash = hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+    def key(self):
+        ts = self.schema
+        first = ts.fields[0].type
+        kind = "int" if first.startswith("int") else "str"
+        if ts.primary_key_fields < 2:
+            return kind
+        second = ts.fields[1].type
+        kind2 = "int" if second.startswith("int") else "str"
+        if kind == kind2:
+            return f"{kind}-tuple"
+        return "mixed-tuple"
+
+    def source_table(self):
+        return f"src_{CHUNK_SIZE}_{MATRIX_ROWS}_{self.table_schema_case}_{self.binary}"
+
+    def dest_table(self):
+        return f"dst_{CHUNK_SIZE}_{MATRIX_ROWS}_{self.table_schema_case}_{self.binary}_{self.hash}"
+
+    def table_name(self):
+        return self.dest_table()
 
     def table_names(self):
-        """ returns from and to table names where from table name can be shared """
-        x = f"{CHUNK_SIZE}_{MATRIX_ROWS}_{self.binary}"
-        f = f"src_{x}"
-        t = f"dst_{x}_{self.hash}"
-        return f, t
+        return self.source_table(), self.dest_table()
 
-async def matrix_cases():
+    def _dims(self):
+        tool = "pt" if isinstance(self.tool_opts, MatrixCasePTOpts) else "rust"
+        mode = None if tool == "pt" else self.tool_opts.mode
+        return {
+            "table_schema_case": self.table_schema_case,
+            "key": self.key(),
+            "binary": self.binary,
+            "table": self.table_name(),
+            "tool": tool,
+            "mode": mode,
+            "mysqls": self.mysqls,
+        }
+
+    def keys(self):
+        return self._dims().keys()
+
+    def __getitem__(self, key):
+        return self._dims()[key]
+
+    def __iter__(self):
+        return iter(self._dims())
+
+    def __len__(self):
+        return len(self._dims())
+
+
+def _mysql_by_version(version):
+    for m in MYSQL_INSTANCES.values():
+        if m.version == version:
+            return m
+    raise SystemExit(f"Keine MySQL-Instanz fuer Version {version} konfiguriert")
+
+
+def matrix_cases():
     cases = []
-    # different mysql versions !
-    # the binary-via-
-    for table_schema_case, binary, mysqls in product(
-           # primary key  variations
-
-            TABLE_SCHEMA_CASES.keys(),
-
-           # with or without binary
-           ("no_binary", "bin"),
-
-           # mysql versions differ
-           # --hash-raw-binary-row -> expected to fail if mysql versions differ
-           # --hash-raw-binary-row-vec -> expected to always work
-           ("8.0:8.0", "8.0:9.7")
-        ):
-        common = { "table_schema_case": table_schema_case, "binary": binary, "mysqls": Mysqls(mysqls) }
-        cases.append(MatrixCase({**common, "tool_opts": MatrixCasePTOpts()}))
+    # Nur Paare, fuer die tatsaechlich Instanzen laufen. Weitere Versionen
+    # (z.B. 8.0:8.0) brauchen zusaetzliche Container in docker-compose.yml.
+    version_pairs = [("8.0", "9.7"), ("8.0", "8.0")]
+    for (table_schema_case, schema), binary, (v_src, v_dst) in product(
+            TABLE_SCHEMAS.items(),
+            ("no_binary", "bin"),
+            version_pairs):
+        mysqls = (_mysql_by_version(v_src), _mysql_by_version(v_dst))
+        common = {"table_schema_case": table_schema_case,
+                  "schema": schema,
+                  "binary": binary, "mysqls": mysqls}
+        cases.append(MatrixCase(**common, tool_opts=MatrixCasePTOpts()))
         for mode, _ in RUST_MODES:
-            cases.append(MatrixCase({**common, "tool_opts": MatrixCaseRustOpts(mode)}))
+            cases.append(MatrixCase(**common, tool_opts=MatrixCaseRustOpts(mode)))
     return cases
 
-def _matrix_ddl(case):
-    key, id2_type = _key_types(case)
+def _matrix_ddl(case, table):
+    fields = case.schema.fields
+    key = fields[0].sql_type()
+    id2_type = fields[1].sql_type() if case.schema.primary_key_fields > 1 else None
     tuple_col = f"  id2 {id2_type} NOT NULL,\n" if id2_type else ""
     pk = "(id, id2)" if id2_type else "(id)"
     bin_col = "  bin_data VARBINARY(128) NULL,\n" if case["binary"] == "bin" else ""
     return (
-        f"CREATE TABLE {MATRIX_DB}.{case['table']} (\n"
+        f"CREATE TABLE {MATRIX_DB}.{table} (\n"
         f"  id {key} NOT NULL,\n"
         f"{tuple_col}"
         f"{bin_col}"
@@ -502,25 +588,28 @@ def _matrix_ddl(case):
 
 
 def _matrix_id_expr(case, n="n"):
-    base = f"CEIL({n} / 3)" if _is_tuple(case) else n
-    if _key_kind(case) == "int":
+    id_type = case.schema.fields[0].type
+    base = f"CEIL({n} / 1000)" if case.schema.primary_key_fields > 1 else n
+    if id_type.startswith("int"):
         return base
+    if id_type.startswith("blob"):
+        return f"UNHEX(CONCAT(LPAD(HEX({base}), 8, '0'), '000000'))"
     return f"CONCAT('k', LPAD({base}, 8, '0'))"
 
 
 def _matrix_id2_expr(case, n="n"):
-    if _key_kind(case) == "str":
-        return f"CONCAT('c', MOD({n}, 3))"
-    return f"MOD({n}, 3)"
+    if case.schema.fields[1].type.startswith("int"):
+        return f"MOD({n}, 1000)"
+    return f"CONCAT('c', LPAD(MOD({n}, 1000), 3, '0'))"
 
 
-def _matrix_seed(case, rows):
-    table = f"{MATRIX_DB}.{case['table']}"
+def _matrix_seed(case, rows, table):
+    table = f"{MATRIX_DB}.{table}"
     id_expr = _matrix_id_expr(case)
     txt_expr = "CONCAT('row-', n, CASE WHEN n % 7 = 0 THEN '\\tTab' ELSE '' END)"
     cols = ["id"]
     vals = [id_expr]
-    if _is_tuple(case):
+    if case.schema.primary_key_fields > 1:
         cols.append("id2")
         vals.append(_matrix_id2_expr(case))
     if case["binary"] == "bin":
@@ -548,13 +637,18 @@ SELECT {vals} FROM (
 ) nums WHERE n <= {rows}"""
 
 
-def _matrix_drift(case):
-    table = f"{MATRIX_DB}.{case['table']}"
+def _matrix_drift(case, table):
+    table = f"{MATRIX_DB}.{table}"
     update_bin = ", bin_data = UNHEX('DEADBEEF')" if case["binary"] == "bin" else ""
-    extra_id = (f"{MATRIX_EXTRA_OFFSET} + n" if _key_kind(case) == "int"
-                else "CONCAT('extra-', LPAD(n, 4, '0'))")
-    tuple_col = ", id2" if _is_tuple(case) else ""
-    tuple_val = ", " + _matrix_id2_expr(case) if _is_tuple(case) else ""
+    id_type = case.schema.fields[0].type
+    if id_type.startswith("int"):
+        extra_id = f"{MATRIX_EXTRA_OFFSET} + n"
+    elif id_type.startswith("blob"):
+        extra_id = f"UNHEX(CONCAT('E', LPAD(HEX(n), 7, '0'), '000000'))"
+    else:
+        extra_id = "CONCAT('extra-', LPAD(n, 4, '0'))"
+    tuple_col = ", id2" if case.schema.primary_key_fields > 1 else ""
+    tuple_val = ", " + _matrix_id2_expr(case) if case.schema.primary_key_fields > 1 else ""
     bin_col = ", bin_data" if case["binary"] == "bin" else ""
     bin_val = ", UNHEX('00FF00FF')" if case["binary"] == "bin" else ""
     return f"""
@@ -567,26 +661,15 @@ FROM (SELECT 1 AS n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
 """
 
 
-def _matrix_checksum_sql(case):
+def _matrix_checksum_sql(case, table):
     cols = ["HEX(id)"]
-    if _is_tuple(case):
+    if case.schema.primary_key_fields > 1:
         cols.append("CAST(id2 AS CHAR)")
     cols += ["HEX(txt)", "CAST(n AS CHAR)"]
     if case["binary"] == "bin":
         cols.append("IFNULL(HEX(bin_data), 'NULL')")
     expr = "CONCAT_WS('|', " + ", ".join(cols) + ")"
-    return f"SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32({expr})), 0)) FROM {MATRIX_DB}.{case['table']}"
-
-
-def _matrix_setup(case):
-    for which in ("src", "dst"):
-        sql(which, f"DROP TABLE IF EXISTS {MATRIX_DB}.{case['table']}", quiet=True)
-        sql(which, _matrix_ddl(case), quiet=True)
-        sql(which, _matrix_seed(case, MATRIX_ROWS), quiet=True)
-    a = scalar("src", _matrix_checksum_sql(case), quiet=True)
-    b = scalar("dst", _matrix_checksum_sql(case), quiet=True)
-    if a != b:
-        raise RuntimeError(f"Matrix-Setup ungleich: {a} != {b}")
+    return f"SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32({expr})), 0)) FROM {MATRIX_DB}.{table}"
 
 
 def _timed(cmd):
@@ -597,15 +680,20 @@ def _timed(cmd):
 
 
 def _matrix_base(case):
-    out = {**case, "clean_ms": None, "drift_ms": None, "sync_ms": None,
+    out = {**case._dims(), "clean_ms": None, "drift_ms": None, "sync_ms": None,
            "total_ms": None, "status": "error", "detail": ""}
     return out
 
 
+def _case_scalar(case, which, query):
+    m = case.mysqls[0] if which == "src" else case.mysqls[1]
+    return m.scalar(query, quiet=True)
+
+
 def _run_rust_case(cfg, case):
     out = _matrix_base(case)
-    _matrix_setup(case)
-    selector = f"{MATRIX_DB}.{case['table']}"
+    src_table, dst_table = case.table_names()
+    selector = f"{MATRIX_DB}.{src_table}"
     flag = dict(RUST_MODES)[case["mode"]]
     base = [str(BIN), *cfg, "--no-progress"] + ([flag] if flag else [])
 
@@ -615,26 +703,29 @@ def _run_rust_case(cfg, case):
                    detail=f"rc={r.returncode}")
         return out
 
-    clean_ms, r = _timed([*base, "--check", "0", selector])
-    if r.returncode != 0:
-        out.update(clean_ms=clean_ms, detail=f"clean rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
-        return out
-
-    sql("dst", _matrix_drift(case), quiet=True)
+    # prepare_tables has already removed chunks from both sides. With the
+    # default CHUNK_SIZE=2 and 10k rows there are 100 chunks, so the drops are
+    # real differences and the first check must report drift.
     drift_ms, r = _timed([*base, "--check", "0", selector])
     if r.returncode != 1:
-        out.update(clean_ms=clean_ms, drift_ms=drift_ms,
+        out.update(drift_ms=drift_ms,
                    detail=f"drift rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
         return out
 
     sync_ms, r = _timed([*base, "--sync", selector])
     if r.returncode != 0:
-        out.update(clean_ms=clean_ms, drift_ms=drift_ms, sync_ms=sync_ms,
+        out.update(drift_ms=drift_ms, sync_ms=sync_ms,
                    detail=f"sync rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
         return out
 
-    a = scalar("src", _matrix_checksum_sql(case), quiet=True)
-    b = scalar("dst", _matrix_checksum_sql(case), quiet=True)
+    clean_ms, r = _timed([*base, "--check", "0", selector])
+    if r.returncode != 0:
+        out.update(drift_ms=drift_ms, sync_ms=sync_ms, clean_ms=clean_ms,
+                   detail=f"clean rc={r.returncode}: {(r.stdout + r.stderr)[-300:]}")
+        return out
+
+    a = _case_scalar(case, "src", _matrix_checksum_sql(case, src_table))
+    b = _case_scalar(case, "dst", _matrix_checksum_sql(case, dst_table))
     out.update(clean_ms=clean_ms, drift_ms=drift_ms, sync_ms=sync_ms,
                total_ms=clean_ms + drift_ms + sync_ms,
                status="ok" if a == b else "mismatch",
@@ -650,9 +741,10 @@ def _run_pt_case(cfg, case):
     if not PT_BIN:
         out.update(status="skip", detail="pt-table-sync nicht im PATH")
         return out
-    _matrix_setup(case)
-    sql("dst", _matrix_drift(case), quiet=True)
-    src_dsn, dst_dsn = _pt_dsn("src", case), _pt_dsn("dst", case)
+    src_table, dst_table = case.table_names()
+    src, dst = case.mysqls
+    dst.sql(_matrix_drift(case, dst_table), quiet=True)
+    src_dsn, dst_dsn = src._pt_dsn(src_table), dst._pt_dsn(dst_table)
     common = [PT_BIN, "--no-check-slave", "--no-check-triggers", "--chunk-size=1000"]
 
     # pt always runs against the drifted tables (no clean pass):
@@ -670,41 +762,44 @@ def _run_pt_case(cfg, case):
         return out
 
     rc, out_text = run_bin([*cfg, "--no-progress", "--check", "0",
-                            f"{MATRIX_DB}.{case['table']}"])
-    a = scalar("src", _matrix_checksum_sql(case), quiet=True)
-    b = scalar("dst", _matrix_checksum_sql(case), quiet=True)
+                            f"{MATRIX_DB}.{src_table}"])
+    a = _case_scalar(case, "src", _matrix_checksum_sql(case, src_table))
+    b = _case_scalar(case, "dst", _matrix_checksum_sql(case, dst_table))
     ok = rc == 0 and a == b
     out.update(drift_ms=drift_ms, sync_ms=sync_ms, total_ms=drift_ms + sync_ms,
                status="ok" if ok else "mismatch",
                detail="" if ok else f"rust --check rc={rc}: {out_text[-200:]} | {a} != {b}")
     return out
 
-LOCK_FROM_TABLES = defaultdict(lambda: Semaphore())
+LOCK_FROM_TABLES = defaultdict(threading.Lock)
+
+
+def _prepare_matrix_table(m, case, table):
+    m.sql(f"DROP TABLE IF EXISTS {MATRIX_DB}.{table}", quiet=True)
+    m.sql(_matrix_ddl(case, table), quiet=True)
+    m.sql(_matrix_seed(case, MATRIX_ROWS, table), quiet=True)
+
+
+def _drop_matrix_chunks(m, table, start):
+    return run([str(BIN), "-C", "-", f"--testing-drop-chunks={start}",
+                f"{MATRIX_DB}.{table}"], input=_matrix_mysql_json(m))
+
 
 async def prepare_tables(case: MatrixCase):
-    f,t = case.table_names()
-    F,T = case.mysqls
+    src_table, dst_table = case.table_names()
+    src, dst = case.mysqls
 
-    async def prepare_from_table():
-        async with LOCK_FROM_TABLES[f]:
-            try:
-                await F.sql(f"SELECT count(*) FROM {f}")
-            except Exception as e:
-                # doens't exist yet create
-                await F.sql(case.table_schema_case)
-                # run on db_matrix.{f}
-                run([str(BIN), f"--testing-drop-chunks-source={CHUNK_DROP_START_SOURCE}",
-                     "--mysql-host=127.0.0.1", f"--mysql-port={F.port}", "--mysql-user=root",
-                    f"--mysql-password={ROOT_PW}"])
+    def prepare_source():
+        with LOCK_FROM_TABLES[(src.name, src_table)]:
+            if not src.table_exists(src_table):
+                _prepare_matrix_table(src, case, src_table)
+                _drop_matrix_chunks(src, src_table, CHUNK_DROP_START_SOURCE)
 
-    async def prepare_to_table():
-        await T.sql(case.table_schema_case)
-        # run on db_matrix.{t}
-        run([str(BIN), f"--testing-drop-chunks-source={CHUNK_DROP_START_DEST}",
-             "--mysql-host=127.0.0.1", f"--mysql-port={T.port}", "--mysql-user=root",
-            f"--mysql-password={ROOT_PW}"])
+    def prepare_dest():
+        _prepare_matrix_table(dst, case, dst_table)
+        _drop_matrix_chunks(dst, dst_table, CHUNK_DROP_START_DEST)
 
-    return await gather(prepare_from_table(), prepare_to_table())
+    return await gather(to_thread(prepare_source), to_thread(prepare_dest))
 
 async def _matrix_runner(cfg, case: MatrixCase):
     try:
@@ -718,17 +813,20 @@ async def _matrix_runner(cfg, case: MatrixCase):
         out.update(status="error", detail=str(exc)[-300:])
         return out
 
-async def _matrix_async(cfg, cases):
+async def _matrix_async(cases, fingerprints):
+    global CONCURRENCY
     sem = Semaphore(CONCURRENCY)
 
     async def one(case):
         async with sem:
-            return await _matrix_runner(cfg, case)
+            client_cfg = make_client_cfg(case, fingerprints[case.mysqls[1].name])
+            return await _matrix_runner(["-C", str(client_cfg)], case)
 
-    return await gather(*(_matrix_async(cfg, case) for case in cases))
+    return await gather(*(one(case) for case in cases))
 
 
 def _report_matrix(rows, wall_ms):
+    global CONCURRENCY
     print("\n== Matrix: rust-sync vs pt-table-sync ==")
     print(f"concurrency={CONCURRENCY} rows={MATRIX_ROWS} "
           f"wall={wall_ms:.0f} ms")
@@ -769,11 +867,9 @@ def _report_matrix(rows, wall_ms):
 @task
 async def prepare_workdir():
     WORK.mkdir(exist_ok=True)
-    if not DOCKER:
-        return
 
     # raw-tsv starts the `mysql` CLI on the host (client and server side).
-    # Docker mode exposes the databases via published ports, so provide a
+    # The Docker databases are exposed via published ports, so provide a
     # small mysql wrapper that forwards the scan into the containers.
     bin_dir = WORK / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -782,8 +878,7 @@ async def prepare_workdir():
 import subprocess, sys
 
 COMPOSE = {str(HERE / "docker-compose.yml")!r}
-SRC_PORT = {str(SRC_PORT)!r}
-DST_PORT = {str(DST_PORT)!r}
+SERVICES = { {str(m.port): m.name for m in MYSQL_INSTANCES.values()}!r}
 ROOT_PW = {ROOT_PW!r}
 
 args = sys.argv[1:]
@@ -817,7 +912,9 @@ while i < len(args):
     out.append(a)
     i += 1
 
-service = "mysql-dst" if port == DST_PORT else "mysql-src"
+service = SERVICES.get(port)
+if service is None:
+    sys.exit(f"unknown mysql port {{port}}")
 cmd = ["docker", "compose", "-f", COMPOSE, "exec", "-T", service, "mysql", "-uroot"]
 if ROOT_PW:
     cmd.append("-p" + ROOT_PW)
@@ -835,28 +932,21 @@ async def docker_db_up():
 async def ensure_dbs_up(attempts=20):
     for _ in range(attempts):
         try:
-            sql("src", "SELECT 1", quiet=True)
-            sql("dst", "SELECT 1", quiet=True)
+            for m in MYSQL_INSTANCES.values():
+                m.sql("SELECT 1", quiet=True)
             return True
         except SystemExit:
             time.sleep(2)
             print(".. waiting for dbs")
     assert False, "dbs not up"
 
-def make_server_cfg():
-    cfg = WORK / "config-server.json"
+def make_client_cfg(case, fingerprint):
+    src, dst = case.mysqls
+    src_table, dst_table = case.table_names()
+    cfg = WORK / f"config-client-{case.hash}.json"
     cfg.write_text(json.dumps({
-        "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": DST_PORT},
-        "listen": "127.0.0.1",
-        "port": MYSQL_SYNC_SERVER_PORT,
-    }, indent=2))
-    return cfg
-
-def make_client_cfg(fingerprint):
-    cfg = WORK / "config-client.json"
-    cfg.write_text(json.dumps({
-        "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": SRC_PORT},
-        "server": f"127.0.0.1:{MYSQL_SYNC_SERVER_PORT}",
+        "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": src.port},
+        "server": f"127.0.0.1:{dst.server_port}",
         "server_fingerprint": fingerprint,
         "allow_csv": True,
         "dump_strategies": ["select-stream"],
@@ -864,6 +954,9 @@ def make_client_cfg(fingerprint):
         "chunked": 3,
         "concurrent_processes": 3,
         "diff_threshold_percent": 10,
+        "database_table_mappings": {
+            f"{MATRIX_DB}.{src_table}": f"{MATRIX_DB}.{dst_table}",
+        },
     }, indent=2))
     return cfg
 
@@ -882,8 +975,9 @@ def update_json(path, **changes):
 
 def print_env():
     print("== Testumgebung ==")
-    print(f"  Modus: {'Docker (2 MySQL-8-Container)' if DOCKER else 'lokal (vorab gestartete Instanzen)'}")
-    print(f"  Quelle : 127.0.0.1:{SRC_PORT}\n  Ziel   : 127.0.0.1:{DST_PORT}\n  QUIC   : 127.0.0.1:{MYSQL_SYNC_SERVER_PORT}")
+    print("  Modus: Docker")
+    for m in MYSQL_INSTANCES.values():
+        print(f"  {m.name}: MySQL 127.0.0.1:{m.port}, QUIC 127.0.0.1:{m.server_port}")
 
 
 def start_server(server_cfg, log_name):
@@ -927,326 +1021,31 @@ def wait_tcp(port, attempts=50):
     return False
 
 
-class OldContext:
-    def __init__(self, server_cfg, client_cfg, server):
-        self.server_cfg = server_cfg
-        self.client_cfg = client_cfg
-        self.server = server
-        self.cfg = ["-C", str(client_cfg)]
-
-
-def test_force_schema(ctx):
-    print("== A: --force-schema ==")
-    ok = mysql_sync(ctx.cfg + ["--force-schema", "db1,db2"])
-    tbls = scalar("dst", "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='db1'")
-    ok &= step("Tabellen auf Ziel erstellt", tbls == "1")
-    return step("A: force-schema", ok)
-
-
-def test_initial_sync(ctx):
-    print("== B: --sync (differentiell) ==")
-    ok = mysql_sync(ctx.cfg + ["--sync", "db1.*,db2.*"])
-    for db, table in [("db1", "flights"), ("db2", "payloads")]:
-        s = scalar("src", f"SELECT COUNT(*) FROM {table}", db)
-        d = scalar("dst", f"SELECT COUNT(*) FROM {table}", db)
-        ok &= step(f"Count gleich: {db}.{table}", s == d, f"src={s} dst={d}")
-    cs = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,'')))+SUM(CRC32(label)) FROM payloads", "db2")
-    cd = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,'')))+SUM(CRC32(label)) FROM payloads", "db2")
-    ok &= step("BLOB-Prüfsummen identisch (binärsicher!)", cs == cd and cs != "0", f"{cs} vs {cd}")
-    fs = scalar("src", "SELECT SUM(CRC32(COALESCE(notes,'')))+SUM(CRC32(flight_no))+SUM(CRC32(origin)) FROM flights", "db1")
-    fd = scalar("dst", "SELECT SUM(CRC32(COALESCE(notes,'')))+SUM(CRC32(flight_no))+SUM(CRC32(origin)) FROM flights", "db1")
-    ok &= step("Inhalts-Prüfsummen identisch", fs == fd, f"{fs} vs {fd}")
-    return step("B: sync", ok)
-
-
-def test_check_identical(ctx):
-    print("== C: --check (select/dump/raw-binary/raw-tsv) 10 (identisch) ==")
-    ok = mysql_sync(ctx.cfg + ["--check", "10", "db1.*,db2.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--check-dump", "db1.*,db2.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--hash-raw-binary-row", "db1.*,db2.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "10", "--hash-raw-tsv", "db1.*"], expect_rc=0)
-    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-raw-tsv", "db2.payloads"])
-    ok &= step("raw-tsv lehnt binäre Spalten ab",
-               rc != 0 and "keine binären Spalten" in out, f"rc={rc}")
-    return step("C: check (select/dump/raw) → Exit 0", ok)
-
-
-def test_drift_check(ctx):
-    print("== D: Drift erzeugen + --check (select/dump/raw) 5 ==")
-    sql("dst", (HERE / "deploy/drift.sql").read_text())
-
-    def capture_check(extra=None, selector="db1.*,db2.*"):
-        return run_bin(ctx.cfg + ["--check", "5", *([extra] if extra else []), selector])
-
-    ok = True
-    for name, extra in (("--check", None), ("--check-dump", "--check-dump"),
-                        ("--hash-raw-binary-row", "--hash-raw-binary-row")):
-        rc, joined = capture_check(extra)
-        ok &= step(f"{name}: Exit 1", rc == 1, f"rc={rc}")
-        ok &= step(f"{name}: 49 Diffs in flights erkannt", "49" in joined)
-        ok &= step(f"{name}: 19 Diffs in payloads erkannt", "19" in joined)
-        ok &= step(f"{name}: Beispiel-IDs angegeben", "Beispiele:" in joined)
-    rc, joined = capture_check("--hash-raw-tsv", "db1.*")
-    ok &= step("--hash-raw-tsv: Exit 1", rc == 1, f"rc={rc}")
-    ok &= step("--hash-raw-tsv: 49 Diffs in flights erkannt", "49" in joined)
-    ok &= step("--hash-raw-tsv: Beispiel-IDs angegeben", "Beispiele:" in joined)
-    return step("D: check mit Drift (select/dump/raw)", ok)
-
-
-def test_drift_repair(ctx):
-    print("== E: --sync (nur Differenzen, raw-tsv + raw-binary) ==")
-    ok = mysql_sync(ctx.cfg + ["--sync", "db1.*", "--hash-raw-tsv"])
-    e1 = scalar("src", "SELECT SUM(CRC32(CONCAT(flight_no,'|',origin,'|',COALESCE(notes,'')))) FROM flights", "db1")
-    e2 = scalar("dst", "SELECT SUM(CRC32(CONCAT(flight_no,'|',origin,'|',COALESCE(notes,'')))) FROM flights", "db1")
-    ok &= step("raw-tsv: Flights-Prüfsummen nach Drift-Fix identisch", e1 == e2)
-    ok &= mysql_sync(ctx.cfg + ["--sync", "db1.*,db2.*", "--hash-raw-binary-row"])
-    e1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
-    e2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
-    ok &= step("raw-binary: BLOB-Prüfsummen nach Drift-Fix identisch", e1 == e2)
-    rc, _ = run_bin(ctx.cfg + ["--check", "10", "--hash-raw-binary-row",
-                              "db1.*,db2.*"])
-    ok &= step("Erneuter raw-binary --check → Exit 0", rc == 0)
-    rc, _ = run_bin(ctx.cfg + ["--check", "10", "--hash-raw-tsv", "db1.*"])
-    ok &= step("Erneuter raw-tsv --check → Exit 0", rc == 0)
-    return step("E: drift behoben (raw)", ok)
-
-
-def test_force_resync(ctx):
-    print("== F: --force --sync (Recreate + Vollkopie) ==")
-    ok = mysql_sync(ctx.cfg + ["--force", "--sync", "db2.payloads"])
-    f1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
-    f2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,'')))+SUM(CRC32(COALESCE(meta,''))) FROM payloads", "db2")
-    ok &= step("Nach Force-Recreate identisch (Binary!)", f1 == f2)
-    return step("F: force+sync", ok)
-
-
-def test_chunking(ctx):
-    print("== K: Chunking (Range + automatischer Mod-Fallback) ==")
-    range_tables = "db_range.char_keys,binary_keys,date_keys,composite_keys"
-    range_tsv_tables = "db_range.char_keys,date_keys,composite_keys"
-    ok = mysql_sync(ctx.cfg + ["--force-schema", range_tables])
-    ok &= step("Chunking-Tabellen auf Ziel erstellt",
-               scalar("dst", "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='db_range'") == "4")
-    ok &= mysql_sync(ctx.cfg + ["--sync", range_tables])
-    checks = (
-        ("CHAR-PK", "SELECT SUM(CRC32(CONCAT(code,'|',label,'|',n))) FROM char_keys"),
-        ("BINARY-PK", "SELECT SUM(CRC32(CONCAT(HEX(id),'|',label,'|',n))) FROM binary_keys"),
-        ("DATE-PK (Mod-Fallback)", "SELECT SUM(CRC32(CONCAT(d,'|',COALESCE(v,-1)))) FROM date_keys"),
-        ("Composite-PK (Mod-Fallback)", "SELECT SUM(CRC32(CONCAT(a,'|',b,'|',COALESCE(v,'')))) FROM composite_keys"),
-    )
-    for label, query in checks:
-        a, b = scalar("src", query, "db_range"), scalar("dst", query, "db_range")
-        ok &= step(f"{label} Inhalt identisch", a == b and a != "0", f"{a} vs {b}")
-
-    raw_checks = (
-        ("--hash-select", None, range_tables),
-        ("--hash-dump", "--hash-dump", range_tables),
-        ("--hash-raw-binary-row", "--hash-raw-binary-row", range_tables),
-        ("--hash-raw-tsv", "--hash-raw-tsv", range_tsv_tables),
-    )
-    for name, extra, selector in raw_checks:
-        ok &= mysql_sync(ctx.cfg + ["--check", "5", *([extra] if extra else []), selector],
-                         expect_rc=0, label=name)
-
-    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-raw-tsv", "db_range.binary_keys"])
-    ok &= step("Chunking raw-tsv lehnt BINARY-Spalten ab",
-               rc != 0 and "keine binären Spalten" in out, f"rc={rc}")
-
-    sql("dst", (HERE / "deploy/drift-range.sql").read_text())
-    sql("dst", (HERE / "deploy/drift-fallback.sql").read_text())
-
-    def capture_range_check(extra=None, selector=range_tables):
-        return run_bin(ctx.cfg + ["--check", "5", *([extra] if extra else []), selector])
-
-    for name, extra, selector in raw_checks:
-        rc, joined = capture_range_check(extra, selector)
-        ok &= step(f"Chunking {name}: Exit 1", rc == 1, f"rc={rc}")
-        expected_six = 2 if "binary_keys" in selector else 1
-        ok &= step(f"Chunking {name}: Range je 6 Diffs",
-                   joined.count("6 Zeilen differieren") >= expected_six)
-        ok &= step(f"Chunking {name}: Fallback je 3 Diffs",
-                   joined.count("3 Zeilen differieren") >= 2)
-
-    ok &= mysql_sync(ctx.cfg + ["--sync", range_tsv_tables, "--hash-raw-tsv"])
-    ok &= mysql_sync(ctx.cfg + ["--sync", range_tables, "--hash-raw-binary-row"])
-    for name, extra, selector in raw_checks:
-        ok &= mysql_sync(ctx.cfg + ["--check", "10", *([extra] if extra else []), selector],
-                         expect_rc=0, label=f"Chunking sync {name}")
-
-    for name, extra in (("select", None), ("dump", "--hash-dump"),
-                        ("raw-binary", "--hash-raw-binary-row"), ("raw-tsv", "--hash-raw-tsv")):
-        rc, out = run_bin(ctx.cfg + ["--check", "3", *([extra] if extra else []), "db_range.no_pk"])
-        ok &= step(f"Sync ohne Primary Key wird abgelehnt ({name})",
-                   rc != 0 and "keinen Primary Key" in out, f"rc={rc}")
-    return step("K: Chunking Range/Mod-Fallback", ok)
-
-
-def test_raw_profile_gate(ctx):
-    print("== L: raw profile gate ==")
-    orig_mode = scalar("dst", "SELECT @@GLOBAL.sql_mode")
-    sql("dst", "SET GLOBAL sql_mode='ANSI_QUOTES'")
-    ctx.server, fp_l, _ = restart_server(ctx.server, ctx.server_cfg, "config-server.json",
-                                         "server-profile-mismatch.log")
-    update_json(ctx.client_cfg, server_fingerprint=fp_l)
-    rc, out = run_bin(ctx.cfg + ["--check", "3", "--hash-raw-binary-row", "db1.*"])
-    ok = step("raw-binary lehnt abweichendes MySQL-Profil ab",
-              rc != 0 and "MySQL-Profil weicht ab" in out, f"rc={rc}")
-
-    escaped_mode = orig_mode.replace("'", "''")
-    sql("dst", f"SET GLOBAL sql_mode='{escaped_mode}'")
-    ctx.server, fp_l, _ = restart_server(ctx.server, ctx.server_cfg, "config-server.json",
-                                         "server-profile-restored.log")
-    update_json(ctx.client_cfg, server_fingerprint=fp_l)
-    ok &= mysql_sync(ctx.cfg + ["--check", "5", "--hash-raw-binary-row", "db1.*"], expect_rc=0)
-    ok &= mysql_sync(ctx.cfg + ["--check", "5", "--hash-raw-tsv", "db1.*"], expect_rc=0)
-    return step("L: raw profile gate", ok)
-
-
-def test_dump_mode(ctx):
-    print("== G: SQL-Dump-Modus (allow_csv=false) ==")
-    dump_cfg = json_variant(ctx.client_cfg, "config-client-dump.json", allow_csv=False)
-    ok = mysql_sync(["-C", str(dump_cfg), "--sync", "db2.payloads"])
-    g1 = scalar("src", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db2")
-    g2 = scalar("dst", "SELECT SUM(CRC32(COALESCE(data,''))) FROM payloads", "db2")
-    ok &= step("Dump-Modus binärsicher", g1 == g2)
-    return step("G: Dump-Modus", ok)
-
-
-def test_hash_algo(ctx):
-    print("== H: hash_algo ==")
-    bad_cfg = json_variant(ctx.client_cfg, "config-client-md5.json", hash_algo="md5")
-    rc, out = run_bin(["-C", str(bad_cfg), "--check", "3", "db1.*"])
-    ok = step("Mismatch (md5 vs xxh3) wird abgelehnt",
-              rc != 0 and "Hash-Algorithmus weicht ab" in out, f"rc={rc}")
-
-    ctx.server, fp_b, _ = restart_server(ctx.server, ctx.server_cfg,
-                                         "config-server-blake3.json", "server-blake3.log",
-                                         hash_algo="blake3")
-    blake_cfg = json_variant(ctx.client_cfg, "config-client-blake3.json",
-                             hash_algo="blake3", server_fingerprint=fp_b)
-    ok &= step("Server mit blake3 gestartet", bool(fp_b))
-    ok &= mysql_sync(["-C", str(blake_cfg), "--check", "5", "db1.*,db2.*"], expect_rc=0)
-    return step("H: hash_algo", ok)
-
-
-def test_zstd(ctx):
-    print("== I: zstd compression ==")
-    ctx.server, fp_z, _ = restart_server(ctx.server, ctx.server_cfg,
-                                         "config-server-zstd.json", "server-zstd.log",
-                                         compression="zstd", compression_level=3)
-    client_cfg_z = json_variant(ctx.client_cfg, "config-client-zstd.json",
-                                compression="zstd", compression_level=3,
-                                server_fingerprint=fp_z)
-    ok = step("Server mit zstd gestartet", bool(fp_z))
-    ok &= mysql_sync(["-C", str(client_cfg_z), "--check", "5", "db1.*,db2.*"], expect_rc=0)
-    return step("I: zstd compression", ok)
-
-
-def test_plaintext_tcp(ctx):
-    print("== J: plaintext TCP ==")
-    ctx.server, _, _ = restart_server(ctx.server, ctx.server_cfg,
-                                      "config-server-tcp.json", "server-tcp.log",
-                                      transport="tcp", allow_plaintext=True)
-    wait_tcp(MYSQL_SYNC_SERVER_PORT)
-    client_cfg_t = json_variant(ctx.client_cfg, "config-client-tcp.json",
-                                transport="tcp", allow_plaintext=True)
-    ok = mysql_sync(["-C", str(client_cfg_t), "--check", "5", "db1.*,db2.*"], expect_rc=0)
-    step("J: plaintext TCP", ok)
-
-    bad_tcp_cfg = json_variant(ctx.client_cfg, "config-client-tcp-bad.json", transport="tcp")
-    rc, out = run_bin(["-C", str(bad_tcp_cfg), "--check", "3", "db1.*"])
-    return step("tcp ohne allow_plaintext wird abgelehnt",
-                rc != 0 and "allow_plaintext" in out)
-
-
-async def down():
-    await compose("down", "--remove-orphans")
-
-async def clean():
-    await compose("down", "--remove-orphans", "--volumes")
-
-async def old():
-    ensure_binary()
-    prepare_workdir()
-    await ensure_dbs_up()
-    print_env()
-    before = len(results)
-
-    print("== Seed-Daten ==")
-    sql("src", "DROP DATABASE IF EXISTS db1")
-    sql("src", "DROP DATABASE IF EXISTS db2")
-    sql("src", (HERE / "deploy/seed.sql").read_text())
-    n_flights = scalar("src", "SELECT COUNT(*) FROM db1.flights")
-    n_payloads = scalar("src", "SELECT COUNT(*) FROM db2.payloads")
-    step("Seed geladen", n_flights == "5000" and n_payloads == "800",
-         f"flights={n_flights} payloads={n_payloads}")
-    n_nullbytes = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = '000000'", "db2")
-    n_badutf = scalar("src", "SELECT COUNT(*) FROM payloads WHERE HEX(data) = 'FFFE80C0AF'", "db2")
-    step("Binäre Giftdaten vorhanden (\\0\\0\\0, invalid UTF-8)",
-         int(n_nullbytes or 0) > 0 and int(n_badutf or 0) > 0,
-         f"nullbytes={n_nullbytes} badutf={n_badutf}")
-
-    print("== mysql-sync Server ==")
-    server_cfg = make_server_cfg()
-    server, fingerprint = start_server(server_cfg, "server.log")
-    if not step("Server gestartet + Fingerprint", bool(fingerprint),
-                fingerprint or "kein Fingerprint"):
-        stop_server(server)
-        raise SystemExit("Server-Fingerprint fehlt")
-
-    ctx = OldContext(server_cfg, make_client_cfg(fingerprint), server)
-    try:
-        test_force_schema(ctx)
-        test_initial_sync(ctx)
-        test_check_identical(ctx)
-        test_drift_check(ctx)
-        test_drift_repair(ctx)
-        test_force_resync(ctx)
-        test_chunking(ctx)
-        test_raw_profile_gate(ctx)
-        test_dump_mode(ctx)
-        test_hash_algo(ctx)
-        test_zstd(ctx)
-        test_plaintext_tcp(ctx)
-    finally:
-        stop_server(ctx.server)
-
-    failed = [r for r in results[before:] if not r[1]]
-    return not failed
-
-
 async def matrix():
     ensure_binary()
     prepare_workdir()
     await ensure_dbs_up()
     print_env()
 
-    server = None
-    try:
-        sql("src", f"CREATE DATABASE IF NOT EXISTS {MATRIX_DB} CHARACTER SET utf8mb4", quiet=True)
-        sql("dst", f"CREATE DATABASE IF NOT EXISTS {MATRIX_DB} CHARACTER SET utf8mb4", quiet=True)
+    for m in MYSQL_INSTANCES.values():
+        m.sql(f"CREATE DATABASE IF NOT EXISTS {MATRIX_DB} CHARACTER SET utf8mb4", quiet=True)
 
-        server_cfg = make_server_cfg()
-        server, fingerprint = start_server(server_cfg, "server-matrix.log")
-        if not step("Matrix: Server gestartet + Fingerprint", bool(fingerprint),
-                    fingerprint or "kein Fingerprint"):
-            return False
-
-        client_cfg = make_client_cfg(fingerprint)
-        cfg = ["-C", str(client_cfg)]
-        cases = matrix_cases()
+    cases = matrix_cases()
+    async with AsyncExitStack() as stack:
+        fingerprints = {}
+        for m in MYSQL_INSTANCES.values():
+            fingerprints[m.name] = await stack.enter_async_context(m.server_running())
         started = time.perf_counter()
-        rows = asyncio.run(_matrix_async(cfg, cases))
+        rows = await _matrix_async(cases, fingerprints)
         wall_ms = (time.perf_counter() - started) * 1000.0
-        _report_matrix(rows, wall_ms)
-        bad = [r for r in rows if r["status"] not in ("ok", "reject", "skip")]
-        skipped = [r for r in rows if r["status"] == "skip"]
-        return step("Matrix: alle Fälle", not bad,
-                    f"{len(rows)-len(bad)-len(skipped)} ok, {len(skipped)} skip, {len(bad)} Fehler")
-    finally:
-        stop_server(server)
+    _report_matrix(rows, wall_ms)
+    bad = [r for r in rows if r["status"] not in ("ok", "reject", "skip")]
+    skipped = [r for r in rows if r["status"] == "skip"]
+    return step("Matrix: alle Fälle", not bad,
+                f"{len(rows)-len(bad)-len(skipped)} ok, {len(skipped)} skip, {len(bad)} Fehler")
 
 async def compose(*args):
+    write_docker_compose()
     cmd = ["docker", "compose", "-f", str(HERE / "docker-compose.yml"), *args]
     proc = await asyncio.create_subprocess_exec(*cmd)
     rc = await proc.wait()
@@ -1257,35 +1056,17 @@ async def up():
     prepare_workdir()
     await docker_db_up()
 
-async def write_docker_compose():
-    services = {}
-    for m in MYSQL_INSTANCES.values():
-        environment = {"MYSQL_ROOT_PASSWORD": ROOT_PW}
-        if role == "src":
-            environment["MYSQL_DATABASE"] = "db1"
-        services[m['name']] = {
-            "image": f"mysql:{m.version}",
-            "container_name": f"mysqlsync-{role}",
-            "environment": environment,
-            "command": "--character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1",
-            "ports": [f"${{MSYNC_{role.upper()}_PORT:-{m.port}}}:3306"],
-            "volumes": ["./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro"] if role == "src" else [],
-            "healthcheck": {
-                "test": ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", f"-p{ROOT_PW}"],
-                "interval": "3s",
-                "timeout": "3s",
-                "retries": 30,
-            },
-        }
-    p = Path("docker-compose.yml")
-    print(f"services {services}")
-    p.write_text(yaml.safe_dump({"services": services}, sort_keys=False))
-    print(f"written {str(p)}")
+
+async def down():
+    await compose("down", "--remove-orphans")
+
+
+async def clean():
+    await compose("down", "--remove-orphans", "--volumes")
+
 
 ACTIONS = {
-    "write_docker_compose": write_docker_compose,
     "up": up,
-    "old": old,
     "matrix": matrix,
     "down": down,
     "clean": clean,
@@ -1298,9 +1079,9 @@ async def main():
 
     # --concurrency[N]
     c = "--concurrency"
-    if args[0].startswith(c):
-        CONCURRENCY = int(args[0][len(c):])
-        args = sys.argv[1:]
+    if args and args[0].startswith(c):
+        CONCURRENCY = int(args[0][len(c):]) or 1
+        args = args[1:]
 
     print("\n\n")
     print(f"CONCURRENCY {CONCURRENCY}")
@@ -1310,8 +1091,8 @@ async def main():
     with with_logging(header = header):
         print(f"CONCURRENCY={CONCURRENCY or 'MISSING'} matrix_jobs={CONCURRENCY}")
 
-        # python test.py [--concurrencyN] up old matrix down [clean]
-        actions = args or ["up", "old", "matrix", "down"]
+        # python test.py [--concurrencyN] up matrix down [clean]
+        actions = args or ["up", "matrix", "down"]
         for action in actions:
             print(f"==> STARTING ACTION {action}")
             assert action in ACTIONS
