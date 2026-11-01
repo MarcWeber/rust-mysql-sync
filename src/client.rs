@@ -23,6 +23,7 @@ pub struct ClientArgs {
     pub hash_via_select: bool,
     pub hash_via_dump: bool,
     pub hash_via_raw_binary: bool,
+    pub hash_via_raw_binary_vec: bool,
     pub hash_via_raw_tsv: bool,
 }
 
@@ -104,6 +105,8 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
 
     let hash_via = if args.hash_via_raw_tsv {
         HashVia::RawTsv
+    } else if args.hash_via_raw_binary_vec {
+        HashVia::RawBinaryVec
     } else if args.hash_via_raw_binary {
         HashVia::RawBinary
     } else if args.hash_via_dump {

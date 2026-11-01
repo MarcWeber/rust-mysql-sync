@@ -49,9 +49,9 @@ Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`, `db1,db2.t1,t2`
 | `--sync [SEL]` | Differential sync (INSERT/UPDATE/DELETE) |
 | `--check N [SEL]` | Diff report + N sample IDs only; no writes; shows timings thus could be seen as dry-run option to predict the time to diff |
 
-| `--benchmark [SEL]` | same as chuck but run locally only to get an idea how fast it is to walk all rows which roughly is the time it will take for a final sync |
--> how is it different from check? If you run check you'll get the same
-basically with network latency
+| `--benchmark [SEL]` | same as check but no need for server basically. For testing how fast it is to build chunked hashes on tables
+
+| `--testing-drop-chunks S [SEL]` | from chunks S, S+1, S+2, S+3 drop all, first, last, random. It must be tetsed that missing chunks source/dest work, this implements dropping them
 
 | Option | Meaning |
 |---|---|
@@ -66,6 +66,7 @@ basically with network latency
 
 | `--no-progress` | No progress bars (cron/CI) |
 | `--log-level LVL` | `error|warn|info|debug|trace` |
+
 
 ## HASHING — RECOMMENDATION
 

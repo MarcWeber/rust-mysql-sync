@@ -30,14 +30,16 @@ pub enum HashVia {
     Select,
     Dump,
     RawBinary,
+    RawBinaryVec,
     RawTsv,
 }
 
 impl HashVia {
-    pub const ALL: [HashVia; 4] = [
+    pub const ALL: [HashVia; 5] = [
         HashVia::Select,
         HashVia::Dump,
         HashVia::RawBinary,
+        HashVia::RawBinaryVec,
         HashVia::RawTsv,
     ];
 
@@ -46,12 +48,16 @@ impl HashVia {
             HashVia::Select => "select",
             HashVia::Dump => "dump",
             HashVia::RawBinary => "raw-binary",
+            HashVia::RawBinaryVec => "raw-binary-vec",
             HashVia::RawTsv => "raw-tsv",
         }
     }
 
     fn is_raw(self) -> bool {
-        matches!(self, HashVia::RawBinary | HashVia::RawTsv)
+        matches!(
+            self,
+            HashVia::RawBinary | HashVia::RawBinaryVec | HashVia::RawTsv
+        )
     }
 }
 
@@ -60,6 +66,7 @@ fn hash_via_source(via: HashVia) -> Option<String> {
         HashVia::Select => None,
         HashVia::Dump => Some("dump".to_string()),
         HashVia::RawBinary => Some("raw_binary".to_string()),
+        HashVia::RawBinaryVec => Some("raw_binary_vec".to_string()),
         HashVia::RawTsv => Some("raw_tsv".to_string()),
     }
 }
@@ -134,6 +141,20 @@ async fn run_local_chunk_stream(
         }
         HashVia::RawBinary => {
             hash_binary::stream_chunk_hashes(
+                tx,
+                &mut conn,
+                &task.local_db,
+                &task.local_table,
+                pks,
+                &pk_indexes,
+                mode,
+                cfg.chunked,
+                cfg.hash_algo(),
+            )
+            .await?;
+        }
+        HashVia::RawBinaryVec => {
+            hash_binary::stream_chunk_hashes_vec(
                 tx,
                 &mut conn,
                 &task.local_db,
@@ -268,9 +289,7 @@ async fn start_chunk_stream(
     })
 }
 
-async fn next_chunk(
-    rx: &mut mpsc::Receiver<hash::ChunkHashEvent>,
-) -> Result<Option<ChunkHash>> {
+async fn next_chunk(rx: &mut mpsc::Receiver<hash::ChunkHashEvent>) -> Result<Option<ChunkHash>> {
     match rx.recv().await {
         None => Ok(None),
         Some(hash::ChunkHashEvent::Item((bucket, count, hash))) => Ok(Some(ChunkHash {
@@ -347,7 +366,11 @@ pub async fn benchmark_table(
     let mut conn = mysqlutil::session_conn(pool).await?;
     let pks = mysqlutil::pk_columns(&mut conn, &task.local_db, &task.local_table).await?;
     if pks.is_empty() {
-        bail!("{}.{} hat keinen Primary Key", task.local_db, task.local_table);
+        bail!(
+            "{}.{} hat keinen Primary Key",
+            task.local_db,
+            task.local_table
+        );
     }
     let mode = hash::chunk_mode_for_pk(&pks);
     let pk_names: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
@@ -518,7 +541,12 @@ async fn run_inner(
     let raw_profile = if hash_via.is_raw() {
         let local_profile = mysqlutil::mysql_profile(&mut local_conn).await?;
         let remote_profile = fetch_server_profile(&mut send, &mut recv, &f).await?;
-        if let Some(diff) = local_profile.difference(&remote_profile) {
+        let diff = if hash_via == HashVia::RawBinaryVec {
+            local_profile.difference_ignoring_version(&remote_profile)
+        } else {
+            local_profile.difference(&remote_profile)
+        };
+        if let Some(diff) = diff {
             bail!(
                 "{label}: Raw-Hashing abgelehnt — MySQL-Profil weicht ab: {diff}. \
                  Nutze --hash-select oder --hash-dump."
@@ -1094,6 +1122,37 @@ async fn compute_row_hashes_raw_binary(
     Ok(items.into_iter().map(|r| (r.pk, r.hash)).collect())
 }
 
+async fn compute_row_hashes_raw_binary_vec(
+    conn: &mut Conn,
+    task: &TableTask,
+    pks: &[PkCol],
+    pk_names: &[String],
+    mode: ChunkMode,
+    chunked: u32,
+    buckets: &[String],
+    algo: hash::HashAlgo,
+    bar: Option<&crate::progress::TableBar>,
+) -> Result<HashMap<String, String>> {
+    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
+    let pk_indexes = pk_indexes_for(&names, pk_names)?;
+    let items = hash_binary::row_hashes_vec(
+        conn,
+        &task.local_db,
+        &task.local_table,
+        pks,
+        &pk_indexes,
+        mode,
+        chunked,
+        buckets,
+        algo,
+    )
+    .await?;
+    if let Some(b) = bar {
+        b.inc(items.len() as u64);
+    }
+    Ok(items.into_iter().map(|r| (r.pk, r.hash)).collect())
+}
+
 async fn compute_chunk_hashes_raw_tsv(
     cfg: &Config,
     conn: &mut Conn,
@@ -1207,6 +1266,20 @@ async fn row_diff_for_buckets(
         }
         HashVia::RawBinary => {
             compute_row_hashes_raw_binary(
+                local_conn,
+                task,
+                pks,
+                &pk_names,
+                mode,
+                chunked,
+                buckets,
+                cfg.hash_algo(),
+                Some(bar),
+            )
+            .await?
+        }
+        HashVia::RawBinaryVec => {
+            compute_row_hashes_raw_binary_vec(
                 local_conn,
                 task,
                 pks,

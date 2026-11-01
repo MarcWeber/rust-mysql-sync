@@ -48,7 +48,11 @@ Matrix (Aktion matrix):
 Exit 0 = alle aufgerufenen Aktionen bestanden.
 """
 
-import asyncio
+from typing import TypeVar, Generic, Union, Callable, Any, IO, cast, Protocol, overload, Awaitable, Callable, Iterable, Optional, List, Dict, Literal, TypedDict, Unpack, Concatenate, Tuple, NotRequired
+from dataclasses import dataclass
+from dataclasses_json import dataclass_json
+from itertools import product
+from random import random
 import hashlib
 import json
 import os
@@ -60,40 +64,45 @@ import sys
 import time
 import yaml
 import traceback
+import sys
+from u_systeminfo import system_info
+from u_dict import DictFactory
 from datetime import datetime
 from pathlib import Path
 from yachalk import chalk
-from asyncio import create_task, to_thread, sleep, timeout, timeout_at, Semaphore, Future
+from asyncio import create_task, to_thread, sleep, timeout, timeout_at, Semaphore, Future, gather
 import asyncio
+
+from collections import defaultdict
 
 from u_redirect_logging import with_logging
 from u_asyncio import run_show_out_tail_on_error, task
 
-START_PORT = 7012
+TEST_TEXT = "A\nB\n\\\BinärmüllÄß"
 
-DOCKER_MYSQL_INSTANCES = [
-    {"name": "mysql80", "version": 8.0, "port": 7012},
-    {"name": "mysql97", "version": 9.7, "port": 7013}
+# START_PORT = 7012
+MYSQL_INSTANCES_CONFIG = [
+    # name version port
+    ["mysql80", "8.0", 7012],
+    ["mysql97", "9.7", 7013]
 ]
 
-HERE = Path(__file__).resolve().parent
-WORK = HERE / ".test-run"
+TABLE_SCHEMA_CASES = {
+    # number of primary keys
 
-def _cargo_target_dir():
-    override = os.environ.get("CARGO_TARGET_DIR")
-    if override:
-        path = Path(override).expanduser()
-        return path if path.is_absolute() else HERE / path
-    if shutil.which("cargo"):
-        try:
-            meta = subprocess.check_output(
-                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-                cwd=HERE, text=True, stderr=subprocess.DEVNULL,
-            )
-            return Path(json.loads(meta)["target_directory"])
-        except (OSError, subprocess.CalledProcessError, KeyError, ValueError):
-            pass
-    return HERE / "target"
+    # these cases should represent all primary key cases
+    # ond the left side and all potential data cases on the right side
+
+    # single primary key types
+    "TC101": "1:int(10):varchar(50)",
+    "TC102": "1:varchar(10):int(10)",
+    "TC103": "1:blob:varchar(10)",
+    "TC104": "1:int(10):varchar(10):int(10):blob:float(2):float(0):text:currency", # all fields
+
+    # primary key tuples
+    "TC201": "2:int(10):varchar(10):int(10):blob:float(2):float(0)",
+    "TC202": "2:varchar(10):int(10):int(10):blob:float(2):float(0)"
+}
 
 
 def _default_bin():
@@ -119,6 +128,185 @@ results = []
 CONCURRENCY = 1
 
 LOG_PATH = Path(os.environ.get("MSYNC_LOG") or (HERE / "test.log"))
+
+
+@dataclass()
+class TableSchemaField:
+    type: str
+    def sql_value_from_n(self, n):
+        global TEST_TEXT
+        t = self.type
+        if t.startswith("int"):
+            return n
+        if t.startswith("varchar"):
+            return 'CONCAT("LINE", n)'
+        if t.startswith("text"):
+            t = f"{TEST_TEXT} " * 150
+            return f"CONCAT(\"{t}\", n)"
+        if t.startswith("blob"):
+            return 'BIN(n)'
+        if t.startswith("float"):
+            return '(n / 10)'
+        if t.startswith("currency"):
+            return '(n / 10)'
+        assert False
+
+    def drop_recreate_sql(self, name, row_count):
+        """
+        assume all fields are called a,b,c,..
+
+        DROP {name} IF EXISTS
+        CREATE {name}
+
+        INSERT INTO {name} (flight_no, origin, dest, price, seats, notes, created)
+        SELECT
+          CONCAT('SKW', LPAD(n, 5, '0')),
+          CONCAT('City-', n % 97, CASE WHEN n % 13 = 0 THEN '''s End' ELSE '' END),
+          CONCAT('Dest-', (n * 7) % 89),
+          CASE WHEN n % 11 = 0 THEN NULL ELSE ROUND(19.99 + (n % 400) * 1.37, 2) END,
+          60 + (n % 240),
+          CASE
+            WHEN n % 23 = 0 THEN NULL
+            WHEN n % 23 = 1 THEN CONCAT('Zeile ', n, '\tMit\tTabs')
+            WHEN n % 23 = 2 THEN CONCAT('Zeile ', n, '\nMit\nNewlines')
+            WHEN n % 23 = 3 THEN CONCAT('Backslash ', n, '\\')
+            ELSE CONCAT('Notiz äöüß Nr. ', n)
+          END,
+          DATE_ADD('2024-01-01 00:00:00', INTERVAL n MINUTE)
+        FROM (
+          SELECT a.N + b.N * 10 + c.N * 100 + d.N * 1000 + 1 AS n
+          FROM (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+               (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+               (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c,
+               (SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+                UNION SELECT 5) d
+        ) nums
+        WHERE n <= 5000;
+
+        """
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        cols = ", ".join(letters[:len(self)])
+        pk_cols = ", ".join(letters[:self.primary_key_fields])
+        values = ",\n  ".join(self[i].sql_value_from_n("n") for i in range(len(self)))
+        # digit-series generator: n ranges 1 .. row_count
+        digits = max(1, (row_count // 10 + 1).bit_length())  # enough single-digit factors
+        factors = ",\n               ".join(
+            "(SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4"
+            " UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9)"
+            f" {letters[i]}"
+            for i in range(digits)
+        )
+        terms = " + ".join(f"{letters[i]} .N * {10 ** i}" for i in range(digits - 1)) + f" + {letters[-1]}.N + 1"
+        return [f"DROP TABLE IF EXISTS `{name}`",
+f"""
+CREATE TABLE `{name}` ({cols}) ENGINE=InnoDB;
+INSERT INTO `{name}` ({cols})
+SELECT
+  {values}
+FROM (
+  SELECT {terms} AS n
+  FROM {factors}
+) nums
+WHERE n <= {row_count};"""]
+
+
+@dataclass()
+class TableSchema:
+    primary_key_fields: int
+    fields: list[TableSchemaField]
+
+    @staticmethod
+    def from_str(s):
+        x = s.split(':')
+        pkf = int(x[0])
+        return TableSchema(pkf, x[1:])
+
+TABLE_SCHEMAS = {k: TableSchema.from_str(s) for k, s in TABLE_SCHEMA_CASES.items()}
+
+# @dataclass()
+# # slots=True => packed
+# class MFieldTypeInt:
+#     len: Int
+# class MFieldTypeVarchar:
+#     len: Int
+# class MFieldTypeBinary:
+#     len: Int
+# class MFieldTypeDateTime:
+#     len: Int
+
+# @dataclass()
+# # slots=True => packed
+# class MField:
+#     name: str
+#     type: MFieldType
+#     nullable: bool = False
+
+@dataclass(frozen=True)
+class Mysql:
+    name: str
+    version: str
+    port: int
+
+    async def sql(self, *queries, database=None, check=True, quiet=False):
+        """SQL auf Quelle (which='src') oder Ziel (which='dst') ausführen."""
+        if DOCKER:
+
+            cmd = ["docker", "compose", "-f", HERE / "docker-compose.yml", "exec", "-T", self.name,
+                   "mysql", "-uroot", f"-p{ROOT_PW}"]
+        else:
+            cli = os.environ.get("MSYNC_MYSQL_CLI", "mysql")
+            cmd = [cli, "--no-defaults", "-h", "127.0.0.1",
+                   "-P", self.port, "-uroot"]
+            if ROOT_PW:
+                cmd.append(f"-p{ROOT_PW}")
+        if database:
+            cmd.append(database)
+        r = None
+        for query in queries:
+            r = run(cmd + ["-e", query], check=check, quiet=quiet)
+        assert r
+        return r.stdout
+
+
+    def scalar(self, query, database=None, quiet=False):
+        out = self.sql(query, database = database, quiet=quiet).strip().splitlines()
+        return out[-1] if out else None
+
+    def _pt_dsn(self, case, table):
+        parts = [
+            "h=127.0.0.1",
+            f"P={case.port}",
+            "u=root",
+            f"D={MATRIX_DB}",
+            f"t={table}",
+        ]
+        if ROOT_PW:
+            parts.append(f"p={ROOT_PW}")
+        return ",".join(parts)
+
+MYSQL_INSTANCES = {a[0]: Mysql(*a) for a in MYSQL_INSTANCES_CONFIG}
+
+HERE = Path(__file__).resolve().parent
+WORK = HERE / ".test-run"
+
+def _cargo_target_dir():
+    override = os.environ.get("CARGO_TARGET_DIR")
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_absolute() else HERE / path
+    if shutil.which("cargo"):
+        try:
+            meta = subprocess.check_output(
+                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                cwd=HERE, text=True, stderr=subprocess.DEVNULL,
+            )
+            return Path(json.loads(meta)["target_directory"])
+        except (OSError, subprocess.CalledProcessError, KeyError, ValueError):
+            pass
+    return HERE / "target"
 
 
 def step(name, ok, detail=""):
@@ -179,28 +367,6 @@ def ensure_binary():
     if not BIN.exists():
         raise SystemExit(f"Binary auch nach dem Build nicht gefunden: {BIN}")
 
-def sql(which, query, database=None, check=True, quiet=False):
-    """SQL auf Quelle (which='src') oder Ziel (which='dst') ausführen."""
-    if DOCKER:
-        svc = "mysql-src" if which == "src" else "mysql-dst"
-        cmd = ["docker", "compose", "-f", HERE / "docker-compose.yml", "exec", "-T", svc,
-               "mysql", "-uroot", f"-p{ROOT_PW}"]
-    else:
-        cli = os.environ.get("MSYNC_MYSQL_CLI", "mysql")
-        cmd = [cli, "--no-defaults", "-h", "127.0.0.1",
-               "-P", str(SRC_PORT if which == "src" else DST_PORT), "-uroot"]
-        if ROOT_PW:
-            cmd.append(f"-p{ROOT_PW}")
-    if database:
-        cmd.append(database)
-    r = run(cmd + ["-e", query], check=check, quiet=quiet)
-    return r.stdout
-
-
-def scalar(which, query, database=None, quiet=False):
-    out = sql(which, query, database, quiet=quiet).strip().splitlines()
-    return out[-1] if out else None
-
 
 def mysql_sync(args, expect_rc=0, label=""):
     r = subprocess.run([str(BIN), *args], text=True, capture_output=True, cwd=WORK)
@@ -218,7 +384,16 @@ def run_bin(args):
 
 
 MATRIX_DB = "db_matrix"
-MATRIX_ROWS = 100000
+MATRIX_ROWS = 10000
+
+if random() > 0.5:
+    CHUNK_DROP_START_SOURCE = 0
+    CHUNK_DROP_START_DEST   = 4
+else:
+    CHUNK_DROP_START_SOURCE = 4
+    CHUNK_DROP_START_DEST   = 0
+
+CHUNK_SIZE = 2
 MATRIX_JOBS = 4
 MATRIX_TIMEOUT = 300
 MATRIX_DRIFT_OFFSET = MATRIX_ROWS
@@ -232,49 +407,82 @@ RUST_MODES = (
     ("raw-tsv", "--hash-raw-tsv"),
 )
 
-def _matrix_case(tool, key, binary, mode=None):
-    dims = {"tool": tool, "key": key, "binary": binary, "mode": mode}
-    payload = json.dumps(dims, sort_keys=True, separators=(",", ":"))
-    table = "mx_" + hashlib.sha256(payload.encode()).hexdigest()[:16]
-    return {**dims, "table": table}
+Tool = Literal['pt', 'rust'] # rust is rust-mysql-sync
 
+@dataclass()
+class Mysqls:
+    mysqls: str
+    def versions(self):
+        return self.mysqls.split(':')
 
-def matrix_cases():
+@dataclass()
+class MatrixCasePTOpts:
+    pass
+
+@dataclass()
+class MatrixCaseRustOpts:
+    mode: str
+
+# @dataclass()
+# class PrimaryKeyTypes:
+#     """ primary keys """
+#     types: str
+
+#     def kind(self):
+#         return self.types.split("-")[0]
+
+#     def types(self):
+#         """(id_type, id2_type) — id2_type ist None ohne zusammengesetzten Key."""
+#         id_type = "BIGINT" if _key_kind(self.types) == "int" else "VARCHAR(32)"
+#         if not _is_tuple(self.types):
+#             return id_type, None
+#         return id_type, "VARCHAR(32)" if _key_kind(self.types) == "str" else "INT"
+
+#     def is_tuple(self):
+#         return self.types.endswith("-tuple")
+
+Binary = Tuple["binary", "no_binary"]
+
+@dataclass_json
+@dataclass()
+class MatrixCase:
+    table_schema_case: TableSchema # key of TABLE_SCHEMA_CASES
+    binary: Binary
+    mysqls: Tuple[Mysql, Mysql] # from to mysqls connections
+    tool_opts: MatrixCasePTOpts | MatrixCaseRustOpts
+
+    def __post_init__(self):
+        self.hash = hashlib.sha256(self.to_json().encode()).hexdigest()[:16]
+
+    def table_names(self):
+        """ returns from and to table names where from table name can be shared """
+        x = f"{CHUNK_SIZE}_{MATRIX_ROWS}_{self.binary}"
+        f = f"src_{x}"
+        t = f"dst_{x}_{self.hash}"
+        return f, t
+
+async def matrix_cases():
     cases = []
     # different mysql versions !
     # the binary-via-
-    for key, binary, mysql_versions in product(
+    for table_schema_case, binary, mysqls in product(
            # primary key  variations
-           ("int", "str", "int-tuple", "str-tuple", "mixed-tuple"),
+
+            TABLE_SCHEMA_CASES.keys(),
 
            # with or without binary
-           ("none", "bin"),
+           ("no_binary", "bin"),
 
            # mysql versions differ
            # --hash-raw-binary-row -> expected to fail if mysql versions differ
            # --hash-raw-binary-row-vec -> expected to always work
            ("8.0:8.0", "8.0:9.7")
         ):
-        cases.append(_matrix_case("pt", key, binary))
+        common = { "table_schema_case": table_schema_case, "binary": binary, "mysqls": Mysqls(mysqls) }
+        cases.append(MatrixCase({**common, "tool_opts": MatrixCasePTOpts()}))
         for mode, _ in RUST_MODES:
-            cases.append(_matrix_case("rust", key, binary, mode))
+            cases.append(MatrixCase({**common, "tool_opts": MatrixCaseRustOpts(mode)}))
     return cases
-
-def _key_kind(case):
-    return case["key"].split("-")[0]
-
-
-def _is_tuple(case):
-    return case["key"].endswith("-tuple")
-
-
-def _key_types(case):
-    """(id_type, id2_type) — id2_type ist None ohne zusammengesetzten Key."""
-    id_type = "BIGINT" if _key_kind(case) == "int" else "VARCHAR(32)"
-    if not _is_tuple(case):
-        return id_type, None
-    return id_type, "VARCHAR(32)" if _key_kind(case) == "str" else "INT"
-
 
 def _matrix_ddl(case):
     key, id2_type = _key_types(case)
@@ -434,19 +642,6 @@ def _run_rust_case(cfg, case):
     return out
 
 
-def _pt_dsn(which, case):
-    parts = [
-        "h=127.0.0.1",
-        f"P={SRC_PORT if which == 'src' else DST_PORT}",
-        "u=root",
-        f"D={MATRIX_DB}",
-        f"t={case['table']}",
-    ]
-    if ROOT_PW:
-        parts.append(f"p={ROOT_PW}")
-    return ",".join(parts)
-
-
 def _run_pt_case(cfg, case):
     # pt-table-sync exit 2 means "Differences found" (also after a successful
     # --execute), 0 means "Nothing to do", 1 means error. Verify the outcome
@@ -484,25 +679,53 @@ def _run_pt_case(cfg, case):
                detail="" if ok else f"rust --check rc={rc}: {out_text[-200:]} | {a} != {b}")
     return out
 
+LOCK_FROM_TABLES = defaultdict(lambda: Semaphore())
 
-def _matrix_runner(cfg, case):
+async def prepare_tables(case: MatrixCase):
+    f,t = case.table_names()
+    F,T = case.mysqls
+
+    async def prepare_from_table():
+        async with LOCK_FROM_TABLES[f]:
+            try:
+                await F.sql(f"SELECT count(*) FROM {f}")
+            except Exception as e:
+                # doens't exist yet create
+                await F.sql(case.table_schema_case)
+                # run on db_matrix.{f}
+                run([str(BIN), f"--testing-drop-chunks-source={CHUNK_DROP_START_SOURCE}",
+                     "--mysql-host=127.0.0.1", f"--mysql-port={F.port}", "--mysql-user=root",
+                    f"--mysql-password={ROOT_PW}"])
+
+    async def prepare_to_table():
+        await T.sql(case.table_schema_case)
+        # run on db_matrix.{t}
+        run([str(BIN), f"--testing-drop-chunks-source={CHUNK_DROP_START_DEST}",
+             "--mysql-host=127.0.0.1", f"--mysql-port={T.port}", "--mysql-user=root",
+            f"--mysql-password={ROOT_PW}"])
+
+    return await gather(prepare_from_table(), prepare_to_table())
+
+async def _matrix_runner(cfg, case: MatrixCase):
     try:
-        if case["tool"] == "pt":
+        src, dst = await prepare_tables(case)
+        if case.tool_opts is MatrixCasePTOpts:
             return _run_pt_case(cfg, case)
-        return _run_rust_case(cfg, case)
+        else:
+            return _run_rust_case(cfg, case)
     except Exception as exc:
         out = _matrix_base(case)
         out.update(status="error", detail=str(exc)[-300:])
         return out
 
 async def _matrix_async(cfg, cases):
-    sem = asyncio.Semaphore(CONCURRENCY)
+    sem = Semaphore(CONCURRENCY)
 
     async def one(case):
         async with sem:
-            return await asyncio.to_thread(_matrix_runner, cfg, case)
+            return await _matrix_runner(cfg, case)
 
-    return await asyncio.gather(*(one(case) for case in cases))
+    return await gather(*(_matrix_async(cfg, case) for case in cases))
 
 
 def _report_matrix(rows, wall_ms):
@@ -1024,38 +1247,40 @@ async def matrix():
         stop_server(server)
 
 async def compose(*args):
-    await run_show_out_tail_on_error(["docker", "compose", "-f", HERE / "docker-compose.yml", *args])
+    cmd = ["docker", "compose", "-f", str(HERE / "docker-compose.yml"), *args]
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    rc = await proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 async def up():
     prepare_workdir()
     await docker_db_up()
 
 async def write_docker_compose():
-    def kv(name, version, port):
-        y = f"""
-        {name}:
-            image: mysql:{version}
-            container_name: mysqlsync-src
-            environment:
-              MYSQL_ROOT_PASSWORD: syncroot
-              MYSQL_DATABASE: db1
-            command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
-            ports:
-              - "${{MSYNC_SRC_PORT:-{port}}}:3306"
-            volumes:
-              - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
-            healthcheck:
-              test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
-              interval: 3s
-              timeout: 3s
-              retries: 30
-        """
-        return yaml.parse(y)
-
-    dcy = {}
-    for m in DOCKER_MYSQL_INSTANCES:
-        dcy = {**docker, **kv(m["name"], m["version"], m['port'])}
-    Path("docker-compose.yml").write_text(yaml.dumps(dcy))
+    services = {}
+    for m in MYSQL_INSTANCES.values():
+        environment = {"MYSQL_ROOT_PASSWORD": ROOT_PW}
+        if role == "src":
+            environment["MYSQL_DATABASE"] = "db1"
+        services[m['name']] = {
+            "image": f"mysql:{m.version}",
+            "container_name": f"mysqlsync-{role}",
+            "environment": environment,
+            "command": "--character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1",
+            "ports": [f"${{MSYNC_{role.upper()}_PORT:-{m.port}}}:3306"],
+            "volumes": ["./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro"] if role == "src" else [],
+            "healthcheck": {
+                "test": ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", f"-p{ROOT_PW}"],
+                "interval": "3s",
+                "timeout": "3s",
+                "retries": 30,
+            },
+        }
+    p = Path("docker-compose.yml")
+    print(f"services {services}")
+    p.write_text(yaml.safe_dump({"services": services}, sort_keys=False))
+    print(f"written {str(p)}")
 
 ACTIONS = {
     "write_docker_compose": write_docker_compose,
@@ -1066,47 +1291,29 @@ ACTIONS = {
     "clean": clean,
 }
 
-def cpu_type():
-    """
-    cleanup?
-    """
-    if sys.platform == "darwin":
-        try:
-            return subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                text=True, stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            pass
-    try:
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
-            if line.startswith("model name"):
-                return line.split(":", 1)[1].strip()
-    except OSError:
-        pass
-    return platform.processor() or platform.machine() or "unknown"
-
-
 async def main():
     global CONCURRENCY
     args = sys.argv[1:]
+    print(args)
 
     # --concurrency[N]
     c = "--concurrency"
     if args[0].startswith(c):
         CONCURRENCY = int(args[0][len(c):])
         args = sys.argv[1:]
+
     print("\n\n")
     print(f"CONCURRENCY {CONCURRENCY}")
 
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"===== cpu={cpu_type()} | concurrency={CONCURRENCY or 'MISSING'} | "
+    header = f"===== cpu={system_info()} | concurrency={CONCURRENCY or 'MISSING'} | "
     with with_logging(header = header):
         print(f"CONCURRENCY={CONCURRENCY or 'MISSING'} matrix_jobs={CONCURRENCY}")
 
         # python test.py [--concurrencyN] up old matrix down [clean]
-        actions = args[1:] or ["up", "old", "matrix", "down"]
+        actions = args or ["up", "old", "matrix", "down"]
         for action in actions:
+            print(f"==> STARTING ACTION {action}")
             assert action in ACTIONS
             await ACTIONS[action]()
 

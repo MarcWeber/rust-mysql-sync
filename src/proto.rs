@@ -97,13 +97,36 @@ impl MysqlProfile {
         check!(version_comment, "@@version_comment");
         check!(version_compile_os, "@@version_compile_os");
         check!(version_compile_machine, "@@version_compile_machine");
+        self.session_difference_into(other, &mut diffs);
+        (!diffs.is_empty()).then(|| diffs.join("; "))
+    }
+
+    /// Difference that may be ignored when rows are decoded into canonical
+    /// `Value`s before hashing. Version/build fields do not affect the decoded
+    /// representation, but session charset/timezone/sql_mode still do.
+    pub fn difference_ignoring_version(&self, other: &MysqlProfile) -> Option<String> {
+        let mut diffs = Vec::new();
+        self.session_difference_into(other, &mut diffs);
+        (!diffs.is_empty()).then(|| diffs.join("; "))
+    }
+
+    fn session_difference_into(&self, other: &MysqlProfile, diffs: &mut Vec<String>) {
+        macro_rules! check {
+            ($field:ident, $name:literal) => {
+                if self.$field != other.$field {
+                    diffs.push(format!(
+                        "{}: client={:?}, server={:?}",
+                        $name, self.$field, other.$field
+                    ));
+                }
+            };
+        }
         check!(character_set_client, "character_set_client");
         check!(character_set_connection, "character_set_connection");
         check!(character_set_results, "character_set_results");
         check!(collation_connection, "collation_connection");
         check!(time_zone, "time_zone");
         check!(sql_mode, "sql_mode");
-        (!diffs.is_empty()).then(|| diffs.join("; "))
     }
 }
 

@@ -35,6 +35,7 @@ enum HashSource {
     Select,
     Dump,
     RawBinary,
+    RawBinaryVec,
     RawTsv,
 }
 
@@ -44,13 +45,19 @@ impl HashSource {
             "" | "select" => Ok(HashSource::Select),
             "dump" => Ok(HashSource::Dump),
             "raw_binary" | "raw-binary" | "binary" => Ok(HashSource::RawBinary),
+            "raw_binary_vec" | "raw-binary-vec" | "binary_vec" | "binary-vec" => {
+                Ok(HashSource::RawBinaryVec)
+            }
             "raw_tsv" | "raw-tsv" | "tsv" => Ok(HashSource::RawTsv),
             other => anyhow::bail!("Unbekannte hash_source: {other}"),
         }
     }
 
     fn is_raw(self) -> bool {
-        matches!(self, HashSource::RawBinary | HashSource::RawTsv)
+        matches!(
+            self,
+            HashSource::RawBinary | HashSource::RawBinaryVec | HashSource::RawTsv
+        )
     }
 }
 
@@ -706,7 +713,11 @@ async fn write_chunk_stream(
         match event {
             hash::ChunkHashEvent::Item((bucket, count, hash)) => {
                 if filter.as_ref().map(|f| f.contains(&bucket)).unwrap_or(true) {
-                    batch.push(proto::ChunkHash { bucket, hash, count });
+                    batch.push(proto::ChunkHash {
+                        bucket,
+                        hash,
+                        count,
+                    });
                     total += 1;
                     if batch.len() >= MAX_BUCKETS_PER_BATCH {
                         proto::write_response(
@@ -724,12 +735,7 @@ async fn write_chunk_stream(
         }
     }
     if !batch.is_empty() {
-        proto::write_response(
-            send,
-            &Response::ChunkHashes { items: batch },
-            f,
-        )
-        .await?;
+        proto::write_response(send, &Response::ChunkHashes { items: batch }, f).await?;
     }
     Ok(total)
 }
@@ -788,7 +794,12 @@ async fn do_hashes(
             }
         };
         let server_profile = mysqlutil::mysql_profile(&mut conn).await?;
-        if let Some(diff) = client_profile.difference(&server_profile) {
+        let diff = if source == HashSource::RawBinaryVec {
+            client_profile.difference_ignoring_version(&server_profile)
+        } else {
+            client_profile.difference(&server_profile)
+        };
+        if let Some(diff) = diff {
             send_response(
                 send,
                 Response::err(format!(
@@ -862,6 +873,20 @@ async fn do_hashes(
                     )
                     .await
                 }
+                HashSource::RawBinaryVec => {
+                    hash_binary::stream_chunk_hashes_vec(
+                        tx,
+                        &mut conn,
+                        db,
+                        table,
+                        &pk_meta,
+                        &pk_indexes,
+                        mode,
+                        chunked_c,
+                        state.cfg.hash_algo(),
+                    )
+                    .await
+                }
                 HashSource::RawTsv => {
                     hash_tsv::stream_chunk_hashes(
                         tx,
@@ -892,13 +917,7 @@ async fn do_hashes(
                 }
                 HashSource::Select => {
                     sqlhash::stream_chunk_hashes(
-                        tx,
-                        &mut conn,
-                        db,
-                        table,
-                        &pk_meta,
-                        mode,
-                        chunked_c,
+                        tx, &mut conn, db, table, &pk_meta, mode, chunked_c,
                     )
                     .await
                 }
@@ -949,6 +968,33 @@ async fn do_hashes(
 
         if source == HashSource::RawBinary {
             let rows = hash_binary::row_hashes(
+                &mut conn,
+                db,
+                table,
+                &pk_meta,
+                &pk_indexes,
+                mode,
+                chunked_c,
+                &bucket_list,
+                state.cfg.hash_algo(),
+            )
+            .await?;
+            for chunk in rows.chunks(MAX_ROWHASHES_PER_BATCH) {
+                proto::write_response(
+                    send,
+                    &Response::RowHashes {
+                        items: chunk.to_vec(),
+                    },
+                    f,
+                )
+                .await?;
+            }
+            send_response(send, Response::ok("row hashes done"), f).await?;
+            return Ok(());
+        }
+
+        if source == HashSource::RawBinaryVec {
+            let rows = hash_binary::row_hashes_vec(
                 &mut conn,
                 db,
                 table,

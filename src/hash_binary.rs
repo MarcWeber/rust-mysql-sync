@@ -298,3 +298,139 @@ where
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Raw binary protocol -> decoded `Value` rows.
+//
+// These paths still use prepared statements / the binary protocol, but decode
+// the complete row before hashing with the canonical `hash::row_hash` encoding.
+// Unlike packet hashing they are safe across MySQL versions, because version-
+// specific wire-format details are normalized by `mysql_async`.
+// ---------------------------------------------------------------------------
+
+async fn for_each_value_sync<F>(conn: &mut Conn, sql: String, mut f: F) -> Result<()>
+where
+    F: FnMut(Vec<Value>) -> Result<()>,
+{
+    let mut result = conn
+        .exec_iter(sql, ())
+        .await
+        .context("binäres SELECT fehlgeschlagen")?;
+    while let Some(row) = result
+        .next()
+        .await
+        .context("binäre Zeile dekodieren fehlgeschlagen")?
+    {
+        f(row.unwrap())?;
+    }
+    Ok(())
+}
+
+/// Stream bucket hashes from decoded binary-protocol rows.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chunk_hashes_vec(
+    tx: mpsc::Sender<hash::ChunkHashEvent>,
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    pk_indexes: &[usize],
+    mode: ChunkMode,
+    chunked: u32,
+    algo: hash::HashAlgo,
+) -> Result<u64> {
+    let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
+    let sql = row_sql(db, table, None, Some(&order));
+    let mut result = conn
+        .exec_iter(sql, ())
+        .await
+        .context("binäres SELECT fehlgeschlagen")?;
+    let mut acc = hash::ChunkAccumulator::new(algo);
+    let mut total = 0u64;
+    while let Some(row) = result
+        .next()
+        .await
+        .context("binäre Zeile dekodieren fehlgeschlagen")?
+    {
+        let values = row.unwrap();
+        let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
+        let rh = hash::row_hash(&values, algo);
+        if let Some(item) = acc.push(bucket, &rh) {
+            send_chunk(&tx, item).await?;
+            total += 1;
+        }
+    }
+    if let Some(item) = acc.finish() {
+        tx.send(hash::ChunkHashEvent::Item(item))
+            .await
+            .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))?;
+        total += 1;
+    }
+    Ok(total)
+}
+
+/// Collect bucket hashes from decoded binary-protocol rows.
+pub async fn chunk_hashes_vec<F>(
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    pk_indexes: &[usize],
+    mode: ChunkMode,
+    chunked: u32,
+    algo: hash::HashAlgo,
+    mut on_row: F,
+) -> Result<HashMap<String, (u64, String)>>
+where
+    F: FnMut(),
+{
+    let sql = row_sql(db, table, None, Some(&mysqlutil::order_by(pks)));
+    let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
+    for_each_value_sync(conn, sql, |values| {
+        let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
+        let rh = hash::row_hash(&values, algo);
+        hash::add_row_hash(&mut acc, algo, bucket, &rh);
+        on_row();
+        Ok(())
+    })
+    .await?;
+    Ok(hash::finish_chunks(acc))
+}
+
+/// Row hashes for selected buckets from decoded binary-protocol rows.
+#[allow(clippy::too_many_arguments)]
+pub async fn row_hashes_vec(
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    pks: &[PkCol],
+    pk_indexes: &[usize],
+    mode: ChunkMode,
+    chunked: u32,
+    buckets: &[String],
+    algo: hash::HashAlgo,
+) -> Result<Vec<RowHash>> {
+    let where_clause = mysqlutil::chunk_where(pks, mode, chunked, buckets)?;
+    let wanted: HashSet<String> = buckets.iter().cloned().collect();
+    let sql = row_sql(
+        db,
+        table,
+        Some(&where_clause),
+        Some(&mysqlutil::order_by(pks)),
+    );
+    let mut out = Vec::new();
+    for_each_value_sync(conn, sql, |values| {
+        let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
+        if !wanted.contains(&bucket) {
+            return Ok(());
+        }
+        out.push(RowHash {
+            bucket,
+            pk: hash::pk_canonical(&values, pk_indexes, pks),
+            hash: hash::row_hash(&values, algo),
+        });
+        Ok(())
+    })
+    .await?;
+    Ok(out)
+}

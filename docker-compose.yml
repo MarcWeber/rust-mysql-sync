@@ -1,11 +1,3 @@
-version: "3.8"
-
-# mysql-sync Testumgebung: 2 MySQL-8-Container (Quelle + Ziel)
-#   Quelle : localhost:3306  (db1, db2 mit Seed-Daten)
-#   Ziel   : localhost:3307
-# Start:   docker compose up -d
-# Test:    python3 test.py          (im selben Verzeichnis)
-
 services:
   mysql-src:
     image: mysql:8.0
@@ -13,27 +5,43 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: syncroot
       MYSQL_DATABASE: db1
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+      --local_infile=1
     ports:
-      - "${MSYNC_SRC_PORT:-7012}:3306"
+    - ${MSYNC_SRC_PORT:-7012}:3306
     volumes:
-      - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    - ./deploy/seed.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
+      test:
+      - CMD
+      - mysqladmin
+      - ping
+      - -h
+      - 127.0.0.1
+      - -uroot
+      - -psyncroot
       interval: 3s
       timeout: 3s
       retries: 30
-
   mysql-dst:
-    image: mysql:8.0
+    image: mysql:9.7
     container_name: mysqlsync-dst
     environment:
       MYSQL_ROOT_PASSWORD: syncroot
-    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci --local_infile=1
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+      --local_infile=1
     ports:
-      - "${MSYNC_DST_PORT:-7013}:3306"
+    - ${MSYNC_DST_PORT:-7013}:3306
+    volumes: []
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-psyncroot"]
+      test:
+      - CMD
+      - mysqladmin
+      - ping
+      - -h
+      - 127.0.0.1
+      - -uroot
+      - -psyncroot
       interval: 3s
       timeout: 3s
       retries: 30

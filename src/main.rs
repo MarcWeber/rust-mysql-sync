@@ -76,12 +76,21 @@ struct Cli {
     #[arg(long, alias = "check-dump")]
     hash_via_dump: bool,
 
-    /// Diff-/Check-Hashes über rohe MySQL-Binary-Protokoll-Zeilen berechnen
-    #[arg(long, alias = "check-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_tsv"])]
+    /// Diff-/Check-Hashes über rohe MySQL-Binary-Protokoll-Pakete berechnen (streng versionsgleich)
+    #[arg(long, alias = "check-raw-binary", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary_vec", "hash_via_raw_tsv"])]
     hash_via_raw_binary: bool,
 
+    /// Diff-/Check-Hashes über dekorierte Binary-Protokoll-Zeilen berechnen (versionsübergreifend)
+    #[arg(
+        long = "hash-raw-binary-vec",
+        alias = "hash-raw-binary-row-vec",
+        alias = "check-raw-binary-vec",
+        conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary", "hash_via_raw_tsv"]
+    )]
+    hash_via_raw_binary_vec: bool,
+
     /// Diff-/Check-Hashes über rohe `mysql --batch`-TSV-Zeilen berechnen
-    #[arg(long, alias = "check-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary"])]
+    #[arg(long, alias = "check-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary", "hash_via_raw_binary_vec"])]
     hash_via_raw_tsv: bool,
 }
 
@@ -109,6 +118,8 @@ async fn main() -> ExitCode {
 
     let bench_modes: Vec<sync::HashVia> = if cli.hash_via_raw_tsv {
         vec![sync::HashVia::RawTsv]
+    } else if cli.hash_via_raw_binary_vec {
+        vec![sync::HashVia::RawBinaryVec]
     } else if cli.hash_via_raw_binary {
         vec![sync::HashVia::RawBinary]
     } else if cli.hash_via_dump {
@@ -133,6 +144,7 @@ async fn main() -> ExitCode {
             hash_via_select: cli.hash_via_select,
             hash_via_dump: cli.hash_via_dump,
             hash_via_raw_binary: cli.hash_via_raw_binary,
+            hash_via_raw_binary_vec: cli.hash_via_raw_binary_vec,
             hash_via_raw_tsv: cli.hash_via_raw_tsv,
         })
         .await
