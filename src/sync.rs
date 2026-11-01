@@ -27,7 +27,8 @@ const DIFF_BUCKET_BATCH: usize = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HashVia {
-    Select,
+    SelectSha2,
+    SelectCrc32,
     Dump,
     RawBinary,
     RawBinaryVec,
@@ -35,8 +36,9 @@ pub enum HashVia {
 }
 
 impl HashVia {
-    pub const ALL: [HashVia; 5] = [
-        HashVia::Select,
+    pub const ALL: [HashVia; 6] = [
+        HashVia::SelectSha2,
+        HashVia::SelectCrc32,
         HashVia::Dump,
         HashVia::RawBinary,
         HashVia::RawBinaryVec,
@@ -45,7 +47,8 @@ impl HashVia {
 
     pub fn name(self) -> &'static str {
         match self {
-            HashVia::Select => "select",
+            HashVia::SelectSha2 => "select-sha2",
+            HashVia::SelectCrc32 => "select-crc32",
             HashVia::Dump => "dump",
             HashVia::RawBinary => "raw-binary",
             HashVia::RawBinaryVec => "raw-binary-vec",
@@ -65,8 +68,16 @@ impl HashVia {
     pub fn supports_field_opts(self) -> bool {
         matches!(
             self,
-            HashVia::Select | HashVia::Dump | HashVia::RawBinaryVec
+            HashVia::SelectSha2 | HashVia::SelectCrc32 | HashVia::Dump | HashVia::RawBinaryVec
         )
+    }
+
+    fn sql_hash_algo(self) -> Option<sqlhash::SqlHashAlgo> {
+        match self {
+            HashVia::SelectSha2 => Some(sqlhash::SqlHashAlgo::Sha2),
+            HashVia::SelectCrc32 => Some(sqlhash::SqlHashAlgo::Crc32),
+            _ => None,
+        }
     }
 }
 
@@ -76,13 +87,14 @@ impl std::str::FromStr for HashVia {
     fn from_str(s: &str) -> Result<Self> {
         let t = s.trim().to_ascii_lowercase().replace('_', "-");
         match t.as_str() {
-            "select" | "sql" => Ok(HashVia::Select),
+            "select" | "sql" | "select-sha2" => Ok(HashVia::SelectSha2),
+            "select-crc32" => Ok(HashVia::SelectCrc32),
             "dump" | "export" => Ok(HashVia::Dump),
             "raw-binary" | "raw-binary-row" | "packet" => Ok(HashVia::RawBinary),
             "raw-binary-vec" | "raw-binary-row-vec" | "vec" => Ok(HashVia::RawBinaryVec),
             "raw-tsv" | "tsv" => Ok(HashVia::RawTsv),
             _ => bail!(
-                "Unbekannter Hash-Weg {s:?} (erlaubt: select, dump, raw-binary, \
+                "Unbekannter Hash-Weg {s:?} (erlaubt: select-sha2, select-crc32, dump, raw-binary, \
                  raw-binary-vec, raw-tsv)"
             ),
         }
@@ -244,7 +256,8 @@ pub fn plan_table(
 
 fn hash_via_source(via: HashVia) -> Option<String> {
     match via {
-        HashVia::Select => None,
+        HashVia::SelectSha2 => Some("select-sha2".to_string()),
+        HashVia::SelectCrc32 => Some("select-crc32".to_string()),
         HashVia::Dump => Some("dump".to_string()),
         HashVia::RawBinary => Some("raw_binary".to_string()),
         HashVia::RawBinaryVec => Some("raw_binary_vec".to_string()),
@@ -299,7 +312,8 @@ async fn run_local_chunk_stream(
     let names = mysqlutil::column_names(&mut conn, &task.local_db, &task.local_table).await?;
     let pk_indexes = pk_indexes_for(&names, pk_names)?;
     match hash_via {
-        HashVia::Select => {
+        HashVia::SelectSha2 | HashVia::SelectCrc32 => {
+            let algo = hash_via.sql_hash_algo().unwrap();
             sqlhash::stream_chunk_hashes(
                 tx,
                 &mut conn,
@@ -309,6 +323,7 @@ async fn run_local_chunk_stream(
                 field_opts,
                 mode,
                 cfg.chunked,
+                algo,
             )
             .await?;
         }
@@ -1202,9 +1217,10 @@ async fn compute_chunk_hashes(
     mode: ChunkMode,
     chunked: u32,
     opts: &[proto::FieldOpt],
+    algo: sqlhash::SqlHashAlgo,
     bar: Option<&crate::progress::TableBar>,
 ) -> Result<HashMap<String, (u64, String)>> {
-    let out = sqlhash::chunk_hashes(conn, db, table, pks, opts, mode, chunked).await?;
+    let out = sqlhash::chunk_hashes(conn, db, table, pks, opts, mode, chunked, algo).await?;
     if let Some(b) = bar {
         b.set_total(out.len() as u64, "Lokale SQL-Gruppen-Hashes");
         b.inc(out.len() as u64);
@@ -1221,10 +1237,11 @@ async fn compute_row_hashes(
     chunked: u32,
     buckets: &[String],
     opts: &[proto::FieldOpt],
+    algo: sqlhash::SqlHashAlgo,
     bar: Option<&crate::progress::TableBar>,
 ) -> Result<HashMap<Vec<String>, String>> {
     let rows =
-        sqlhash::row_hashes(conn, db, table, pks, opts, mode, chunked, Some(buckets)).await?;
+        sqlhash::row_hashes(conn, db, table, pks, opts, mode, chunked, Some(buckets), algo).await?;
     let out: HashMap<Vec<String>, String> = rows.into_iter().map(|r| (r.pk, r.hash)).collect();
     if let Some(b) = bar {
         b.set_total(out.len() as u64, "SQL-Zeilen-Hashes");
@@ -1504,7 +1521,8 @@ async fn row_diff_for_buckets(
     let chunked = cfg.chunked;
 
     let local_rows = match hash_via {
-        HashVia::Select => {
+        HashVia::SelectSha2 | HashVia::SelectCrc32 => {
+            let algo = hash_via.sql_hash_algo().unwrap();
             compute_row_hashes(
                 local_conn,
                 &task.local_db,
@@ -1514,6 +1532,7 @@ async fn row_diff_for_buckets(
                 chunked,
                 buckets,
                 field_opts,
+                algo,
                 Some(bar),
             )
             .await?
@@ -2372,7 +2391,7 @@ mod tests {
         assert_eq!(plan.field_opts.len(), 1);
         assert_eq!(plan.field_opts[0].ordinal, 1);
         assert_eq!(plan.field_opts[0].float_precision, Some(2));
-        assert_eq!(plan.candidates, vec![HashVia::Select]);
+        assert_eq!(plan.candidates, vec![HashVia::SelectSha2]);
     }
 
     #[test]
@@ -2416,7 +2435,7 @@ mod tests {
         ];
         let pks = vec!["id".to_string()];
         let plan = plan_table(&cfg, "d", "t", &cols, &pks, None).unwrap();
-        assert_eq!(plan.candidates, vec![HashVia::Dump, HashVia::Select]);
+        assert_eq!(plan.candidates, vec![HashVia::Dump, HashVia::SelectSha2]);
         assert!(plan_table(&cfg, "d", "t", &cols, &pks, Some(HashVia::RawBinary)).is_err());
     }
 

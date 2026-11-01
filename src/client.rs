@@ -20,7 +20,8 @@ pub struct ClientArgs {
     pub check: Option<u32>,
     pub selector: Option<String>,
     pub no_progress: bool,
-    pub hash_via_select: bool,
+    pub hash_via_select_sha2: bool,
+    pub hash_via_select_crc32: bool,
     pub hash_via_dump: bool,
     pub hash_via_raw_binary: bool,
     pub hash_via_raw_binary_vec: bool,
@@ -111,8 +112,10 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
         Some(HashVia::RawBinary)
     } else if args.hash_via_dump {
         Some(HashVia::Dump)
-    } else if args.hash_via_select {
-        Some(HashVia::Select)
+    } else if args.hash_via_select_crc32 {
+        Some(HashVia::SelectCrc32)
+    } else if args.hash_via_select_sha2 {
+        Some(HashVia::SelectSha2)
     } else {
         None
     };

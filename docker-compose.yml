@@ -20,6 +20,27 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
+  mysql80b:
+    image: mysql:8.0
+    container_name: mysql80b
+    environment:
+      MYSQL_ROOT_PASSWORD: syncroot
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+      --local_infile=1
+    ports:
+    - 7014:3306
+    healthcheck:
+      test:
+      - CMD
+      - mysqladmin
+      - ping
+      - -h
+      - 127.0.0.1
+      - -uroot
+      - -psyncroot
+      interval: 3s
+      timeout: 3s
+      retries: 30
   mysql97:
     image: mysql:9.7
     container_name: mysql97

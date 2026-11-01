@@ -80,13 +80,21 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Diff-/Check-Hashes als gruppierte MD5-Aggregate in MySQL berechnen (Default)
+    /// Diff-/Check-Hashes als gruppierte SHA2-Aggregate in MySQL berechnen (Default)
     #[arg(
-        long = "hash-select",
-        alias = "hash-via-select",
-        alias = "check-select"
+        long = "hash-select-sha2",
+        alias = "hash-via-select-sha2",
+        alias = "check-select-sha2"
     )]
-    hash_via_select: bool,
+    hash_via_select_sha2: bool,
+
+    /// Diff-/Check-Hashes als schnelle CRC32-Aggregate in MySQL berechnen
+    #[arg(
+        long = "hash-select-crc32",
+        alias = "hash-via-select-crc32",
+        alias = "check-select-crc32"
+    )]
+    hash_via_select_crc32: bool,
 
     /// Diff-/Check-Hashes über Export/Parser berechnen (transfer_all-Strategien)
     #[arg(long = "hash-dump", alias = "hash-via-dump", alias = "check-dump")]
@@ -142,8 +150,10 @@ async fn main() -> ExitCode {
         vec![sync::HashVia::RawBinary]
     } else if cli.hash_via_dump {
         vec![sync::HashVia::Dump]
-    } else if cli.hash_via_select {
-        vec![sync::HashVia::Select]
+    } else if cli.hash_via_select_crc32 {
+        vec![sync::HashVia::SelectCrc32]
+    } else if cli.hash_via_select_sha2 {
+        vec![sync::HashVia::SelectSha2]
     } else {
         sync::HashVia::ALL.to_vec()
     };
@@ -166,7 +176,8 @@ async fn main() -> ExitCode {
             check: cli.check,
             selector: cli.selector,
             no_progress: cli.no_progress,
-            hash_via_select: cli.hash_via_select,
+            hash_via_select_sha2: cli.hash_via_select_sha2,
+            hash_via_select_crc32: cli.hash_via_select_crc32,
             hash_via_dump: cli.hash_via_dump,
             hash_via_raw_binary: cli.hash_via_raw_binary,
             hash_via_raw_binary_vec: cli.hash_via_raw_binary_vec,

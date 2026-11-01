@@ -151,7 +151,35 @@ async fn use_database(conn: &mut Conn, db: &str) -> Result<()> {
         .context("USE Datenbank fehlgeschlagen")
 }
 
-pub fn row_hash_expr(columns: &[String], opts: &[crate::proto::FieldOpt]) -> String {
+/// SQL-Hash-Algorithmus fuer den Select-Pfad.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SqlHashAlgo {
+    #[default]
+    Sha2,
+    Crc32,
+}
+
+impl SqlHashAlgo {
+    fn row_hash(self, parts: &str) -> String {
+        match self {
+            SqlHashAlgo::Sha2 => format!("LEFT(SHA2(CONCAT({}), 256), 32)", parts),
+            SqlHashAlgo::Crc32 => format!("LPAD(CAST(CRC32(CONCAT({})) AS CHAR), 10, '0')", parts),
+        }
+    }
+
+    fn group_hash(self, inner: &str) -> String {
+        match self {
+            SqlHashAlgo::Sha2 => {
+                format!("LOWER(LEFT(SHA2(CONCAT_WS('|', LEFT(SHA2(bucket, 256), 32), {inner})), 256), 32)")
+            }
+            SqlHashAlgo::Crc32 => {
+                format!("LPAD(CAST(CRC32(CONCAT_WS('|', LPAD(CAST(CRC32(bucket) AS CHAR), 10, '0'), {inner})) AS CHAR), 10, '0')")
+            }
+        }
+    }
+}
+
+pub fn row_hash_expr(columns: &[String], opts: &[crate::proto::FieldOpt], algo: SqlHashAlgo) -> String {
     let parts: Vec<String> = columns
         .iter()
         .enumerate()
@@ -165,7 +193,7 @@ pub fn row_hash_expr(columns: &[String], opts: &[crate::proto::FieldOpt]) -> Str
             ))
         })
         .collect();
-    format!("LEFT(SHA2(CONCAT({}), 256), 32)", parts.join(", "))
+    algo.row_hash(&parts.join(", "))
 }
 
 fn group_query(
@@ -176,14 +204,24 @@ fn group_query(
     opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
+    algo: SqlHashAlgo,
 ) -> Result<String> {
     let bucket = bucket_expr(pks, mode, chunked)?;
-    let row_hash = row_hash_expr(columns, opts);
-    Ok(format!(
-        "SELECT bucket, COUNT(*) AS cnt, \
-         LOWER(LEFT(SHA2(CONCAT_WS('|', LEFT(SHA2(bucket, 256), 32), COUNT(*), \
+    let row_hash = row_hash_expr(columns, opts, algo);
+    let inner = match algo {
+        SqlHashAlgo::Sha2 => {
+            "COUNT(*), \
          IFNULL(SUM(CAST(CONV(SUBSTR(row_hash, 1, 16), 16, 10) AS UNSIGNED)), 0), \
-         IFNULL(SUM(CAST(CONV(SUBSTR(row_hash, 17, 16), 16, 10) AS UNSIGNED)), 0))))) AS hash \
+         IFNULL(SUM(CAST(CONV(SUBSTR(row_hash, 17, 16), 16, 10) AS UNSIGNED)), 0)"
+        }
+        SqlHashAlgo::Crc32 => {
+            "COUNT(*), \
+         IFNULL(SUM(CAST(row_hash AS UNSIGNED)), 0)"
+        }
+    };
+    let hash_expr = algo.group_hash(inner);
+    Ok(format!(
+        "SELECT bucket, COUNT(*) AS cnt, {hash_expr} AS hash \
          FROM (SELECT {bucket} AS bucket, {row_hash} AS row_hash FROM {}) AS x \
          GROUP BY bucket ORDER BY BINARY bucket",
         mysqlutil::qualified(db, table)
@@ -199,6 +237,7 @@ fn row_query(
     mode: ChunkMode,
     chunked: u32,
     buckets: Option<&[String]>,
+    algo: SqlHashAlgo,
 ) -> Result<String> {
     let bucket = bucket_expr(pks, mode, chunked)?;
     let pk_cols: Vec<String> = pks
@@ -206,7 +245,7 @@ fn row_query(
         .enumerate()
         .map(|(i, p)| format!("{} AS pk_{i}", pk_component_expr(p)))
         .collect();
-    let row_hash = row_hash_expr(columns, opts);
+    let row_hash = row_hash_expr(columns, opts, algo);
     let mut sql = format!(
         "SELECT {}, {bucket} AS bucket, {row_hash} AS hash \
          FROM {}",
@@ -258,10 +297,11 @@ pub async fn stream_chunk_hashes(
     opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
+    algo: SqlHashAlgo,
 ) -> Result<u64> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
-    let sql = group_query(db, table, pks, &columns, opts, mode, chunked)?;
+    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo)?;
     log::debug!("SQL group hashes (stream): {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -290,10 +330,11 @@ pub async fn chunk_hashes(
     opts: &[crate::proto::FieldOpt],
     mode: ChunkMode,
     chunked: u32,
+    algo: SqlHashAlgo,
 ) -> Result<HashMap<String, (u64, String)>> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
-    let sql = group_query(db, table, pks, &columns, opts, mode, chunked)?;
+    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo)?;
     log::debug!("SQL group hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -320,10 +361,11 @@ pub async fn row_hashes(
     mode: ChunkMode,
     chunked: u32,
     buckets: Option<&[String]>,
+    algo: SqlHashAlgo,
 ) -> Result<Vec<SqlRowHash>> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
-    let sql = row_query(db, table, pks, &columns, opts, mode, chunked, buckets)?;
+    let sql = row_query(db, table, pks, &columns, opts, mode, chunked, buckets, algo)?;
     log::debug!("SQL row hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)

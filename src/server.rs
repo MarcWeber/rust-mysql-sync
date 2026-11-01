@@ -30,9 +30,10 @@ const MAX_BUCKETS_PER_BATCH: usize = 512;
 const MAX_ROWHASHES_PER_BATCH: usize = 1024;
 const MAX_DUMP_BUFFER: u64 = 2 * 1024 * 1024 * 1024; // 2 GB Guard
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HashSource {
-    Select,
+    SelectSha2,
+    SelectCrc32,
     Dump,
     RawBinary,
     RawBinaryVec,
@@ -41,8 +42,9 @@ enum HashSource {
 
 impl HashSource {
     fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("select").to_ascii_lowercase().as_str() {
-            "" | "select" => Ok(HashSource::Select),
+        match raw.unwrap_or("select-sha2").to_ascii_lowercase().as_str() {
+            "" | "select" | "select-sha2" => Ok(HashSource::SelectSha2),
+            "select-crc32" => Ok(HashSource::SelectCrc32),
             "dump" => Ok(HashSource::Dump),
             "raw_binary" | "raw-binary" | "binary" => Ok(HashSource::RawBinary),
             "raw_binary_vec" | "raw-binary-vec" | "binary_vec" | "binary-vec" => {
@@ -50,6 +52,14 @@ impl HashSource {
             }
             "raw_tsv" | "raw-tsv" | "tsv" => Ok(HashSource::RawTsv),
             other => anyhow::bail!("Unbekannte hash_source: {other}"),
+        }
+    }
+
+    fn sql_hash_algo(self) -> sqlhash::SqlHashAlgo {
+        match self {
+            HashSource::SelectSha2 => sqlhash::SqlHashAlgo::Sha2,
+            HashSource::SelectCrc32 => sqlhash::SqlHashAlgo::Crc32,
+            _ => sqlhash::SqlHashAlgo::Sha2,
         }
     }
 
@@ -984,7 +994,8 @@ async fn do_hashes(
                     )
                     .await
                 }
-                HashSource::Select => {
+                HashSource::SelectSha2 | HashSource::SelectCrc32 => {
+                    let algo = source.sql_hash_algo();
                     sqlhash::stream_chunk_hashes(
                         tx,
                         &mut conn,
@@ -994,6 +1005,7 @@ async fn do_hashes(
                         &field_opts,
                         mode,
                         chunked_c,
+                        algo,
                     )
                     .await
                 }
@@ -1125,6 +1137,7 @@ async fn do_hashes(
 
         if source != HashSource::Dump {
             let selected = filter.as_ref().map(|_| bucket_list.as_slice());
+            let algo = source.sql_hash_algo();
             let rows = sqlhash::row_hashes(
                 &mut conn,
                 db,
@@ -1134,6 +1147,7 @@ async fn do_hashes(
                 mode,
                 chunked_c,
                 selected,
+                algo,
             )
             .await?;
             for chunk in rows.chunks(MAX_ROWHASHES_PER_BATCH) {

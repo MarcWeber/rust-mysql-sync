@@ -200,7 +200,7 @@ pub enum Request {
         chunked: u32,
         hash_of_chunk: bool,
         buckets: Option<Vec<String>>,
-        /// "select" (default), "dump", "raw_binary" or "raw_tsv".
+        /// "select-sha2", "select-crc32", "dump", "raw_binary" or "raw_tsv".
         hash_source: Option<String>,
         /// Required for raw sources: exact client-side MySQL representation profile.
         profile: Option<MysqlProfile>,

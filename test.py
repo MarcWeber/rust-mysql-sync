@@ -57,6 +57,7 @@ TEST_TEXT = "A\nB\n\\\BinärmüllÄß"
 MYSQL_INSTANCES_CONFIG = [
     # name version port
     ["mysql80", "8.0", 7012],
+    ["mysql80b", "8.0", 7014],  # Second 8.0 instance for 8.0→8.0 sync tests
     ["mysql97", "9.7", 7013]
 ]
 
@@ -257,27 +258,33 @@ class Mysql:
     version: str
     port: int
 
-    def sql(self, *queries, database=None, check=True, quiet=False):
+    async def sql(self, *queries, database=None, check=True, quiet=False):
         """SQL auf die MySQL-Instanz dieses Objekts ausführen."""
         cli = os.environ.get("MSYNC_MYSQL_CLI", "mysql")
-        cmd = [cli, "-h", "127.0.0.1", "-P", str(self.port), "-uroot"]
+        base = [cli, "-h", "127.0.0.1", "-P", str(self.port), "-uroot"]
         if ROOT_PW:
-            cmd.append(f"-p{ROOT_PW}")
+            base.append(f"-p{ROOT_PW}")
         if database:
-            cmd.append(database)
-        r = None
+            base.append(database)
+        out_parts = []
         for query in queries:
-            r = run(cmd + ["-e", query], check=check, quiet=quiet)
-        assert r
-        return r.stdout
+            cmd = base + ["-e", query]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if check and proc.returncode != 0:
+                err = stderr.decode(errors="replace") if stderr else ""
+                raise RuntimeError(f"mysql CLI failed: {' '.join(str(c) for c in cmd)[:120]}\n{err[-500:]}" if not quiet else err)
+            out_parts.append(stdout.decode(errors="replace") if stdout else "")
+        return "".join(out_parts)
 
-
-    def scalar(self, query, database=None, quiet=False):
-        out = self.sql(query, database = database, quiet=quiet).strip().splitlines()
+    async def scalar(self, query, database=None, quiet=False):
+        out = (await self.sql(query, database=database, quiet=quiet)).strip().splitlines()
         return out[-1] if out else None
 
-    def table_exists(self, table):
-        return self.scalar(
+    async def table_exists(self, table):
+        return await self.scalar(
             "SELECT COUNT(*) FROM information_schema.TABLES "
             f"WHERE TABLE_SCHEMA='{MATRIX_DB}' AND TABLE_NAME='{table}'",
             quiet=True,
@@ -293,6 +300,7 @@ class Mysql:
             "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": self.port},
             "listen": "127.0.0.1",
             "port": self.server_port,
+            "allow_plaintext": True,
         }, indent=2))
         return cfg
 
@@ -457,11 +465,24 @@ MATRIX_EXTRA_OFFSET = 9 * MATRIX_ROWS
 PT_BIN = os.environ.get("MSYNC_PT_TABLE_SYNC") or shutil.which("pt-table-sync")
 
 RUST_MODES = (
-    ("select", None),
+    ("select-sha2", "--hash-select-sha2"),
+    ("select-crc32", "--hash-select-crc32"),
     ("dump", "--hash-dump"),
     ("raw-binary", "--hash-raw-binary-row"),
     ("raw-tsv", "--hash-raw-tsv"),
 )
+
+# Rust-side hash algorithm for raw modes (xxh3 is default)
+RUST_HASH_ALGOS = ("xxh3", "blake3", "sha256")
+
+# Chunk size exponent (1-6); 3 is the default
+RUST_CHUNKED = (1, 3, 6)
+
+# Wire compression: none (default) or zstd
+RUST_COMPRESSION = ("none", "zstd")
+
+# Transport: quic (TLS 1.3 encrypted, default) or tcp (plaintext)
+RUST_TRANSPORT = ("quic", "tcp")
 
 Tool = Literal['pt', 'rust'] # rust is rust-mysql-sync
 
@@ -478,6 +499,10 @@ class MatrixCasePTOpts:
 @dataclass()
 class MatrixCaseRustOpts:
     mode: str
+    hash_algo: str = "xxh3"
+    chunked: int = 3
+    compression: str = "none"
+    transport: str = "quic"
 
 Binary = Tuple["binary", "no_binary"]
 
@@ -520,7 +545,7 @@ class MatrixCase:
     def _dims(self):
         tool = "pt" if isinstance(self.tool_opts, MatrixCasePTOpts) else "rust"
         mode = None if tool == "pt" else self.tool_opts.mode
-        return {
+        d = {
             "table_schema_case": self.table_schema_case,
             "key": self.key(),
             "binary": self.binary,
@@ -529,6 +554,12 @@ class MatrixCase:
             "mode": mode,
             "mysqls": self.mysqls,
         }
+        if isinstance(self.tool_opts, MatrixCaseRustOpts):
+            d["hash_algo"] = self.tool_opts.hash_algo
+            d["chunked"] = self.tool_opts.chunked
+            d["compression"] = self.tool_opts.compression
+            d["transport"] = self.tool_opts.transport
+        return d
 
     def keys(self):
         return self._dims().keys()
@@ -543,7 +574,12 @@ class MatrixCase:
         return len(self._dims())
 
 
-def _mysql_by_version(version):
+def _mysql_by_version(version, exclude=None):
+    """Find a MySQL instance by version, optionally excluding one instance name."""
+    for m in MYSQL_INSTANCES.values():
+        if m.version == version and m.name != exclude:
+            return m
+    # Fallback: allow any instance of that version
     for m in MYSQL_INSTANCES.values():
         if m.version == version:
             return m
@@ -555,17 +591,39 @@ def matrix_cases():
     # Nur Paare, fuer die tatsaechlich Instanzen laufen. Weitere Versionen
     # (z.B. 8.0:8.0) brauchen zusaetzliche Container in docker-compose.yml.
     version_pairs = [("8.0", "9.7"), ("8.0", "8.0")]
+
+    # Representative schemas for extended dimension testing (hash_algo, chunked, compression)
+    # to avoid exploding the full matrix. Full matrix uses default config.
+    extended_schemas = {"TC101", "TC201"}
+
     for (table_schema_case, schema), binary, (v_src, v_dst) in product(
             TABLE_SCHEMAS.items(),
             ("no_binary", "bin"),
             version_pairs):
-        mysqls = (_mysql_by_version(v_src), _mysql_by_version(v_dst))
+        src_mysql = _mysql_by_version(v_src)
+        dst_mysql = _mysql_by_version(v_dst, exclude=src_mysql.name)
+        mysqls = (src_mysql, dst_mysql)
         common = {"table_schema_case": table_schema_case,
                   "schema": schema,
                   "binary": binary, "mysqls": mysqls}
         cases.append(MatrixCase(**common, tool_opts=MatrixCasePTOpts()))
+
+        # Default rust cases: all modes with default config
         for mode, _ in RUST_MODES:
             cases.append(MatrixCase(**common, tool_opts=MatrixCaseRustOpts(mode)))
+
+        # Extended rust cases: vary hash_algo, chunked, compression, transport for representative schemas
+        if table_schema_case in extended_schemas:
+            for (mode, _), hash_algo, chunked, compression, transport in product(
+                    RUST_MODES, RUST_HASH_ALGOS, RUST_CHUNKED, RUST_COMPRESSION, RUST_TRANSPORT):
+                # Skip if this is the default config (already covered above)
+                if (hash_algo == "xxh3" and chunked == 3 and compression == "none"
+                        and transport == "quic"):
+                    continue
+                cases.append(MatrixCase(**common, tool_opts=MatrixCaseRustOpts(
+                    mode, hash_algo=hash_algo, chunked=chunked, compression=compression,
+                    transport=transport)))
+
     return cases
 
 def _matrix_ddl(case, table):
@@ -672,11 +730,19 @@ def _matrix_checksum_sql(case, table):
     return f"SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32({expr})), 0)) FROM {MATRIX_DB}.{table}"
 
 
-def _timed(cmd):
+async def _timed(cmd):
+    """Run a command asynchronously; returns (elapsed_ms, (stdout_bytes, stderr_bytes, returncode))."""
     started = time.perf_counter()
-    r = subprocess.run([str(c) for c in cmd], text=True, capture_output=True,
-                       cwd=WORK, timeout=MATRIX_TIMEOUT)
-    return (time.perf_counter() - started) * 1000.0, r
+    proc = await asyncio.create_subprocess_exec(
+        *[str(c) for c in cmd],
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=WORK,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MATRIX_TIMEOUT)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return elapsed_ms, (stdout, stderr, proc.returncode)
 
 
 def _matrix_base(case):
@@ -804,10 +870,10 @@ async def prepare_tables(case: MatrixCase):
 async def _matrix_runner(cfg, case: MatrixCase):
     try:
         src, dst = await prepare_tables(case)
-        if case.tool_opts is MatrixCasePTOpts:
-            return _run_pt_case(cfg, case)
+        if isinstance(case.tool_opts, MatrixCasePTOpts):
+            return await to_thread(_run_pt_case, cfg, case)
         else:
-            return _run_rust_case(cfg, case)
+            return await to_thread(_run_rust_case, cfg, case)
     except Exception as exc:
         out = _matrix_base(case)
         out.update(status="error", detail=str(exc)[-300:])
@@ -836,20 +902,43 @@ def _report_matrix(rows, wall_ms):
     print("    sync  = apply the differences (this is the real sync time)")
     print("    total = clean + drift + sync = total time for this table")
     print("    pt-table-sync: drift = --print, sync = --execute (no clean run)")
-    print("    mode: select/dump/raw-binary/raw-tsv = rust-sync hashing method")
-    print("key\tbin\tsync\ttool\tmode\tclean\tdrift\ttotal\tstatus")
+    print("    mode: select-sha2/select-crc32/dump/raw-binary/raw-tsv = rust-sync hashing method")
+    print("    algo: xxh3/blake3/sha256 = Rust-side hash algorithm (raw modes)")
+    print("    chunked: 1-6 = chunk size exponent")
+    print("    comp: none/zstd = wire compression")
+    print("    trans: quic (TLS 1.3 encrypted) / tcp (plaintext)")
+    print("    mysqls: source→dest MySQL version pair")
+    print("key\tbin\tmysqls\tsync\ttool\tmode\talgo\tchunked\tcomp\ttrans\tclean\tdrift\ttotal\tstatus")
     for r in sorted(rows, key=lambda x: (x["key"], x["binary"], x["tool"], x["mode"] or "")):
         def ms(v):
             return "-" if v is None else f"{v:.0f}"
-        print(f"{r['key']}\t{r['binary']}\t{ms(r['sync_ms'])}\t{r['tool']}\t"
-              f"{r['mode'] or '-'}\t{ms(r['clean_ms'])}\t{ms(r['drift_ms'])}\t"
+        mysqls_str = "-"
+        if "mysqls" in r and r["mysqls"]:
+            mysqls_str = f"{r['mysqls'][0].version}:{r['mysqls'][1].version}"
+        algo = r.get("hash_algo", "-")
+        chunked = r.get("chunked", "-")
+        comp = r.get("compression", "-")
+        trans = r.get("transport", "-")
+        print(f"{r['key']}\t{r['binary']}\t{mysqls_str}\t{ms(r['sync_ms'])}\t{r['tool']}\t"
+              f"{r['mode'] or '-'}\t{algo}\t{chunked}\t{comp}\t{trans}\t"
+              f"{ms(r['clean_ms'])}\t{ms(r['drift_ms'])}\t"
               f"{ms(r['total_ms'])}\t{r['status']}"
               + (f" ({r['detail']})" if r["detail"] else ""))
 
     print("  Totals:")
     groups = {}
     for r in rows:
-        label = r["tool"] if r["tool"] == "pt" else f"rust/{r['mode']}"
+        algo = r.get("hash_algo", "xxh3")
+        chunked = r.get("chunked", 3)
+        comp = r.get("compression", "none")
+        trans = r.get("transport", "quic")
+        if r["tool"] == "pt":
+            label = "pt"
+        else:
+            cfg = ""
+            if algo != "xxh3" or chunked != 3 or comp != "none" or trans != "quic":
+                cfg = f"({algo},c{chunked},{comp},{trans})"
+            label = f"rust/{r['mode']}{cfg}"
         g = groups.setdefault(label, {"n": 0, "clean": 0.0, "drift": 0.0, "sync": 0.0, "total": 0.0})
         g["n"] += 1
         for k in ("clean", "drift", "sync", "total"):
@@ -943,21 +1032,39 @@ async def ensure_dbs_up(attempts=20):
 def make_client_cfg(case, fingerprint):
     src, dst = case.mysqls
     src_table, dst_table = case.table_names()
+    opts = case.tool_opts
+    if isinstance(opts, MatrixCaseRustOpts):
+        hash_algo = opts.hash_algo
+        chunked = opts.chunked
+        compression = opts.compression
+        transport = opts.transport
+    else:
+        hash_algo = "xxh3"
+        chunked = 3
+        compression = "none"
+        transport = "quic"
     cfg = WORK / f"config-client-{case.hash}.json"
-    cfg.write_text(json.dumps({
+    cfg_dict = {
         "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": src.port},
         "server": f"127.0.0.1:{dst.server_port}",
         "server_fingerprint": fingerprint,
         "allow_csv": True,
         "dump_strategies": ["select-stream"],
+        "hash_algo": hash_algo,
         "transfer_batch_rows": 1000,
-        "chunked": 3,
+        "chunked": chunked,
         "concurrent_processes": 3,
         "diff_threshold_percent": 10,
+        "compression": compression,
+        "transport": transport,
         "database_table_mappings": {
             f"{MATRIX_DB}.{src_table}": f"{MATRIX_DB}.{dst_table}",
         },
-    }, indent=2))
+    }
+    if transport == "tcp":
+        cfg_dict["allow_plaintext"] = True
+    cfg = WORK / f"config-client-{case.hash}.json"
+    cfg.write_text(json.dumps(cfg_dict, indent=2))
     return cfg
 
 
