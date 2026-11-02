@@ -610,6 +610,11 @@ TC2* -> more columns thus somewhat realistic
 test mysqls sync  details
 
 SLOW mysqlump and perl
+
+
+HEADERS:
+table-schema, mysql-versions, sync time, test setup description
+
 TC201-mixed-tuple-no_binary	8.0:9.7	1785	pt clean=- drift=1075 total=2860 ok
 TC201-mixed-tuple-no_binary	8.0:8.0	1577	pt clean=- drift=1240 total=2818 ok
 TC201-mixed-tuple-no_binary	8.0:8.0	1240	mysqldump/none clean=- drift=- total=1240 ok
