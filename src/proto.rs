@@ -208,6 +208,8 @@ pub enum Request {
         schema_hash: Option<String>,
         /// Per-column transforms/rounding; must be identical on both sides.
         field_opts: Vec<FieldOpt>,
+        /// SQL WHERE snippet from check_where/sync_where TableOverride.
+        extra_where: Option<String>,
     },
     DumpBegin {
         db: String,

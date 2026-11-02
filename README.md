@@ -14,6 +14,11 @@ A chunk is defined by int/binary/varchar primary keys eg any last n chars
 such as 19.. (thus 1901 1902 1903 ..) or Benjam.. (eg for names such as
 Benjamin)
 
+## HOW IT WORKS
+The client connects to server.
+The client controls the server and tells how and what to sync or check.
+
+
 ## NAME
 
 mysql-sync — differentially synchronize MySQL tables over QUIC (or plaintext
@@ -67,6 +72,19 @@ Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`, `db1,db2.t1,t2`
 | `--no-progress` | No progress bars (cron/CI) |
 | `--log-level LVL` | `error|warn|info|debug|trace` |
 
+## tutorial
+python test.py tutorial_up
+python test.py step_1
+python test.py step_2
+python test.py tutorial_down
+
+For shell usage eg see demo/tutorial.sh
+
+## old immutable data
+most projects have old and an auto increment field which no longer changes.
+
+That's why per table sync_where and check_where fields have
+bee n introduced to allow to reduce the load even more.
 
 ## HASHING — RECOMMENDATION
 
@@ -594,12 +612,23 @@ Differences from mysql-sync:
 > data-diff project in May 2024. Check its maintenance status before adopting it
 > for new production use.
 
+## FUTURE IMPROVEMENTS
+
+TODO: Maybe its not very smart to allow the client to
+control the server, maybe it should be the other way
+round.
+
+Maybe concurrent processing within a table in case if all data are in
+RAM that would be even faster.
+
 ## SEE ALSO
 
 Source: `src/sync.rs` (diff engine), `src/sqlhash.rs` (SQL group/row hashes),
 `src/hash.rs` (Rust hashing/buckets), `src/hash_binary.rs` (raw binary rows),
 `src/hash_tsv.rs` (raw TSV lines), `src/export.rs` (export strategies),
 `src/server.rs` (target side), `vendor/mysql_async` (patched `next_raw()`).
+
+
 
 ## BENCHMARKS
 TC2* -> more columns thus somewhat realistic
@@ -661,7 +690,10 @@ TC202-mixed-tuple-bin	8.0:9.7	718	rust/dump clean=333 drift=1892 total=2943 ok
 
 Example run 100000 rows
 TC201-mixed-tuple-bin   8.0:8.0 -       rust/raw-tsv(xxh3,c3,none,quic) clean=- drift=- total
+
 TC201-mixed-tuple-bin   8.0:8.0 22600   pt clean=- drift=7524 total=30124 ok    8745da64
+TC201-mixed-tuple-bin   8.0:9.7 11663   pt clean=- drift=8092 total=19755 ok    1f422a98
+TC201-mixed-tuple-bin   8.0:8.0 10473   mysqldump/none clean=- drift=- total=10473 ok   32759
 TC201-mixed-tuple-bin   8.0:9.7 11663   pt clean=- drift=8092 total=19755 ok    1f422a98
 TC201-mixed-tuple-bin   8.0:8.0 10473   mysqldump/none clean=- drift=- total=10473 ok   32759
 TC201-mixed-tuple-bin   8.0:8.0 5842    rust/dump(xxh3,c3,none,quic) clean=1915 drift=7487 to
@@ -671,26 +703,19 @@ TC201-mixed-tuple-bin   8.0:9.7 3756    mysqldump/zstd clean=- drift=- total=375
 TC201-mixed-tuple-bin   8.0:9.7 2912    mysqldump/none clean=- drift=- total=2912 ok    0b2ba
 TC201-mixed-tuple-bin   8.0:8.0 2438    rust/raw-binary(xxh3,c3,none,quic) clean=423 drift=90
 TC201-mixed-tuple-bin   8.0:8.0 2427    rust/select-crc32(xxh3,c3,none,quic) clean=648 drift=
-TC201-mixed-tuple-bin   8.0:9.7 1737    rust/select-sha2(xxh3,c3,none,quic) clean=1412 drift=
-TC201-mixed-tuple-bin   8.0:8.0 1244    rust/select-sha2(xxh3,c3,none,quic) clean=1121 drift=
-TC201-mixed-tuple-bin   8.0:8.0 1277    rust/raw-binary-vec(xxh3,c3,none,quic) clean=475 drif
-TC201-mixed-tuple-bin   8.0:9.7 941     rust/select-crc32(xxh3,c3,none,quic) clean=705 drift=
-TC201-mixed-tuple-bin   8.0:9.7 669     rust/raw-binary-vec(xxh3,c3,none,quic) clean=353 drif
-TC201-mixed-tuple-bin   8.0:8.0 22600   pt clean=- drift=7524 total=30124 ok    8745da64
-TC201-mixed-tuple-bin   8.0:9.7 11663   pt clean=- drift=8092 total=19755 ok    1f422a98
-TC201-mixed-tuple-bin   8.0:8.0 10473   mysqldump/none clean=- drift=- total=10473 ok   32759
-TC201-mixed-tuple-bin   8.0:8.0 5842    rust/dump(xxh3,c3,none,quic) clean=1915 drift=7487 to
-TC201-mixed-tuple-bin   8.0:9.7 5270    rust/dump(xxh3,c3,none,quic) clean=881 drift=9471 tot
-TC201-mixed-tuple-bin   8.0:8.0 4701    mysqldump/zstd clean=- drift=- total=4701 ok    ed988
-TC201-mixed-tuple-bin   8.0:9.7 3756    mysqldump/zstd clean=- drift=- total=3756 ok    a0d95
-TC201-mixed-tuple-bin   8.0:9.7 2912    mysqldump/none clean=- drift=- total=2912 ok    0b2ba
 TC201-mixed-tuple-bin   8.0:8.0 2438    rust/raw-binary(xxh3,c3,none,quic) clean=423 drift=90
 TC201-mixed-tuple-bin   8.0:8.0 2427    rust/select-crc32(xxh3,c3,none,quic) clean=648 drift=
 TC201-mixed-tuple-bin   8.0:9.7 1737    rust/select-sha2(xxh3,c3,none,quic) clean=1412 drift=
+TC201-mixed-tuple-bin   8.0:9.7 1737    rust/select-sha2(xxh3,c3,none,quic) clean=1412 drift=
+TC201-mixed-tuple-bin   8.0:8.0 1244    rust/select-sha2(xxh3,c3,none,quic) clean=1121 drift=
+TC201-mixed-tuple-bin   8.0:8.0 1277    rust/raw-binary-vec(xxh3,c3,none,quic) clean=475 drif
 TC201-mixed-tuple-bin   8.0:8.0 1244    rust/select-sha2(xxh3,c3,none,quic) clean=1121 drift=
 TC201-mixed-tuple-bin   8.0:8.0 1277    rust/raw-binary-vec(xxh3,c3,none,quic) clean=475 drif
 TC201-mixed-tuple-bin   8.0:9.7 941     rust/select-crc32(xxh3,c3,none,quic) clean=705 drift=
 TC201-mixed-tuple-bin   8.0:9.7 669     rust/raw-binary-vec(xxh3,c3,none,quic) clean=353 drif
+TC201-mixed-tuple-bin   8.0:9.7 941     rust/select-crc32(xxh3,c3,none,quic) clean=705 drift=
+TC201-mixed-tuple-bin   8.0:9.7 669     rust/raw-binary-vec(xxh3,c3,none,quic) clean=353 drif
+
 bin expected can't be run through TSV export
 TC201-mixed-tuple-bin   8.0:9.7 -       rust/raw-binary(xxh3,c3,none,quic) clean=- drift=- to
 TC201-mixed-tuple-bin   8.0:9.7 -       rust/raw-tsv(xxh3,c3,none,quic) clean=- drift=- total

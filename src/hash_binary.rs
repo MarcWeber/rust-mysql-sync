@@ -152,9 +152,10 @@ pub async fn stream_chunk_hashes(
     mode: ChunkMode,
     chunked: u32,
     algo: hash::HashAlgo,
+    extra_where: Option<&str>,
 ) -> Result<u64> {
     let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
-    let sql = row_sql(db, table, None, Some(&order));
+    let sql = row_sql(db, table, extra_where, Some(&order));
     let mut result = conn
         .exec_iter(sql, ())
         .await
@@ -339,9 +340,10 @@ pub async fn stream_chunk_hashes_vec(
     chunked: u32,
     algo: hash::HashAlgo,
     opts: &[crate::proto::FieldOpt],
+    extra_where: Option<&str>,
 ) -> Result<u64> {
     let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
-    let sql = row_sql(db, table, None, Some(&order));
+    let sql = row_sql(db, table, extra_where, Some(&order));
     let mut result = conn
         .exec_iter(sql, ())
         .await

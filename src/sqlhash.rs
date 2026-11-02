@@ -205,6 +205,7 @@ fn group_query(
     mode: ChunkMode,
     chunked: u32,
     algo: SqlHashAlgo,
+    extra_where: Option<&str>,
 ) -> Result<String> {
     let bucket = bucket_expr(pks, mode, chunked)?;
     let row_hash = row_hash_expr(columns, opts, algo);
@@ -220,9 +221,13 @@ fn group_query(
         }
     };
     let hash_expr = algo.group_hash(inner);
+    let where_clause = match extra_where {
+        Some(w) => format!(" WHERE {w}"),
+        None => String::new(),
+    };
     Ok(format!(
         "SELECT bucket, COUNT(*) AS cnt, {hash_expr} AS hash \
-         FROM (SELECT {bucket} AS bucket, {row_hash} AS row_hash FROM {}) AS x \
+         FROM (SELECT {bucket} AS bucket, {row_hash} AS row_hash FROM {}{where_clause}) AS x \
          GROUP BY bucket ORDER BY BINARY bucket",
         mysqlutil::qualified(db, table)
     ))
@@ -238,6 +243,7 @@ fn row_query(
     chunked: u32,
     buckets: Option<&[String]>,
     algo: SqlHashAlgo,
+    extra_where: Option<&str>,
 ) -> Result<String> {
     let bucket = bucket_expr(pks, mode, chunked)?;
     let pk_cols: Vec<String> = pks
@@ -252,6 +258,7 @@ fn row_query(
         pk_cols.join(", "),
         mysqlutil::qualified(db, table)
     );
+    let mut has_where = false;
     if let Some(buckets) = buckets {
         if buckets.is_empty() {
             sql.push_str(" WHERE FALSE");
@@ -264,6 +271,14 @@ fn row_query(
                 vals.push(String::from_utf8_lossy(&buf).to_string());
             }
             sql.push_str(&format!(" WHERE ({bucket}) IN ({})", vals.join(", ")));
+            has_where = true;
+        }
+    }
+    if let Some(w) = extra_where {
+        if has_where {
+            sql.push_str(&format!(" AND {w}"));
+        } else {
+            sql.push_str(&format!(" WHERE {w}"));
         }
     }
     sql.push_str(&mysqlutil::order_by(pks));
@@ -298,10 +313,11 @@ pub async fn stream_chunk_hashes(
     mode: ChunkMode,
     chunked: u32,
     algo: SqlHashAlgo,
+    extra_where: Option<&str>,
 ) -> Result<u64> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
-    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo)?;
+    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo, extra_where)?;
     log::warn!("SQL group hashes (stream): {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -331,10 +347,11 @@ pub async fn chunk_hashes(
     mode: ChunkMode,
     chunked: u32,
     algo: SqlHashAlgo,
+    extra_where: Option<&str>,
 ) -> Result<HashMap<String, (u64, String)>> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
-    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo)?;
+    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo, extra_where)?;
     log::warn!("SQL group hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)
@@ -362,10 +379,11 @@ pub async fn row_hashes(
     chunked: u32,
     buckets: Option<&[String]>,
     algo: SqlHashAlgo,
+    extra_where: Option<&str>,
 ) -> Result<Vec<SqlRowHash>> {
     let columns = mysqlutil::column_names(conn, db, table).await?;
     use_database(conn, db).await?;
-    let sql = row_query(db, table, pks, &columns, opts, mode, chunked, buckets, algo)?;
+    let sql = row_query(db, table, pks, &columns, opts, mode, chunked, buckets, algo, extra_where)?;
     log::warn!("SQL row hashes: {sql}");
     let mut result = conn
         .query_iter(&sql)

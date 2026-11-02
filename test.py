@@ -39,6 +39,10 @@ from datetime import datetime
 from pathlib import Path
 from yachalk import chalk
 
+# Add bundled 3rd-party libs to path
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "3rd"))
+
 from u_asyncio import run_show_out_tail_on_error, task
 from u_no_proc_zombies import ProcManager
 from u_benchmark import context_benchmark
@@ -53,6 +57,7 @@ ROOT_PW = "syncroot"
 SERVER_PORT_OFFSET = 100
 MATRIX_DB = "db_matrix"
 MATRIX_ROWS = 100000
+TUTORIAL_ROWS = 1000
 CHUNK_SIZE = 2
 MATRIX_JOBS = 4
 FAIL_EARLY = True
@@ -84,7 +89,6 @@ TABLE_SCHEMA_CASES = {
 }
 
 
-HERE = Path(__file__).resolve().parent
 WORK = HERE / ".test-run"
 
 
@@ -220,7 +224,7 @@ class TableSchema:
             for i in range(digits)
         )
         terms = " + ".join(f"{letters[i]}.N * {10 ** i}" for i in range(digits)) + " + 1"
-        return [f"DROP TABLE IF EXISTS {name}",
+        return [f"DROP TABLE IF EXISTS {name};",
 f"""
 CREATE TABLE {name} ({col_defs}, PRIMARY KEY ({pk_cols})) ENGINE=InnoDB;
 INSERT INTO {name} ({cols})
@@ -680,14 +684,14 @@ async def _timed(cmd, stdin_data=None):
         *[str(c) for c in cmd],
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         cwd=WORK,
     )
-    stdout, _ = await asyncio.wait_for(
+    stdout, stderr = await asyncio.wait_for(
         proc.communicate(input=stdin_data), timeout=MATRIX_TIMEOUT
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    return elapsed_ms, (stdout, b"", proc.returncode)
+    return elapsed_ms, (stdout, stderr, proc.returncode)
 
 
 @dataclass
@@ -1235,6 +1239,494 @@ async def dump_table_create_sql():
         print(f"Loaded on {m.name} in {elapsed_ms:.0f} ms")
         started = _time.perf_counter()
 
+async def test_where_constraint():
+    """Test check_where/sync_where: only rows matching the WHERE clause are checked/synced."""
+    await ensure_binary(str(BIN))
+    await prepare_workdir()
+    await ensure_dbs_up()
+
+    src, dst = MYSQL_INSTANCES["mysql80"], MYSQL_INSTANCES["mysql97"]
+    db = "db_where_test"
+    table = "t1"
+
+    # Create database and table on both sides
+    await src.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
+    await dst.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
+    await src.sql(f"DROP TABLE IF EXISTS {db}.{table}")
+    await dst.sql(f"DROP TABLE IF EXISTS {db}.{table}")
+    ddl = f"""
+        CREATE TABLE {db}.{table} (
+            id INT PRIMARY KEY,
+            name VARCHAR(50),
+            value INT
+        )
+    """
+    await src.sql(ddl)
+    await dst.sql(ddl)
+
+    # Insert 1000 rows on source
+    inserts = []
+    for i in range(1, 1001):
+        inserts.append(f"({i}, 'row_{i}', {i * 10})")
+    await src.sql(f"INSERT INTO {db}.{table} VALUES " + ", ".join(inserts))
+
+    # Insert only rows 1-100 on dest (rows 101-1000 are missing)
+    inserts_dst = []
+    for i in range(1, 101):
+        inserts_dst.append(f"({i}, 'row_{i}', {i * 10})")
+    await dst.sql(f"INSERT INTO {db}.{table} VALUES " + ", ".join(inserts_dst))
+
+    # Start server on src
+    async with AsyncExitStack() as stack:
+        fingerprint = await stack.enter_async_context(src.server_running())
+
+        # Test 1: Without WHERE, check should find differences (rows 101-1000 missing on dest)
+        cfg_no_where = {
+            "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
+            "server": f"127.0.0.1:{src.server_port}",
+            "server_fingerprint": fingerprint,
+            "hash-strategies": ["select-sha2"],
+        }
+        cfg_json = json.dumps(cfg_no_where)
+        print("  Test 1: check without WHERE (should find differences)")
+        ms, (stdout, stderr, rc) = await _timed(
+            [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
+            cfg_json.encode()
+        )
+        if rc != 1:
+            print(f"  FAIL: expected rc=1, got rc={rc}")
+            print(f"    stderr: {stderr.decode(errors='replace')[-500:]}")
+        else:
+            print(f"  PASS: check found differences ({ms:.0f}ms)")
+
+        # Test 2: With check_where/sync_where = "id <= 100", only rows 1-100 are checked
+        # Since both sides have rows 1-100 identical, check should pass (rc=0)
+        cfg_with_where = {
+            "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
+            "server": f"127.0.0.1:{src.server_port}",
+            "server_fingerprint": fingerprint,
+            "hash-strategies": ["select-sha2"],
+            "tables": {
+                f"{db}.{table}": {
+                    "check_where": "id <= 100",
+                    "sync_where": "id <= 100",
+                }
+            },
+        }
+        cfg_json_where = json.dumps(cfg_with_where)
+        print("  Test 2: check with WHERE id <= 100 (should find NO differences)")
+        ms, (stdout, stderr, rc) = await _timed(
+            [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
+            cfg_json_where.encode()
+        )
+        if rc != 0:
+            print(f"  FAIL: expected rc=0, got rc={rc}")
+            print(f"    stderr: {stderr.decode(errors='replace')[-500:]}")
+        else:
+            print(f"  PASS: check found no differences ({ms:.0f}ms)")
+
+        # Test 3: Sync with WHERE should only sync rows 1-100 (which are already identical)
+        print("  Test 3: sync with WHERE id <= 100 (should be a no-op)")
+        ms, (stdout, stderr, rc) = await _timed(
+            [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}.{table}"],
+            cfg_json_where.encode()
+        )
+        if rc != 0:
+            print(f"  FAIL: expected rc=0, got rc={rc}")
+            print(f"    stderr: {stderr.decode(errors='replace')[-500:]}")
+        else:
+            print(f"  PASS: sync completed ({ms:.0f}ms)")
+
+        # Test 4: Verify dest still only has 100 rows (rows 101-1000 should NOT be synced)
+        count = int(await dst.scalar(f"SELECT COUNT(*) FROM {db}.{table}", quiet=True))
+        if count != 100:
+            print(f"  FAIL: dest should have 100 rows, has {count}")
+        else:
+            print(f"  PASS: dest has 100 rows (rows 101-1000 correctly excluded)")
+
+        # Cleanup
+        await src.sql(f"DROP TABLE IF EXISTS {db}.{table}")
+        await dst.sql(f"DROP TABLE IF EXISTS {db}.{table}")
+        await src.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+        await dst.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+
+    print("  test_where_constraint: OK")
+
+
+async def write_tutorial_files():
+    """Generate tutorial/ directory with db.sql, source.json, target.json, and README.md."""
+    await ensure_binary(str(BIN))
+
+    src_mysql, dst_mysql = MYSQL_INSTANCES["mysql80"], MYSQL_INSTANCES["mysql97"]
+    db = "db_tutorial"
+    src_table = "src_manual"
+    dst_table = "dest_manual"
+
+    # Use TC104 schema (all field types) for the tutorial table
+    schema = TABLE_SCHEMAS["TC104"]
+    sql_lines = schema.drop_recreate_sql(f"{db}.{src_table}", TUTORIAL_ROWS)
+
+    # Create tutorial directory
+    tutorial_dir = HERE / "tutorial"
+    tutorial_dir.mkdir(exist_ok=True)
+
+    # 1. db.sql — load into both source and target
+    (tutorial_dir / "db.sql").write_text("\n".join(sql_lines) + "\n")
+
+    # 2. source.json — server config
+    source_cfg = {
+        "mysql": {
+            "host": "127.0.0.1",
+            "port": src_mysql.port,
+            "user": "root",
+            "password": ROOT_PW
+        },
+        "listen": "127.0.0.1",
+        "quic_port": src_mysql.server_port
+    }
+    (tutorial_dir / "source.json").write_text(json.dumps(source_cfg, indent=2) + "\n")
+
+    # 3. target.json — client config (fingerprint placeholder)
+    target_cfg = {
+        "mysql": {
+            "host": "127.0.0.1",
+            "port": dst_mysql.port,
+            "user": "root",
+            "password": ROOT_PW
+        },
+        "server": f"127.0.0.1:{src_mysql.server_port}",
+        "server_fingerprint": "REPLACE_WITH_FINGERPRINT",
+        "chunked": 2,
+        "hash-strategies": ["select-sha2"]
+    }
+    (tutorial_dir / "target.json").write_text(json.dumps(target_cfg, indent=2) + "\n")
+
+    # 4. README.md — step-by-step guide
+    bin_rel = f"${{CARGO_TARGET_DIR}}/release/mysql-sync"
+    readme = f"""# mysql-sync Tutorial
+
+## Prerequisites
+
+```bash
+python test.py up          # Start MySQL containers
+```
+
+## Setup — Load the table into both databases
+
+```bash
+mysql -h 127.0.0.1 -P {src_mysql.port} -uroot -p{ROOT_PW} {db} < tutorial/db.sql
+mysql -h 127.0.0.1 -P {dst_mysql.port} -uroot -p{ROOT_PW} {db} < tutorial/db.sql
+```
+
+## Step 1 — Start the server (on source MySQL)
+
+The server reads data from the source and sends hashes to the client.
+
+```bash
+{bin_rel} -C tutorial/source.json &
+```
+
+Wait a moment, then read the fingerprint:
+
+```bash
+cat .fingerprint
+```
+
+Replace `REPLACE_WITH_FINGERPRINT` in `tutorial/target.json` with the output.
+
+## Step 2 — Benchmark
+
+Measures how fast the tool can hash and compare all chunks.
+
+```bash
+{bin_rel} -C tutorial/target.json --benchmark {db}.{src_table}:{db}.{dst_table}
+```
+
+## Step 3 — Check for differences
+
+Compares chunk hashes on both sides. Expected: exit code 1 (differences found).
+
+```bash
+{bin_rel} -C tutorial/target.json --check 0 {db}.{src_table}:{db}.{dst_table}
+```
+
+## Step 4 — Full sync
+
+Copies all differing chunks from source to dest.
+
+```bash
+{bin_rel} -C tutorial/target.json --sync {db}.{src_table}:{db}.{dst_table}
+```
+
+## Step 5 — Verify sync
+
+Confirms all chunks now match. Expected: exit code 0 (no differences).
+
+```bash
+{bin_rel} -C tutorial/target.json --check 0 {db}.{src_table}:{db}.{dst_table}
+```
+
+## Step 6 — Sync with WHERE filter
+
+Delete rows on source, then sync only rows matching a WHERE clause.
+
+```bash
+mysql -h 127.0.0.1 -P {src_mysql.port} -uroot -p{ROOT_PW} -e "DELETE FROM {db}.{src_table} WHERE a < 100"
+```
+
+Edit `tutorial/target.json` and add:
+
+```json
+"tables": {{
+  "{db}.{src_table}:{db}.{dst_table}": {{
+    "sync_where": "a >= 100"
+  }}
+}}
+```
+
+Then sync only the filtered rows:
+
+```bash
+{bin_rel} -C tutorial/target.json --sync {db}.{src_table}:{db}.{dst_table}
+```
+
+## Step 7 — Final check
+
+No problems expected — all filtered chunks should match.
+
+```bash
+{bin_rel} -C tutorial/target.json --check 0 {db}.{src_table}:{db}.{dst_table}
+```
+
+## Cleanup
+
+```bash
+pkill -f mysql-sync
+python test.py down
+```
+"""
+    (tutorial_dir / "README.md").write_text(readme)
+
+    # 5. run.py — automated tutorial
+    run_py = '''#!/usr/bin/env python3
+"""Automated mysql-sync tutorial — runs all steps from README.md end-to-end."""
+
+import asyncio
+import json
+import os
+import signal
+import sys
+
+from u_asyncio import run_show_out_tail_on_error
+
+# Resolve paths relative to this script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.join(SCRIPT_DIR, "..", os.environ.get("CARGO_TARGET_DIR", ".cargo/target"), "release", "mysql-sync")
+if not os.path.exists(BIN):
+    BIN = os.path.join(SCRIPT_DIR, "..", "target", "release", "mysql-sync")
+
+SRC_PORT = ''' + str(src_mysql.port) + '''
+DST_PORT = ''' + str(dst_mysql.port) + '''
+SERVER_PORT = ''' + str(src_mysql.server_port) + '''
+ROOT_PW = "''' + ROOT_PW + '''"
+DB = "''' + db + '''"
+SRC_TABLE = "''' + src_table + '''"
+DST_TABLE = "''' + dst_table + '''"
+
+server_proc = None
+
+
+def info(msg):
+    print(f"\\n\\033[1m>>> {msg}\\033[0m")
+
+
+def die(msg):
+    print(f"\\n\\033[1m\\033[31mFATAL: {msg}\\033[0m")
+    sys.exit(1)
+
+
+async def cleanup(signum=None, frame=None):
+    if signum:
+        print(f"\\nReceived signal {signum}, cleaning up...")
+    import subprocess
+    subprocess.run(["pkill", "-f", "mysql-sync"], stderr=subprocess.DEVNULL)
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, cleanup)
+signal.signal(signal.SIGTERM, cleanup)
+
+
+async def step_1_load_data():
+    """Load db.sql into both source and target databases."""
+    info("Step 1: Load table data into both databases")
+    sql = os.path.join(SCRIPT_DIR, "db.sql")
+    await run_show_out_tail_on_error(
+        ["mysql", "-h", "127.0.0.1", "-P", str(SRC_PORT), "-u", "root", "-p" + ROOT_PW, DB],
+        input=open(sql, "rb").read()
+    )
+    await run_show_out_tail_on_error(
+        ["mysql", "-h", "127.0.0.1", "-P", str(DST_PORT), "-u", "root", "-p" + ROOT_PW, DB],
+        input=open(sql, "rb").read()
+    )
+    print("  Data loaded on both sides")
+
+
+async def step_2_start_server():
+    """Start the mysql-sync server on source MySQL."""
+    info("Step 2: Start server on source MySQL")
+    global server_proc
+    server_cfg = json.dumps({
+        "mysql": {"host": "127.0.0.1", "port": SRC_PORT, "user": "root", "password": ROOT_PW},
+        "listen": "127.0.0.1",
+        "quic_port": SERVER_PORT
+    })
+    server_proc = await asyncio.create_subprocess_exec(
+        BIN, "-C", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    server_proc.stdin.write(server_cfg.encode())
+    server_proc.stdin.close()
+    print(f"  Server started (PID {server_proc.pid})")
+
+    # Read fingerprint from server stdout
+    import re
+    fp = None
+    for _ in range(50):
+        line = await server_proc.stdout.readline()
+        if not line:
+            break
+        text = line.decode(errors="replace").strip()
+        m = re.search(r"TLS-Fingerprint:\\s*(sha256:\\S+)", text)
+        if m:
+            fp = m.group(1)
+            break
+        await asyncio.sleep(0.1)
+    if not fp:
+        die("Server fingerprint not found in stdout")
+    print(f"  Fingerprint: {fp}")
+
+    # Update target.json with real fingerprint
+    target_file = os.path.join(SCRIPT_DIR, "target.json")
+    with open(target_file) as f:
+        cfg = json.load(f)
+    cfg["server_fingerprint"] = fp
+    with open(target_file, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\\n")
+    print("  target.json updated with fingerprint")
+
+
+async def step_3_benchmark():
+    """Run --benchmark to measure hash speed."""
+    info("Step 3: Benchmark — measure hash and compare speed")
+    target = os.path.join(SCRIPT_DIR, "target.json")
+    await run_show_out_tail_on_error(
+        [BIN, "-C", target, "--benchmark", f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}"]
+    )
+
+
+async def step_4_check():
+    """Run --check to detect differences."""
+    info("Step 4: Check — detect differences (expected: exit code 1)")
+    target = os.path.join(SCRIPT_DIR, "target.json")
+    try:
+        await run_show_out_tail_on_error(
+            [BIN, "-C", target, "--check", "0", f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}"]
+        )
+        die("UNEXPECTED: no differences found")
+    except Exception:
+        print("  EXPECTED: differences detected (exit code 1)")
+
+
+async def step_5_sync():
+    """Run --sync to copy all data."""
+    info("Step 5: Sync — copy all differing chunks")
+    target = os.path.join(SCRIPT_DIR, "target.json")
+    await run_show_out_tail_on_error(
+        [BIN, "-C", target, "--sync", f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}"]
+    )
+
+
+async def step_6_verify():
+    """Run --check again to verify sync was complete."""
+    info("Step 6: Verify — confirm no differences remain")
+    target = os.path.join(SCRIPT_DIR, "target.json")
+    await run_show_out_tail_on_error(
+        [BIN, "-C", target, "--check", "0", f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}"]
+    )
+    print("  SUCCESS: tables are identical")
+
+
+async def step_7_sync_with_where():
+    """Delete rows on source, then sync only filtered rows."""
+    info("Step 7: Sync with WHERE — delete rows, sync only matching chunks")
+    # Delete rows with a < 100 on source
+    await run_show_out_tail_on_error(
+        ["mysql", "-h", "127.0.0.1", "-P", str(SRC_PORT), "-u", "root", "-p" + ROOT_PW,
+         "-e", f"DELETE FROM {DB}.{SRC_TABLE} WHERE a < 100"]
+    )
+    print("  Deleted rows a < 100 on source")
+
+    # Update target.json with sync_where
+    target = os.path.join(SCRIPT_DIR, "target.json")
+    with open(target) as f:
+        cfg = json.load(f)
+    cfg["tables"] = {
+        f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}": {
+            "sync_where": "a >= 100"
+        }
+    }
+    with open(target, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\\n")
+    print("  target.json updated with sync_where: a >= 100")
+
+    await run_show_out_tail_on_error(
+        [BIN, "-C", target, "--sync", f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}"]
+    )
+    print("  Synced only rows with a >= 100")
+
+
+async def step_8_final_check():
+    """Final check — no problems expected."""
+    info("Step 8: Final check — all filtered chunks should match")
+    target = os.path.join(SCRIPT_DIR, "target.json")
+    await run_show_out_tail_on_error(
+        [BIN, "-C", target, "--check", "0", f"{DB}.{SRC_TABLE}:{DB}.{DST_TABLE}"]
+    )
+    print("  SUCCESS: tutorial complete")
+
+
+async def main():
+    try:
+        await step_1_load_data()
+        await step_2_start_server()
+        await step_3_benchmark()
+        await step_4_check()
+        await step_5_sync()
+        await step_6_verify()
+        await step_7_sync_with_where()
+        await step_8_final_check()
+    finally:
+        await cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+    (tutorial_dir / "run.py").write_text(run_py)
+
+    print(f"Generated {tutorial_dir}/db.sql")
+    print(f"Generated {tutorial_dir}/source.json")
+    print(f"Generated {tutorial_dir}/target.json")
+    print(f"Generated {tutorial_dir}/README.md")
+    print(f"Generated {tutorial_dir}/run.py")
+    print(f"Run: python tutorial/run.py  (after python test.py up)")
+
+
 ACTIONS = {
     "write_docker_compose": write_docker_compose,
     "up": up,
@@ -1242,6 +1734,8 @@ ACTIONS = {
     "down": down,
     "clean": clean,
     "dump-table-create-sql": dump_table_create_sql,
+    "test_where_constraint": test_where_constraint,
+    "tutorial": write_tutorial_files,
 }
 
 async def main():

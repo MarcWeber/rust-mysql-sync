@@ -112,6 +112,8 @@ pub struct TablePlan {
     pub matched: Option<String>,
     /// Menschliche Notizen zu aufgeloesten Feld-Optionen.
     pub notes: Vec<String>,
+    /// SQL WHERE snippet aus `check_where` / `sync_where` TableOverride.
+    pub extra_where: Option<String>,
 }
 
 /// Loest `tables`/`float_precision` fuer eine Tabelle auf.
@@ -129,6 +131,7 @@ pub fn plan_table(
     columns: &[mysqlutil::ColumnMeta],
     pk_names: &[String],
     forced: Option<HashVia>,
+    mode: Mode,
 ) -> Result<TablePlan> {
     use crate::config::FloatPrecision;
     use crate::proto::{FieldOpt, FieldTransform};
@@ -246,11 +249,35 @@ pub fn plan_table(
         }
     }
 
+    // Extract WHERE clause from TableOverride
+    let extra_where = match matched {
+        Some((_, ov)) => {
+            match mode {
+                Mode::Check => ov.check_where.clone(),
+                Mode::Sync => ov.sync_where.clone(),
+                Mode::Force => None,
+            }
+        }
+        None => None,
+    };
+
+    // Reject Dump mode when WHERE is set
+    if extra_where.is_some() {
+        candidates.retain(|v| *v != HashVia::Dump);
+        if candidates.is_empty() {
+            bail!(
+                "{db}.{table}: check_where/sync_where is set but dump mode cannot filter rows. \
+                 Use select or raw-binary instead."
+            );
+        }
+    }
+
     Ok(TablePlan {
         candidates,
         field_opts,
         matched: matched.map(|(pattern, _)| pattern.to_string()),
         notes,
+        extra_where,
     })
 }
 
@@ -307,6 +334,7 @@ async fn run_local_chunk_stream(
     hash_via: HashVia,
     mode: ChunkMode,
     field_opts: &[proto::FieldOpt],
+    extra_where: Option<&str>,
 ) -> Result<()> {
     let mut conn = mysqlutil::session_conn(pool).await?;
     let names = mysqlutil::column_names(&mut conn, &task.local_db, &task.local_table).await?;
@@ -324,6 +352,7 @@ async fn run_local_chunk_stream(
                 mode,
                 cfg.chunked,
                 algo,
+                extra_where,
             )
             .await?;
         }
@@ -355,6 +384,7 @@ async fn run_local_chunk_stream(
                 mode,
                 cfg.chunked,
                 cfg.hash_algo(),
+                extra_where,
             )
             .await?;
         }
@@ -370,6 +400,7 @@ async fn run_local_chunk_stream(
                 cfg.chunked,
                 cfg.hash_algo(),
                 field_opts,
+                extra_where,
             )
             .await?;
         }
@@ -383,6 +414,7 @@ async fn run_local_chunk_stream(
                 &pk_indexes,
                 mode,
                 cfg.chunked,
+                extra_where,
             )
             .await?;
         }
@@ -433,6 +465,7 @@ async fn start_chunk_stream(
     mut chunk_send: SendHalf,
     chunk_recv: RecvHalf,
     f: Framing,
+    extra_where: Option<&str>,
 ) -> Result<ChunkStream> {
     proto::write_request(
         &mut chunk_send,
@@ -447,6 +480,7 @@ async fn start_chunk_stream(
             profile: raw_profile,
             schema_hash,
             field_opts: field_opts.to_vec(),
+            extra_where: extra_where.map(|s| s.to_string()),
         },
         &f,
     )
@@ -461,6 +495,7 @@ async fn start_chunk_stream(
     let job_pks = local_pks.to_vec();
     let job_pk_names = pk_names.to_vec();
     let job_field_opts = field_opts.to_vec();
+    let job_extra_where = extra_where.map(|s| s.to_string());
     let local_task = tokio::spawn(async move {
         let err_tx = local_tx.clone();
         let res = run_local_chunk_stream(
@@ -473,6 +508,7 @@ async fn start_chunk_stream(
             hash_via,
             mode,
             &job_field_opts,
+            job_extra_where.as_deref(),
         )
         .await;
         if let Err(e) = res {
@@ -616,6 +652,7 @@ pub async fn benchmark_table(
             hash_via,
             mode,
             &[],
+            None,
         )
         .await
     });
@@ -731,8 +768,10 @@ async fn run_inner(
         &column_meta,
         &pk_names,
         forced_via,
+        mode,
     )?;
     let field_opts = plan.field_opts.clone();
+    let extra_where = plan.extra_where.clone();
     if let Some(pattern) = &plan.matched {
         log::info!("[{label}] tables-Selektor {pattern:?} passt");
     }
@@ -908,6 +947,7 @@ async fn run_inner(
             &field_opts,
             raw_profile,
             schema_hash,
+            extra_where.as_deref(),
         )
         .await?;
         bar.done(&format!("{} Zeilen differieren", stats.0));
@@ -1002,6 +1042,7 @@ async fn run_inner(
         send,
         recv,
         f,
+        extra_where.as_deref(),
     )
     .await?;
     let ChunkStream {
@@ -1090,6 +1131,7 @@ async fn run_inner(
                 &field_opts,
                 raw_profile.clone(),
                 schema_hash.clone(),
+                extra_where.as_deref(),
                 &bar,
                 check_examples,
             )
@@ -1121,6 +1163,7 @@ async fn run_inner(
             &field_opts,
             raw_profile,
             schema_hash,
+            extra_where.as_deref(),
             &bar,
             check_examples,
         )
@@ -1219,8 +1262,9 @@ async fn compute_chunk_hashes(
     opts: &[proto::FieldOpt],
     algo: sqlhash::SqlHashAlgo,
     bar: Option<&crate::progress::TableBar>,
+    extra_where: Option<&str>,
 ) -> Result<HashMap<String, (u64, String)>> {
-    let out = sqlhash::chunk_hashes(conn, db, table, pks, opts, mode, chunked, algo).await?;
+    let out = sqlhash::chunk_hashes(conn, db, table, pks, opts, mode, chunked, algo, extra_where).await?;
     if let Some(b) = bar {
         b.set_total(out.len() as u64, "Lokale SQL-Gruppen-Hashes");
         b.inc(out.len() as u64);
@@ -1239,9 +1283,10 @@ async fn compute_row_hashes(
     opts: &[proto::FieldOpt],
     algo: sqlhash::SqlHashAlgo,
     bar: Option<&crate::progress::TableBar>,
+    extra_where: Option<&str>,
 ) -> Result<HashMap<Vec<String>, String>> {
     let rows =
-        sqlhash::row_hashes(conn, db, table, pks, opts, mode, chunked, Some(buckets), algo).await?;
+        sqlhash::row_hashes(conn, db, table, pks, opts, mode, chunked, Some(buckets), algo, extra_where).await?;
     let out: HashMap<Vec<String>, String> = rows.into_iter().map(|r| (r.pk, r.hash)).collect();
     if let Some(b) = bar {
         b.set_total(out.len() as u64, "SQL-Zeilen-Hashes");
@@ -1513,6 +1558,7 @@ async fn row_diff_for_buckets(
     field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
+    extra_where: Option<&str>,
     bar: &crate::progress::TableBar,
 ) -> Result<RowDiff> {
     let f = Framing::from_cfg(cfg);
@@ -1534,6 +1580,7 @@ async fn row_diff_for_buckets(
                 field_opts,
                 algo,
                 Some(bar),
+                extra_where,
             )
             .await?
         }
@@ -1610,6 +1657,7 @@ async fn row_diff_for_buckets(
             profile: raw_profile,
             schema_hash,
             field_opts: field_opts.to_vec(),
+            extra_where: extra_where.map(|s| s.to_string()),
         },
         &f,
     )
@@ -1758,6 +1806,7 @@ async fn sync_diff_batch(
     field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
+    extra_where: Option<&str>,
     bar: &crate::progress::TableBar,
     check_examples: u32,
 ) -> Result<(u64, u64, u64, Vec<String>)> {
@@ -1773,6 +1822,7 @@ async fn sync_diff_batch(
         field_opts,
         raw_profile,
         schema_hash,
+        extra_where,
         bar,
     )
     .await?;
@@ -1813,6 +1863,7 @@ async fn check_diff_batch(
     field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
+    extra_where: Option<&str>,
     bar: &crate::progress::TableBar,
     check_examples: u32,
 ) -> Result<(u64, Vec<String>)> {
@@ -1828,6 +1879,7 @@ async fn check_diff_batch(
         field_opts,
         raw_profile,
         schema_hash,
+        extra_where,
         bar,
     )
     .await?;
@@ -2158,6 +2210,7 @@ async fn diff_and_report(
     field_opts: &[proto::FieldOpt],
     raw_profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
+    extra_where: Option<&str>,
 ) -> Result<(u64, Vec<String>)> {
     let f = Framing::from_cfg(cfg);
     let pk_names: Vec<String> = pks.iter().map(|p| p.name.clone()).collect();
@@ -2179,6 +2232,7 @@ async fn diff_and_report(
         send,
         recv,
         f,
+        extra_where,
     )
     .await?;
     let ChunkStream {
@@ -2273,6 +2327,7 @@ async fn diff_and_report(
                     field_opts,
                     raw_profile.clone(),
                     schema_hash.clone(),
+                    extra_where.as_deref(),
                     bar,
                     check_examples,
                 )
@@ -2307,6 +2362,7 @@ async fn diff_and_report(
                 field_opts,
                 raw_profile,
                 schema_hash,
+                extra_where.as_deref(),
                 bar,
                 check_examples,
             )
@@ -2386,7 +2442,7 @@ mod tests {
             col("price", "float", "float(10,2)"),
         ];
         let pks = vec!["id".to_string()];
-        let plan = plan_table(&cfg, "shop", "orders", &cols, &pks, None).unwrap();
+        let plan = plan_table(&cfg, "shop", "orders", &cols, &pks, None, Mode::Check).unwrap();
         assert_eq!(plan.matched.as_deref(), Some("*.orders"));
         assert_eq!(plan.field_opts.len(), 1);
         assert_eq!(plan.field_opts[0].ordinal, 1);
@@ -2401,7 +2457,7 @@ mod tests {
             col("id", "int", "int"),
             col("price", "double", "double(10,3)"),
         ];
-        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).unwrap();
+        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None, Mode::Check).unwrap();
         assert_eq!(plan.field_opts[0].float_precision, Some(3));
         assert!(plan.notes.iter().any(|n| n.contains("price")));
     }
@@ -2413,13 +2469,13 @@ mod tests {
             col("price", "decimal", "decimal(10,2)"),
         ];
         let cfg = load_cfg(r#"{"mysql":{"user":"u"}}"#);
-        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).unwrap();
+        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None, Mode::Check).unwrap();
         assert!(plan.field_opts.is_empty());
 
         let cfg = load_cfg(
             r#"{"mysql":{"user":"u"},"tables":{"d.t":{"fields":{"price":{"float-precision":2}}}}}"#,
         );
-        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).is_err());
+        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None, Mode::Check).is_err());
     }
 
     #[test]
@@ -2434,9 +2490,9 @@ mod tests {
             col("name", "varchar", "varchar(20)"),
         ];
         let pks = vec!["id".to_string()];
-        let plan = plan_table(&cfg, "d", "t", &cols, &pks, None).unwrap();
+        let plan = plan_table(&cfg, "d", "t", &cols, &pks, None, Mode::Check).unwrap();
         assert_eq!(plan.candidates, vec![HashVia::Dump, HashVia::SelectSha2]);
-        assert!(plan_table(&cfg, "d", "t", &cols, &pks, Some(HashVia::RawBinary)).is_err());
+        assert!(plan_table(&cfg, "d", "t", &cols, &pks, Some(HashVia::RawBinary), Mode::Check).is_err());
     }
 
     #[test]
@@ -2445,13 +2501,13 @@ mod tests {
             r#"{"mysql":{"user":"u"},"tables":{"d.t":{"fields":{"id":{"transform":"trim"}}}}}"#,
         );
         let cols = vec![col("id", "int", "int")];
-        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).is_err());
+        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None, Mode::Check).is_err());
 
         let cfg = load_cfg(
             r#"{"mysql":{"user":"u"},"tables":{"d.t":{"fields":{"n":{"transform":"lower"}}}}}"#,
         );
         let cols = vec![col("id", "int", "int"), col("n", "int", "int")];
-        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).is_err());
+        assert!(plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None, Mode::Check).is_err());
     }
 
     #[test]
@@ -2461,7 +2517,7 @@ mod tests {
             col("id", "int", "int"),
             col("price", "float", "float(10,2)"),
         ];
-        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None).unwrap();
+        let plan = plan_table(&cfg, "d", "t", &cols, &["id".to_string()], None, Mode::Check).unwrap();
         assert!(plan.field_opts.is_empty());
     }
 }

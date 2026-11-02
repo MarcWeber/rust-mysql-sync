@@ -403,6 +403,7 @@ async fn handle_stream(
                 profile,
                 schema_hash,
                 field_opts,
+                extra_where,
             } => {
                 let source = match HashSource::parse(hash_source.as_ref().map(|s| s.as_str())) {
                     Ok(s) => s,
@@ -432,6 +433,7 @@ async fn handle_stream(
                     .collect();
                 let profile = profile.as_ref().map(proto::MysqlProfile::from_archived);
                 let schema_hash = schema_hash.as_ref().map(|s| s.as_str().to_owned());
+                let extra_where = extra_where.as_ref().map(|s| s.as_str().to_owned());
                 // Streaming: writes all responses including the final one itself
                 if let Err(e) = do_hashes(
                     state.as_ref(),
@@ -445,6 +447,7 @@ async fn handle_stream(
                     profile,
                     schema_hash,
                     field_opts,
+                    extra_where.as_deref(),
                     &mut send,
                     &f,
                 )
@@ -842,6 +845,7 @@ async fn do_hashes(
     profile: Option<proto::MysqlProfile>,
     schema_hash: Option<String>,
     field_opts: Vec<proto::FieldOpt>,
+    extra_where: Option<&str>,
     send: &mut SendHalf,
     f: &Framing,
 ) -> Result<()> {
@@ -974,6 +978,7 @@ async fn do_hashes(
                         mode,
                         chunked_c,
                         state.cfg.hash_algo(),
+                        extra_where,
                     )
                     .await
                 }
@@ -989,6 +994,7 @@ async fn do_hashes(
                         chunked_c,
                         state.cfg.hash_algo(),
                         &field_opts,
+                        extra_where,
                     )
                     .await
                 }
@@ -1002,6 +1008,7 @@ async fn do_hashes(
                         &pk_indexes,
                         mode,
                         chunked_c,
+                        extra_where,
                     )
                     .await
                 }
@@ -1033,6 +1040,7 @@ async fn do_hashes(
                         mode,
                         chunked_c,
                         algo,
+                        extra_where,
                     )
                     .await
                 }
@@ -1175,6 +1183,7 @@ async fn do_hashes(
                 chunked_c,
                 selected,
                 algo,
+                extra_where,
             )
             .await?;
             for chunk in rows.chunks(MAX_ROWHASHES_PER_BATCH) {

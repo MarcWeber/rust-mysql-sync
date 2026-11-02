@@ -81,10 +81,11 @@ pub async fn stream_chunk_hashes(
     pk_indexes: &[usize],
     mode: ChunkMode,
     chunked: u32,
+    extra_where: Option<&str>,
 ) -> Result<u64> {
     let algo = cfg.hash_algo();
     let order = crate::sqlhash::order_by_bucket(pks, mode, chunked)?;
-    let mut rx = export::spawn_raw_tsv(cfg, db.to_string(), table.to_string(), None, Some(order));
+    let mut rx = export::spawn_raw_tsv(cfg, db.to_string(), table.to_string(), extra_where.map(|s| s.to_string()), Some(order));
     let mut acc = hash::ChunkAccumulator::new(algo);
     let mut total = 0u64;
     while let Some(msg) = rx.recv().await {

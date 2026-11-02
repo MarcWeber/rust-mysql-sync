@@ -181,6 +181,12 @@ pub struct TableOverride {
     pub strategies: Option<Vec<String>>,
     #[serde(default)]
     pub fields: IndexMap<String, FieldOverride>,
+    /// SQL WHERE snippet injected into check queries (e.g. `"created_at > '2025-01-01'"`).
+    #[serde(default)]
+    pub check_where: Option<String>,
+    /// SQL WHERE snippet injected into sync queries.
+    #[serde(default)]
+    pub sync_where: Option<String>,
 }
 
 impl TableOverride {
