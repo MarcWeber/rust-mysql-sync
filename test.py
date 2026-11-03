@@ -523,7 +523,7 @@ def matrix_cases():
 
     # Representative schemas for extended dimension testing (hash_algo, chunked, compression)
     # to avoid exploding the full matrix. Full matrix uses default config.
-    tables_schemas = TABLE_SCHEMAS.items()
+    tables_schemas = list(TABLE_SCHEMAS.items())
     binary_cases = ("no_binary", "bin")
     rust_modes = RUST_MODES
     rust_algos = RUST_HASH_ALGOS
@@ -884,7 +884,7 @@ async def _prepare_matrix_table(m, case, table):
 
 async def _drop_matrix_chunks(m, table, start):
     cmd = [str(BIN), "-C", "-", f"--testing-drop-chunks={start}",
-           f"{MATRIX_DB}.{table}"]
+            f"{MATRIX_DB}:{table}"]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

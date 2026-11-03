@@ -31,7 +31,7 @@ use std::process::ExitCode;
     name = "mysql-sync",
     version,
     about = "MySQL-Tabellen differentiell über QUIC synchronisieren",
-    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Server:  ./mysql-sync -C server.json\n  Client:  ./mysql-sync -C client.json --sync db1.*\n           ./mysql-sync -C client.json --sync db1.* db2.*\n           ./mysql-sync -C client.json --force --sync db1.*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1.*\n           ./mysql-sync -C client.json --benchmark db_bench.big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1.*\n\nSelectoren: A.B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
+    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Server:  ./mysql-sync -C server.json\n  Client:  ./mysql-sync -C client.json --sync db1:*\n           ./mysql-sync -C client.json --sync db1:* db2:*\n           ./mysql-sync -C client.json --force --sync db1:*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1:*\n           ./mysql-sync -C client.json --benchmark db_bench:big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1:*\n\nSelectoren: A:B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
     /// JSON-Konfigurationsdatei ("-" liest von stdin); mehrfach angebbar, wird rekursiv gemerged
@@ -71,7 +71,7 @@ struct Cli {
     )]
     testing_drop_chunks: Option<u32>,
 
-    /// Selectoren (z.B. "db1.*" oder "db1,db2.t1,t2"); mehrere angebar
+    /// Selectoren (z.B. "db1:*" oder "db1,db2:t1,t2"); mehrere angebar
     #[arg(value_name = "SELECTOR")]
     selectors: Vec<String>,
 
