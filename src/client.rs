@@ -14,9 +14,9 @@ use tokio::sync::Semaphore;
 
 pub struct ClientArgs {
     pub cfg: Config,
-    pub force: Option<String>,
-    pub sync: Option<String>,
-    pub force_schema: Option<String>,
+    pub force: bool,
+    pub sync: bool,
+    pub force_schema: bool,
     pub check: Option<u32>,
     pub selector: Option<String>,
     pub no_progress: bool,
@@ -47,7 +47,8 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
 
     // ---- Task-Enumeration ----
     let mut local_conn = mysqlutil::session_conn(&pool).await?;
-    let dbs = mysqlutil::list_databases(&mut local_conn).await?;
+    let mut table_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     let mut planned: Vec<PlannedTask> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String, u8)> =
@@ -59,47 +60,39 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
         force: bool,
         selector_str: Option<&str>,
         mode: Mode,
-        dbs: &[String],
         cfg: &Config,
         planned: &mut Vec<PlannedTask>,
         seen: &mut std::collections::HashSet<(String, String, u8)>,
         local_conn: &mut mysql_async::Conn,
+        table_cache: &mut std::collections::HashMap<String, Vec<String>>,
         check_examples: u32,
         hash_via: Option<HashVia>,
     ) -> Result<()> {
         let sel = Selector::parse(selector_str)?;
-        for db in dbs {
-            if !sel.matches_db(db) {
+        let pairs = sel.expand(local_conn, table_cache).await?;
+        for (db, table) in pairs {
+            let tag: u8 = if force { 1 } else { 0 } | if mode == Mode::Check { 2 } else { 0 };
+            if !seen.insert((db.clone(), table.clone(), tag)) {
                 continue;
             }
-            let tables = mysqlutil::list_tables(local_conn, db).await?;
-            for table in tables {
-                if !sel.matches_table(&table) {
-                    continue;
-                }
-                let tag: u8 = if force { 1 } else { 0 } | if mode == Mode::Check { 2 } else { 0 };
-                if !seen.insert((db.clone(), table.clone(), tag)) {
-                    continue;
-                }
-                let (rdb, rtable) = map_remote(
-                    db,
-                    &table,
-                    &cfg.database_mappings,
-                    &cfg.database_table_mappings,
-                );
-                planned.push(PlannedTask {
-                    task: TableTask {
-                        local_db: db.clone(),
-                        local_table: table.clone(),
-                        remote_db: rdb,
-                        remote_table: rtable,
-                    },
-                    force,
-                    mode,
-                    check_examples,
-                    hash_via,
-                });
-            }
+            let (rdb, rtable) = map_remote(
+                &db,
+                &table,
+                &cfg.database_mappings,
+                &cfg.database_table_mappings,
+            );
+            planned.push(PlannedTask {
+                task: TableTask {
+                    local_db: db.clone(),
+                    local_table: table.clone(),
+                    remote_db: rdb,
+                    remote_table: rtable,
+                },
+                force,
+                mode,
+                check_examples,
+                hash_via,
+            });
         }
         Ok(())
     }
@@ -121,63 +114,62 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
     };
 
     // Reihenfolge: force-schema → (force+sync gemerged) → sync → check
-    if args.force_schema.is_some() {
+    if args.force_schema {
         add_plan(
             true,
-            args.force_schema.as_deref(),
+            args.selector.as_deref(),
             Mode::Force,
-            &dbs,
             &cfg,
             &mut planned,
             &mut seen,
             &mut local_conn,
+            &mut table_cache,
             check_examples,
             hash_via,
         )
         .await?;
     }
-    if args.force.is_some() && args.sync.is_some() {
+    if args.force && args.sync {
         // --force --sync: EIN Task (Recreate + differentieller Abgleich in Sequence)
-        let sel = args.sync.as_deref().or(args.force.as_deref());
         add_plan(
             true,
-            sel,
+            args.selector.as_deref(),
             Mode::Sync,
-            &dbs,
             &cfg,
             &mut planned,
             &mut seen,
             &mut local_conn,
+            &mut table_cache,
             check_examples,
             hash_via,
         )
         .await?;
     } else {
-        if args.force.is_some() {
+        if args.force {
             add_plan(
                 true,
-                args.force.as_deref(),
+                args.selector.as_deref(),
                 Mode::Force,
-                &dbs,
                 &cfg,
                 &mut planned,
                 &mut seen,
                 &mut local_conn,
+                &mut table_cache,
                 check_examples,
                 hash_via,
             )
             .await?;
         }
-        if args.sync.is_some() {
+        if args.sync {
             add_plan(
                 false,
-                args.sync.as_deref(),
+                args.selector.as_deref(),
                 Mode::Sync,
-                &dbs,
                 &cfg,
                 &mut planned,
                 &mut seen,
                 &mut local_conn,
+                &mut table_cache,
                 check_examples,
                 hash_via,
             )
@@ -189,11 +181,11 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
             false,
             args.selector.as_deref(),
             Mode::Check,
-            &dbs,
             &cfg,
             &mut planned,
             &mut seen,
             &mut local_conn,
+            &mut table_cache,
             check_examples,
             hash_via,
         )

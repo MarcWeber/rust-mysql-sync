@@ -2,6 +2,11 @@
 
 # mysql-sync(1)
 
+
+${CARGO_TARGET_DIR}/release/mysql-sync
+
+Start mysql-sync on source and target server and tell which tables to
+
 Start mysql-sync on source and target server and tell which tables to
 synchronize by glob patterns.
 
@@ -33,7 +38,7 @@ you can pick the fastest way
 
 ```
 # SOURCE (CLIENT)
-mysql-sync -C CONFIG [--force-schema|--force|--sync|--check N|--benchmark] [OPTIONS] [SELECTOR]
+mysql-sync -C CONFIG [--force-schema|--force|--sync|--check N|--benchmark] [OPTIONS] [...SELECTORS]
 
 # TARGET (SERVER)
 mysql-sync -C config.json
@@ -48,8 +53,35 @@ transfers only differing rows. Transport is QUIC/TLS 1.3 with certificate
 pinning. **Client and server must use the same `hash_algo`** (the Hello
 handshake aborts otherwise), but `--hash-select` always uses MySQL `MD5`.
 
-`SELECTOR` = `A.B` — `A` = DB list or `*`, `B` = table list or `*`.
-Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`, `db1,db2.t1,t2`
+`SELECTORS` = `A.B` — `A` = DB list or `*`, `B` = table list or `*`.
+Examples: 
+`db1.*` # all tables from db1
+`db1,db2.*` # all tables from db1 and db2
+`db1.t1,t2` # tables t1 t2 form db1
+`db1,db2.t1,t2` # tablse t1 t2 from db1 and db2
+`db1*,*db2.*foo,bar*,` all tables starting with bar or ending with foo on databases starting in db1 or ending in db2
+
+So parsing is split by . then split by ,
+then product of all database / table patterns
+then for ecah database table patterns follow previous strategy
+
+Can you please implement like this ?
+a*.b* works like this
+1) create list of databases
+2) if any tables match the a* pattern, keep the list
+3) for each of the matched databases create list of tables
+   then filter matching the b* pattern
+   -> add to a set so that each combination database.table is found only once.
+
+If the databases/tables don't contain * then short circuit and avoid the
+expensive querying ?
+
+Cache the tables per database so that the db is only queried once.
+Thus use somethting rlike   tables_cache_by_db_name[] as hash ..
+if not set query then ..
+
+
+Multiple selectors cane be given such as A.* B.* C.foo C.bar
 
 | Mode | Effect |
 |---|---|

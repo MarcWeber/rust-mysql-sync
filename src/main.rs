@@ -31,7 +31,7 @@ use std::process::ExitCode;
     name = "mysql-sync",
     version,
     about = "MySQL-Tabellen differentiell über QUIC synchronisieren",
-    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Server:  ./mysql-sync -C server.json\n  Client:  ./mysql-sync -C client.json --sync db1.*\n           ./mysql-sync -C client.json --force --sync db1.*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1.*\n           ./mysql-sync -C client.json --benchmark db_bench.big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1.*\n\nSelector A.B: A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
+    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Server:  ./mysql-sync -C server.json\n  Client:  ./mysql-sync -C client.json --sync db1.*\n           ./mysql-sync -C client.json --sync db1.* db2.*\n           ./mysql-sync -C client.json --force --sync db1.*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1.*\n           ./mysql-sync -C client.json --benchmark db_bench.big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1.*\n\nSelectoren: A.B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
     /// JSON-Konfigurationsdatei ("-" liest von stdin); mehrfach angebbar, wird rekursiv gemerged
@@ -42,39 +42,38 @@ struct Cli {
     #[arg(long = "generate-configs", value_name = "DIR")]
     generate_configs: Option<PathBuf>,
 
-    /// Schema der Zieltabellen erzwingen (erstellen / neu erstellen). Optionaler Selector A.B
-    #[arg(long, num_args = 0..=1, default_missing_value = "*")]
-    force: Option<String>,
+    /// Schema der Zieltabellen erzwingen (erstellen / neu erstellen)
+    #[arg(long)]
+    force: bool,
 
-    /// Tabelleninhalte abgleichen (differentiell). Optionaler Selector A.B
-    #[arg(long, num_args = 0..=1, default_missing_value = "*")]
-    sync: Option<String>,
+    /// Tabelleninhalte abgleichen (differentiell)
+    #[arg(long)]
+    sync: bool,
 
     /// Nur Schema für ganze Datenbanken erzwingen: Liste von DBs oder *
-    #[arg(long = "force-schema", num_args = 0..=1, default_missing_value = "*")]
-    force_schema: Option<String>,
+    #[arg(long = "force-schema")]
+    force_schema: bool,
 
     /// Anzahl unterschiedlicher Zeilen je Tabelle ermitteln; Wert = Anzahl Beispiel-IDs (z.B. --check 10)
     #[arg(long)]
     check: Option<u32>,
 
-    /// Chunk-Hashes lokal erzeugen und Zeit messen (kein Server, kein Schreiben). Optionaler Selector A.B
-    #[arg(long, num_args = 0..=1, default_missing_value = "*")]
-    benchmark: Option<String>,
+    /// Chunk-Hashes lokal erzeugen und Zeit messen (kein Server, kein Schreiben)
+    #[arg(long)]
+    benchmark: bool,
 
     /// Nur fuer Tests: ab Chunk S die Chunks S..S+3 in der lokalen DB loeschen
-    /// (alle / erste / letzte / zufaellige Zeile). Optionaler Selector A.B.
+    /// (alle / erste / letzte / zufaellige Zeile)
     #[arg(
         long = "testing-drop-chunks",
         alias = "testing-drop-chunks-source",
-        alias = "testing-drop-chunks-dest",
-        num_args = 0..=1,
-        default_missing_value = "0"
+        alias = "testing-drop-chunks-dest"
     )]
-    testing_drop_chunks: Option<String>,
+    testing_drop_chunks: Option<u32>,
 
-    /// Selector A.B (z.B. "db1.*" oder "db1,db2.t1,t2")
-    selector: Option<String>,
+    /// Selectoren (z.B. "db1.*" oder "db1,db2.t1,t2"); mehrere angebar
+    #[arg(value_name = "SELECTOR")]
+    selectors: Vec<String>,
 
     /// Keine Fortschrittsbalken anzeigen (für Cron/CI)
     #[arg(long)]
@@ -159,9 +158,15 @@ async fn main() -> ExitCode {
         }
     };
 
-    let is_client = cli.force.is_some()
-        || cli.sync.is_some()
-        || cli.force_schema.is_some()
+    let selector_str = if cli.selectors.is_empty() {
+        None
+    } else {
+        Some(cli.selectors.join(","))
+    };
+
+    let is_client = cli.force
+        || cli.sync
+        || cli.force_schema
         || cli.check.is_some()
         || cli.testing_drop_chunks.is_some();
 
@@ -181,15 +186,10 @@ async fn main() -> ExitCode {
         sync::HashVia::ALL.to_vec()
     };
 
-    let result = if let Some(start) = cli.testing_drop_chunks.as_deref() {
-        match start.parse::<u32>() {
-            Ok(start) => testing::run(&cfg, cli.selector.as_deref(), start).await,
-            Err(e) => Err(anyhow::anyhow!(
-                "--testing-drop-chunks erwartet eine Chunk-Nummer: {e}"
-            )),
-        }
-    } else if let Some(selector) = cli.benchmark.clone() {
-        benchmark::run(&cfg, Some(&selector), &bench_modes).await
+    let result = if let Some(start) = cli.testing_drop_chunks {
+        testing::run(&cfg, selector_str.as_deref(), start).await
+    } else if cli.benchmark {
+        benchmark::run(&cfg, selector_str.as_deref(), &bench_modes).await
     } else if is_client {
         client::run(client::ClientArgs {
             cfg,
@@ -197,7 +197,7 @@ async fn main() -> ExitCode {
             sync: cli.sync,
             force_schema: cli.force_schema,
             check: cli.check,
-            selector: cli.selector,
+            selector: selector_str,
             no_progress: cli.no_progress,
             hash_via_select_sha2: cli.hash_via_select_sha2,
             hash_via_select_crc32: cli.hash_via_select_crc32,
