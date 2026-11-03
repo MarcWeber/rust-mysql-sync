@@ -6,18 +6,22 @@ Start mysql-sync on source and target server and tell which tables to
 synchronize by glob patterns.
 
 SYNCHRONIZATION:
-on target machine build hashes on chunks send to source machine,
-if hashes differ hash rows -> send diff of chunk to server which applies
-target.
+On source & target machine build hashes on chunks of rows.
+If they differ hash the rows and send a diff.
+So you get close to IO speed for rows which have no changes.
 
-A chunk is defined by int/binary/varchar primary keys eg any last n chars
-such as 19.. (thus 1901 1902 1903 ..) or Benjam.. (eg for names such as
-Benjamin)
+If that is not enough check_where and sync_where allows to set
+constraints such as ID > 20123 to ignore old never changing rows.
+
+Chunks size (range mode) is the number of last chars of the primary key
+to include:
+1 =   10 (0-  9)
+2 =  100 (0- 99)
+3 = 1000 (0-999)
 
 ## HOW IT WORKS
-The client connects to server.
+The client connects to server and starts the checks or synchronization.
 The client controls the server and tells how and what to sync or check.
-
 
 ## NAME
 
@@ -616,11 +620,12 @@ Differences from mysql-sync:
 
 ## FUTURE IMPROVEMENTS
 
-TODO: Maybe its not very smart to allow the client to
-control the server, maybe it should be the other way
-round.
+Client/server both can be both roles. So ideally this should turn into
+a daemon to be controlled such as send a command "sync this now".
 
-Maybe concurrent processing witihn a table in case if all data are in
+The server eventually should have ways to limit access to databases
+
+Maybe concurrent processing within a table in case if all data are in
 RAM that would be even faster.
 
 ## SEE ALSO
