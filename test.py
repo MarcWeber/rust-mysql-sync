@@ -1268,25 +1268,26 @@ async def test_where_constraint():
     async with AsyncExitStack() as stack:
         fingerprint = await stack.enter_async_context(src.server_running())
 
-        # Each test: [chunked, src_fill_range, dst_fill_range, where_sql]
+        # Each test: [chunked, src_fill_start, src_fill_stop, dst_fill_start, dst_fill_stop, where_start, where_stop]
+        # The WHERE clause is "id >= where_start AND id <= where_stop"
+        # Rows outside this range on dest must remain untouched after sync
         tests = [
-            [1, [0, 100], [0, 10], "id >= 0 AND id <= 10"],
-            [1, [0, 100], [0, 10], "id >= 1 AND id <= 10"],
-            [1, [0, 100], [90, 99], "id >= 90 AND id <= 100"],
-            [1, [0, 100], [90, 99], "id >= 85 AND id <= 99"],
-
-            [1, [0, 10], [0, 10], "id >= 0 AND id <= 10"],
-            [1, [90, 100], [0, 10], "id >= 1 AND id <= 10"],
-            [1, [0, 10], [90, 99], "id >= 90 AND id <= 100"],
-            [1, [90, 100], [90, 99], "id >= 85 AND id <= 99"],
+            [1, 0, 100, 0, 10, 0, 10],
+            [1, 0, 100, 0, 10, 1, 10],
+            [1, 0, 100, 90, 99, 90, 100],
+            [1, 0, 100, 90, 99, 85, 99],
+            [1, 0, 10, 0, 10, 0, 10],
+            [1, 90, 100, 0, 10, 1, 10],
+            [1, 0, 10, 90, 99, 90, 100],
+            [1, 90, 100, 90, 99, 85, 99],
         ]
 
-        for i, (chunked, src_range, dst_range, where_sql) in enumerate(tests, 1):
-            print(f"  Test {i}: chunked={chunked} src={src_range} dst={dst_range} WHERE {where_sql}")
+        for i, (chunked, src_start, src_stop, dst_start, dst_stop, w_start, w_stop) in enumerate(tests, 1):
+            where_sql = f"id >= {w_start} AND id <= {w_stop}"
+            print(f"  Test {i}: src=[{src_start},{src_stop}] dst=[{dst_start},{dst_stop}] WHERE {where_sql}")
 
-            # Fill source and dest with different ranges
-            await truncate_fill_table(src, db, table, src_range[0], src_range[1])
-            await truncate_fill_table(dst, db, table, dst_range[0], dst_range[1])
+            await truncate_fill_table(src, db, table, src_start, src_stop)
+            await truncate_fill_table(dst, db, table, dst_start, dst_stop)
 
             cfg = {
                 "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
@@ -1303,24 +1304,39 @@ async def test_where_constraint():
             }
             cfg_json = json.dumps(cfg)
 
-            # Check (may find differences or not depending on WHERE range)
-            await _timed(
+            # Capture dest rows BELOW and ABOVE the WHERE range before sync
+            below_before = await dst.sql(f"SELECT id, name, value FROM {db}.{table} WHERE id < {w_start} ORDER BY id", quiet=True)
+            above_before = await dst.sql(f"SELECT id, name, value FROM {db}.{table} WHERE id > {w_stop} ORDER BY id", quiet=True)
+
+            # Check
+            ms, (_, _, rc) = await _timed(
                 [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
                 cfg_json.encode(), expected_rcs=(0, 1)
             )
+            print(f"      Check: rc={rc} ({ms:.0f}ms)")
 
-            # Sync copies missing rows within WHERE range
-            await _timed(
+            # Sync
+            ms, (_, _, _) = await _timed(
                 [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}.{table}"],
                 cfg_json.encode()
             )
+            print(f"      Sync: ok ({ms:.0f}ms)")
 
-            # Verify rows match in Python after sync
+            # Verify rows WITHIN range match source
             q = f"SELECT id, name, value FROM {db}.{table} WHERE {where_sql} ORDER BY id"
             src_rows = await src.sql(q, quiet=True)
             dst_rows = await dst.sql(q, quiet=True)
-            if src_rows.strip() != dst_rows.strip():
-                raise RuntimeError(f"Row mismatch for WHERE {where_sql}")
+            assert src_rows.strip() == dst_rows.strip(), f"Row mismatch for WHERE {where_sql}"
+            print(f"      Verify within range: match")
+
+            # Verify rows OUTSIDE range on dest are UNCHANGED
+            below_after = await dst.sql(f"SELECT id, name, value FROM {db}.{table} WHERE id < {w_start} ORDER BY id", quiet=True)
+            above_after = await dst.sql(f"SELECT id, name, value FROM {db}.{table} WHERE id > {w_stop} ORDER BY id", quiet=True)
+            assert below_before.strip() == below_after.strip(), f"Rows below range changed: id < {w_start}"
+            assert above_before.strip() == above_after.strip(), f"Rows above range changed: id > {w_stop}"
+            print(f"      Verify outside range: unchanged")
+
+            print(f"    PASS")
 
         # Cleanup
         await src.sql(f"DROP TABLE IF EXISTS {db}.{table}")
