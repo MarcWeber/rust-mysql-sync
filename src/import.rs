@@ -222,7 +222,7 @@ fn is_allowed_statement(s: &str) -> bool {
 pub fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = sql.as_bytes();
-    let mut cur = String::with_capacity(sql.len());
+    let mut cur: Vec<u8> = Vec::with_capacity(sql.len());
     let mut i = 0;
     let mut in_squote = false;
     let mut in_dquote = false;
@@ -251,8 +251,8 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
                 }
                 if is_exec && j + 1 < bytes.len() {
                     let inner = &sql[i + 3..j]; // nach "/*!"
-                    cur.push_str(inner);
-                    cur.push(' ');
+                    cur.extend_from_slice(inner.as_bytes());
+                    cur.push(b' ');
                 }
                 i = (j + 2).min(bytes.len());
                 continue;
@@ -262,18 +262,18 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
                 '"' if !in_squote => in_dquote = !in_dquote,
                 '`' if !in_squote && !in_dquote => in_backtick = !in_backtick,
                 ';' if !in_squote && !in_dquote && !in_backtick => {
-                    out.push(cur.trim().to_string());
-                    cur = String::with_capacity(cur.capacity());
+                    out.push(String::from_utf8_lossy(&cur).trim().to_string());
+                    cur.clear();
                     i += 1;
                     continue;
                 }
                 _ => {}
             }
         } else if c == '\\' && i + 1 < bytes.len() && (in_squote || in_dquote) {
-            cur.push(c);
+            cur.push(bytes[i]);
             i += 1;
             if i < bytes.len() {
-                cur.push(bytes[i] as char);
+                cur.push(bytes[i]);
                 i += 1;
             }
             continue;
@@ -284,11 +284,12 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
         } else if c == '`' && in_backtick {
             in_backtick = false;
         }
-        cur.push(c);
+        cur.push(bytes[i]);
         i += 1;
     }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
+    let text = String::from_utf8_lossy(&cur);
+    if !text.trim().is_empty() {
+        out.push(text.trim().to_string());
     }
     out
 }
@@ -415,6 +416,13 @@ mod tests {
         assert!(st[0].starts_with("INSERT"));
         assert!(st[1].starts_with("REPLACE"));
         assert!(st[1].contains("x\\'y")); // Escape bleibt erhalten (korrekt für SQL-Ausführung)
+    }
+
+    #[test]
+    fn split_statements_preserves_utf8() {
+        let st = split_sql_statements("REPLACE INTO `t` VALUES ('ä');");
+        assert_eq!(st.len(), 1);
+        assert!(st[0].contains("'ä'"), "UTF-8 wurde verfälscht: {:?}", st[0]);
     }
 
     #[test]

@@ -71,15 +71,7 @@ impl HashSource {
     }
 }
 
-pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::process::ExitCode> {
-    // Bei Config von stdin gibt es keinen Dateinamen; Zertifikate landen dann
-    // neben dem Arbeitsverzeichnis unter dem üblichen Namen.
-    let cert_base = if config_path == std::path::Path::new("-") {
-        std::path::PathBuf::from("config-server.json")
-    } else {
-        config_path.to_path_buf()
-    };
-
+pub async fn run(cfg: Config) -> Result<std::process::ExitCode> {
     let pool = mysqlutil::new_pool(&cfg.mysql, None)?;
     let state = Arc::new(ServerState { cfg, pool });
     let quic_addr = state.cfg.listen_addr()?;
@@ -108,7 +100,7 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
         None
     };
 
-    let (certs, key, fingerprint) = tls::server_identity(&state.cfg, &cert_base)?;
+    let (certs, key, fingerprint) = tls::server_identity(&state.cfg)?;
     let provider = tls::ring_provider();
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -127,7 +119,7 @@ pub async fn run(cfg: Config, config_path: &std::path::Path) -> Result<std::proc
         .with_context(|| format!("QUIC-Listener auf {quic_addr}"))?;
 
     eprintln!("mysql-sync Server lauscht auf {quic_addr} (quic/tls)");
-    eprintln!("TLS-Fingerprint: {fingerprint}");
+    println!("TLS-Fingerprint: {fingerprint}");
     eprintln!("→ Fingerprints in config-client.json → \"server_fingerprint\" (Pinning empfohlen)");
 
     // Run both QUIC and optional TCP listeners concurrently

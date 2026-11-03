@@ -1,8 +1,7 @@
 //! TLS: Self-signed-Zertifikate (Server) + Fingerprint-Pinning (Client).
 //!
-//! Server: erzeugt beim ersten Start ein Self-signed-Zertifikat neben der
-//! Config (mysql-sync-cert.pem / mysql-sync-key.pem) und schreibt den
-//! SHA-256-Fingerprint in <config>.fingerprint.
+//! Server: liest Zertifikat und Key als PEM aus der JSON-Config
+//! (`tls_cert_pem` / `tls_key_pem`, erzeugt von `--generate-configs`).
 //! Client: prüft via custom ServerCertVerifier, ob der Fingerprint in
 //! "server_fingerprint" (sha256:<hex>) passt. Ohne Pinning: TOFU mit Warnung.
 
@@ -29,36 +28,8 @@ fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("Fingerprint muss 32 Bytes (64 Hex-Zeichen) haben"))
 }
 
-/// Lädt oder erzeugt Server-Identität. Liefert (certs, key, fingerprint).
-pub fn server_identity(
-    cfg: &Config,
-    config_path: &std::path::Path,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)> {
-    if let (Some(cp), Some(kp)) = (&cfg.tls_cert, &cfg.tls_key) {
-        let (certs, key) = load_pem(std::path::Path::new(cp), std::path::Path::new(kp))?;
-        let fp = fingerprint_of(certs[0].as_ref());
-        return Ok((certs, key, fp));
-    }
-
-    let stem: String = config_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "config".into());
-    let dir = config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let cert_path = dir.join(format!("{stem}-cert.pem"));
-    let key_path = dir.join(format!("{stem}-key.pem"));
-
-    if cert_path.exists() && key_path.exists() {
-        let (certs, key) = load_pem(&cert_path, &key_path)?;
-        let fp = fingerprint_of(certs[0].as_ref());
-        let fp_path = config_path.with_extension("fingerprint");
-        let _ = std::fs::write(&fp_path, format!("{fp}\n"));
-        return Ok((certs, key, fp));
-    }
-
-    log::info!("Erzeuge neues Self-signed-Zertifikat …");
+/// Erzeugt ein neues Self-signed-Zertifikat: (cert_pem, key_pem, fingerprint).
+pub fn generate_identity() -> Result<(String, String, String)> {
     let mut params =
         rcgen::CertificateParams::new(vec!["mysql-sync".to_string()]).context("rcgen-Params")?;
     params
@@ -68,47 +39,45 @@ pub fn server_identity(
     let cert = params
         .self_signed(&key_pair)
         .context("Self-Signing fehlgeschlagen")?;
-
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-    std::fs::write(&cert_path, &cert_pem)
-        .with_context(|| format!("Schreiben {}", cert_path.display()))?;
-    std::fs::write(&key_path, &key_pem)
-        .with_context(|| format!("Schreiben {}", key_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    let (certs, key) = load_pem(&cert_path, &key_path)?;
+    let (certs, _) = parse_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
     let fp = fingerprint_of(certs[0].as_ref());
-    let fp_path = config_path.with_extension("fingerprint");
-    let _ = std::fs::write(&fp_path, format!("{fp}\n"));
-    log::info!("Server-Fingerprint: {fp}");
-    log::info!("→ in config-client.json unter \"server_fingerprint\" eintragen (Pinning)");
+    Ok((cert_pem, key_pem, fp))
+}
+
+/// Liest die Server-Identität ausschließlich aus den PEM-Feldern der Config.
+pub fn server_identity(
+    cfg: &Config,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)> {
+    let (cp, kp) = match (&cfg.tls_cert_pem, &cfg.tls_key_pem) {
+        (Some(cp), Some(kp)) => (cp, kp),
+        (None, None) => bail!(
+            "Server-Config braucht \"tls_cert_pem\" und \"tls_key_pem\" \
+             (erzeuge sie mit --generate-configs)"
+        ),
+        _ => bail!("tls_cert_pem und tls_key_pem müssen gemeinsam gesetzt sein"),
+    };
+    let (certs, key) = parse_pem(cp.as_bytes(), kp.as_bytes())?;
+    let fp = fingerprint_of(certs[0].as_ref());
     Ok((certs, key, fp))
 }
 
-fn load_pem(
-    cert_path: &std::path::Path,
-    key_path: &std::path::Path,
+fn parse_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let cert_pem =
-        std::fs::read(cert_path).with_context(|| format!("Lesen {}", cert_path.display()))?;
-    let key_pem =
-        std::fs::read(key_path).with_context(|| format!("Lesen {}", key_path.display()))?;
-    let mut cr = &cert_pem[..];
+    let mut cr = cert_pem;
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cr)
         .collect::<std::result::Result<_, _>>()
         .context("Zertifikat-PEM ungültig")?;
     if certs.is_empty() {
-        bail!("Kein Zertifikat in {}", cert_path.display());
+        bail!("Kein Zertifikat im PEM");
     }
-    let mut kr = &key_pem[..];
+    let mut kr = key_pem;
     let key = rustls_pemfile::private_key(&mut kr)
         .context("Key-PEM ungültig")?
-        .with_context(|| format!("Kein privater Key in {}", key_path.display()))?;
+        .context("Kein privater Key im PEM")?;
     Ok((certs, key))
 }
 

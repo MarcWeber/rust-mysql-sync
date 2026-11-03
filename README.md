@@ -49,6 +49,7 @@ Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`, `db1,db2.t1,t2`
 
 | Mode | Effect |
 |---|---|
+| `--generate-configs dir` | creates dir/{server,client}.json configs with certs
 | `--force-schema [SEL]` | Create/align schema and databases only. | (TODO better name such as --try-update-schema)
 | `--force [SEL]` | Recreate the target table (data loss) |
 | `--sync [SEL]` | Differential sync (INSERT/UPDATE/DELETE) |
@@ -618,7 +619,7 @@ TODO: Maybe its not very smart to allow the client to
 control the server, maybe it should be the other way
 round.
 
-Maybe concurrent processing within a table in case if all data are in
+Maybe concurrent processing witihn a table in case if all data are in
 RAM that would be even faster.
 
 ## SEE ALSO

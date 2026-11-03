@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub const DEFAULT_SERVER_PORT: u16 = 4433;
@@ -343,11 +343,11 @@ pub struct Config {
     #[serde(default, alias = "auth_token")]
     pub auth_token: Option<String>,
 
-    /// Optionale eigene TLS-Dateien (Server). Ohne Angabe: Self-signed neben der Config.
+    /// Server-Identität als PEM-Inhalt (aus `--generate-configs`).
     #[serde(default)]
-    pub tls_cert: Option<String>,
+    pub tls_cert_pem: Option<String>,
     #[serde(default)]
-    pub tls_key: Option<String>,
+    pub tls_key_pem: Option<String>,
 
     /// QUIC-Connect-Timeout in Sekunden
     #[serde(default = "d_connect_timeout", alias = "connect_timeout_secs")]
@@ -494,17 +494,98 @@ fn normalize_tables(v: &mut serde_json::Value) {
 }
 
 pub fn load(path: &Path) -> Result<Config> {
-    let (raw, source) = if path == Path::new("-") {
+    load_many(&[path.to_path_buf()])
+}
+
+/// Lädt mehrere JSON-Configs und merged sie rekursiv (spätere Dateien gewinnen).
+pub fn load_many(paths: &[PathBuf]) -> Result<Config> {
+    if paths.is_empty() {
+        bail!("Mindestens eine Config-Datei mit -C/--config angeben");
+    }
+    let mut merged = serde_json::Value::Object(serde_json::Map::new());
+    for path in paths {
+        let (raw, source) = read_config(path)?;
+        let mut v: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("JSON ungültig: {source}"))?;
+        normalize_keys(&mut v);
+        merge_value(&mut merged, v);
+    }
+    let cfg: Config = serde_json::from_value(merged).context("Config-Schema ungültig")?;
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+fn read_config(path: &Path) -> Result<(String, String)> {
+    if path == Path::new("-") {
         let mut s = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
             .context("Config von stdin nicht lesbar")?;
-        (s, "stdin".to_string())
+        Ok((s, "stdin".to_string()))
     } else {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("Konfigdatei nicht lesbar: {}", path.display()))?;
-        (s, path.display().to_string())
-    };
-    parse(&raw, &source)
+        Ok((s, path.display().to_string()))
+    }
+}
+
+fn merge_value(dst: &mut serde_json::Value, src: serde_json::Value) {
+    match (dst, src) {
+        (serde_json::Value::Object(dst_map), serde_json::Value::Object(src_map)) => {
+            for (k, v) in src_map {
+                match dst_map.get_mut(&k) {
+                    Some(existing) => merge_value(existing, v),
+                    None => {
+                        dst_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (dst, src) => *dst = src,
+    }
+}
+
+/// Erzeugt server.json + client.json inkl. Self-signed-PEM und Fingerprint.
+pub fn generate_configs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let server_path = dir.join("server.json");
+    let client_path = dir.join("client.json");
+    for p in [&server_path, &client_path] {
+        if p.exists() {
+            bail!("{} existiert bereits", p.display());
+        }
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Verzeichnis anlegen: {}", dir.display()))?;
+
+    let (cert_pem, key_pem, fp) = crate::tls::generate_identity()?;
+    let server = serde_json::json!({
+        "mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "password": ""},
+        "listen": "127.0.0.1",
+        "quic_port": DEFAULT_SERVER_PORT,
+        "tls_cert_pem": cert_pem,
+        "tls_key_pem": key_pem,
+        "server_fingerprint": fp,
+    });
+    let client = serde_json::json!({
+        "mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "password": ""},
+        "server": format!("127.0.0.1:{DEFAULT_SERVER_PORT}"),
+        "quic_port": DEFAULT_SERVER_PORT,
+        "server_fingerprint": fp,
+    });
+    write_private_json(&server_path, &server)?;
+    write_private_json(&client_path, &client)?;
+    Ok((server_path, client_path))
+}
+
+fn write_private_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let mut text = serde_json::to_string_pretty(value).context("JSON serialisieren")?;
+    text.push('\n');
+    std::fs::write(path, text).with_context(|| format!("Schreiben {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse(raw: &str, source: &str) -> Result<Config> {

@@ -31,12 +31,16 @@ use std::process::ExitCode;
     name = "mysql-sync",
     version,
     about = "MySQL-Tabellen differentiell über QUIC synchronisieren",
-    after_help = "Beispiele:\n  Server:  ./mysql-sync -C config-server.json\n  Client:  ./mysql-sync -C config-client.json --sync db1.*\n           ./mysql-sync -C config-client.json --force --sync db1.*\n           ./mysql-sync -C config-client.json --force-schema db1,db2\n           ./mysql-sync -C config-client.json --check 10 db1.*\n           ./mysql-sync -C config-client.json --benchmark db_bench.big\n\nSelector A.B: A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
+    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Server:  ./mysql-sync -C server.json\n  Client:  ./mysql-sync -C client.json --sync db1.*\n           ./mysql-sync -C client.json --force --sync db1.*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1.*\n           ./mysql-sync -C client.json --benchmark db_bench.big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1.*\n\nSelector A.B: A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
-    /// Pfad zur JSON-Konfigurationsdatei ("-" liest die Config von stdin)
-    #[arg(short = 'C', long = "config")]
-    config: PathBuf,
+    /// JSON-Konfigurationsdatei ("-" liest von stdin); mehrfach angebbar, wird rekursiv gemerged
+    #[arg(short = 'C', long = "config", value_name = "FILE")]
+    config: Vec<PathBuf>,
+
+    /// Erzeugt DIR/server.json + DIR/client.json inkl. PEM und Fingerprint
+    #[arg(long = "generate-configs", value_name = "DIR")]
+    generate_configs: Option<PathBuf>,
 
     /// Schema der Zieltabellen erzwingen (erstellen / neu erstellen). Optionaler Selector A.B
     #[arg(long, num_args = 0..=1, default_missing_value = "*")]
@@ -128,7 +132,26 @@ async fn main() -> ExitCode {
         .format_timestamp_secs()
         .init();
 
-    let cfg = match config::load(&cli.config) {
+    if let Some(dir) = &cli.generate_configs {
+        return match config::generate_configs(dir) {
+            Ok((server, client)) => {
+                println!("{}", server.display());
+                println!("{}", client.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                log::error!("{e:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    if cli.config.is_empty() {
+        log::error!("-C/--config fehlt");
+        return ExitCode::from(2);
+    }
+
+    let cfg = match config::load_many(&cli.config) {
         Ok(c) => c,
         Err(e) => {
             log::error!("Config-Fehler: {e:#}");
@@ -185,7 +208,7 @@ async fn main() -> ExitCode {
         })
         .await
     } else {
-        server::run(cfg, &cli.config).await
+        server::run(cfg).await
     };
 
     match result {
