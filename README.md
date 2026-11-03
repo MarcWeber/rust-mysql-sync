@@ -53,22 +53,26 @@ transfers only differing rows. Transport is QUIC/TLS 1.3 with certificate
 pinning. **Client and server must use the same `hash_algo`** (the Hello
 handshake aborts otherwise), but `--hash-select` always uses MySQL `MD5`.
 
-`SELECTORS` = `A:B` — `A` = DB list or `*`, `B` = table list or `*`.
+`SELECTORS` = `A:B` 
+`A` = DB list or pattern
+`B` = table list or pattern
+
+### patterns
 
 Examples (GLOB)
-    * => any chars
-    ? => any char
-    `db1:*` # all tables from db1
-    `db1,db2:*` # all tables from db1 and db2
-    `db1:t1,t2` # tables t1 t2 form db1
-    `db1,db2:t1,t2` # tablse t1 t2 from db1 and db2
-    `db1*,*db2:*foo,bar*,` all tables starting with bar or ending with foo on databases starting in db1 or ending in db2
+* => any chars
+? => any char
+`db1:*` # all tables from db1
+`db1,db2:*` # all tables from db1 and db2
+`db1:t1,t2` # tables t1 t2 form db1
+`db1,db2:t1,t2` # tablse t1 t2 from db1 and db2
+`db1*,*db2:*foo,bar*,` all tables starting with bar or ending with foo on databases starting in db1 or ending in db2
 
 Examples (REGEX)
-    Enclose by /../ to match database/tables
-    -> https://docs.rs/regex/latest/regex/struct.Regex.html
-    `/^db1.*/,/.*db2$/:/.*foo$/,/^bar*/` all tables starting with bar or ending
-    with foo on databases starting in db1 or ending in db2
+Enclose by /../ to force regex mode on database/tables:
+-> https://docs.rs/regex/latest/regex/struct.Regex.html
+`/^db1.*/,/.*db2$/:/.*foo$/,/^bar*/` all tables starting with bar or ending
+with foo on databases starting in db1 or ending in db2
 
 So parsing is split by . then split by ,
 then product of all database / table patterns
