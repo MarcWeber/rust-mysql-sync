@@ -1,119 +1,95 @@
-//! Selector A.B: A = DB-Liste (oder *), B = Tabellen-Liste (oder *).
-//! Beispiel: "db1,db2.*" oder "*" oder "db1.t1,db1.t2"
-//! Glob-Patterns: "db*.t*" passt db1.table1, db2.test_foo etc.
+//! Selector A:B: A = DB-Liste (oder *), B = Tabellen-Liste (oder *).
+//! Beispiel: "db1,db2:*" oder "*" oder "db1:t1,t2"
+//! Glob-Patterns: "db*:t*" passt db1.table1, db2.test_foo etc.
+//! Patterns starting with / are treated as regex: "/^db1.*/,/.*db2$:/.*foo$/,/^bar.*/"
 
 use anyhow::{Context, Result};
 use mysql_async::prelude::Queryable;
 use mysql_async::Conn;
+use regex::Regex;
 use std::collections::HashMap;
+use std::str::FromStr;
+
+/// A compiled pattern: exact name or regex (globs are converted to regex at parse time).
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Name(String),
+    Regex(Regex),
+}
+
+impl FromStr for Pattern {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        if let Some(inner) = s.strip_prefix('/').and_then(|s| s.strip_suffix('/')) {
+            let re = Regex::new(&format!("^{}$", inner)).context("Invalid regex pattern")?;
+            Ok(Pattern::Regex(re))
+        } else if s.contains('*') || s.contains('?') {
+            let re_str = format!("^{}$", s.replace('*', ".*").replace('?', "."));
+            let re = Regex::new(&re_str).context("Invalid glob pattern")?;
+            Ok(Pattern::Regex(re))
+        } else {
+            Ok(Pattern::Name(s.to_string()))
+        }
+    }
+}
+
+impl Pattern {
+    fn matches(&self, text: &str) -> bool {
+        match self {
+            Pattern::Name(name) => name == text,
+            Pattern::Regex(re) => re.is_match(text),
+        }
+    }
+
+    fn is_wildcard(&self) -> bool {
+        !matches!(self, Pattern::Name(_))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Selector {
-    pub dbs: Vec<String>,
-    pub tables: Vec<String>,
-}
-
-/// Simple glob match: * matches any sequence of chars, ? matches one char.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if !pattern.contains('*') && !pattern.contains('?') {
-        return pattern == text;
-    }
-    // Convert pattern to a simple regex-like match using recursion
-    let mut pi = 0; // pattern index
-    let mut ti = 0; // text index
-    let pat_bytes: &[u8] = pattern.as_bytes();
-    let txt_bytes: &[u8] = text.as_bytes();
-    glob_match_rec(pat_bytes, pi, txt_bytes, ti)
-}
-
-fn glob_match_rec(pat: &[u8], pi: usize, txt: &[u8], ti: usize) -> bool {
-    if pi == pat.len() && ti == txt.len() {
-        return true;
-    }
-    if pi == pat.len() {
-        return false;
-    }
-    if pat[pi] == b'*' {
-        // * matches zero or more chars
-        // skip consecutive *
-        let mut next_pi = pi + 1;
-        while next_pi < pat.len() && pat[next_pi] == b'*' {
-            next_pi += 1;
-        }
-        if next_pi == pat.len() {
-            return true; // trailing * matches anything
-        }
-        // try matching rest of pattern against every position in remaining text
-        for i in ti..=txt.len() {
-            if glob_match_rec(pat, next_pi, txt, i) {
-                return true;
-            }
-        }
-        false
-    } else if pat[pi] == b'?' {
-        // ? matches exactly one char
-        if ti < txt.len() {
-            glob_match_rec(pat, pi + 1, txt, ti + 1)
-        } else {
-            false
-        }
-    } else {
-        // literal char
-        if ti < txt.len() && pat[pi] == txt[ti] {
-            glob_match_rec(pat, pi + 1, txt, ti + 1)
-        } else {
-            false
-        }
-    }
+    pub dbs: Vec<Pattern>,
+    pub tables: Vec<Pattern>,
 }
 
 impl Selector {
-    /// None -> "*.*"
+    /// None -> "*:*"
     pub fn parse(sel: Option<&str>) -> Result<Selector> {
         let sel = match sel {
             None => {
                 return Ok(Selector {
-                    dbs: vec!["*".into()],
-                    tables: vec!["*".into()],
+                    dbs: vec!["*".parse().unwrap()],
+                    tables: vec!["*".parse().unwrap()],
                 })
             }
-            Some(s) => s.trim(),
+            Some(s) => s.trim().to_string(),
         };
         if sel.is_empty() {
             return Ok(Selector {
-                dbs: vec!["*".into()],
-                tables: vec!["*".into()],
+                dbs: vec!["*".parse().unwrap()],
+                tables: vec!["*".parse().unwrap()],
             });
         }
-        // Letzten Punkt als Trenner nehmen: "db1,db2.t1,t2" -> A="db1,db2" B="t1,t2"
-        let (a, b) = match sel.rsplit_once('.') {
-            Some((a, b)) => (a, b),
-            None => (sel, "*"),
-        };
+        let (a, b) = split_db_table(&sel);
         let dbs = split_list(a).context("DB-Liste im Selector ungültig")?;
         let tables = split_list(b).context("Tabellen-Liste im Selector ungültig")?;
         Ok(Selector { dbs, tables })
     }
 
-    /// Returns true if any DB pattern contains a glob wildcard (* or ?).
     pub fn has_db_glob(&self) -> bool {
-        self.dbs.iter().any(|d| d.contains('*') || d.contains('?'))
+        self.dbs.iter().any(Pattern::is_wildcard)
     }
 
-    /// Returns true if any table pattern contains a glob wildcard (* or ?).
     pub fn has_table_glob(&self) -> bool {
-        self.tables.iter().any(|t| t.contains('*') || t.contains('?'))
+        self.tables.iter().any(Pattern::is_wildcard)
     }
 
     pub fn matches_db(&self, db: &str) -> bool {
-        self.dbs.iter().any(|d| glob_match(d, db))
+        self.dbs.iter().any(|p| p.matches(db))
     }
 
     pub fn matches_table(&self, table: &str) -> bool {
-        self.tables.iter().any(|t| glob_match(t, table))
+        self.tables.iter().any(|p| p.matches(table))
     }
 
     /// Expand glob patterns into a list of (db, table) pairs.
@@ -124,12 +100,16 @@ impl Selector {
         conn: &mut Conn,
         cache: &mut HashMap<String, Vec<String>>,
     ) -> Result<Vec<(String, String)>> {
-        // Short-circuit: no globs at all, just return exact pairs
+        // Short-circuit: no globs at all, just return exact name pairs
         if !self.has_db_glob() && !self.has_table_glob() {
             let mut pairs = Vec::new();
             for db_pat in &self.dbs {
-                for tbl_pat in &self.tables {
-                    pairs.push((db_pat.clone(), tbl_pat.clone()));
+                if let Pattern::Name(db) = db_pat {
+                    for tbl_pat in &self.tables {
+                        if let Pattern::Name(table) = tbl_pat {
+                            pairs.push((db.clone(), table.clone()));
+                        }
+                    }
                 }
             }
             return Ok(pairs);
@@ -169,29 +149,61 @@ impl Selector {
     }
 }
 
-fn split_list(s: &str) -> Result<Vec<String>> {
+fn split_list(s: &str) -> Result<Vec<Pattern>> {
     let mut out = Vec::new();
-    for part in s.split(',') {
-        let mut p = part.trim().to_string();
-        if p.is_empty() {
-            continue; // allow trailing/leading commas
+    let mut current = String::new();
+    let mut in_regex = false;
+    for ch in s.chars() {
+        match ch {
+            '/' if !in_regex => { in_regex = true; current.push(ch); }
+            '/' if in_regex => { in_regex = false; current.push(ch); }
+            ',' if !in_regex => {
+                let p = current.trim().to_string();
+                if !p.is_empty() {
+                    out.push(parse_pattern(&p)?);
+                }
+                current.clear();
+            }
+            _ => { current.push(ch); }
         }
-        // "db.*" / "db." → "db" (Wildcard-Tabelle impliziert)
-        if p.ends_with(".*") {
-            p.truncate(p.len() - 2);
-        }
-        while p.ends_with('.') {
-            p.pop();
-        }
-        if p.is_empty() {
-            anyhow::bail!("Leerer DB-Name in Selektor: '{s}'");
-        }
-        out.push(p);
+    }
+    let p = current.trim().to_string();
+    if !p.is_empty() {
+        out.push(parse_pattern(&p)?);
     }
     if out.is_empty() {
-        out.push("*".into()); // all commas or whitespace → match everything
+        out.push("*".parse().unwrap());
     }
     Ok(out)
+}
+
+fn parse_pattern(p: &str) -> Result<Pattern> {
+    let p = clean_pattern(p);
+    p.parse()
+}
+
+fn clean_pattern(p: &str) -> String {
+    let mut p = p.to_string();
+    if p.ends_with(":*") { p.truncate(p.len() - 2); }
+    while p.ends_with(':') { p.pop(); }
+    if p.is_empty() { "*".into() } else { p }
+}
+
+/// Split selector into (db_part, table_part) on the last : that's outside /.../ patterns.
+fn split_db_table(sel: &str) -> (&str, &str) {
+    let mut in_regex = false;
+    let mut last_colon = None;
+    for (i, ch) in sel.char_indices() {
+        match ch {
+            '/' => in_regex = !in_regex,
+            ':' if !in_regex => last_colon = Some(i),
+            _ => {}
+        }
+    }
+    match last_colon {
+        Some(pos) => (&sel[..pos], &sel[pos + 1..]),
+        None => (sel, "*"),
+    }
 }
 
 /// DB-/Tabellen-Mapping auf die Zielnamen anwenden.
@@ -217,23 +229,26 @@ mod tests {
 
     #[test]
     fn parse_full() {
-        let s = Selector::parse(Some("db1,db2.*")).unwrap();
-        assert_eq!(s.dbs, vec!["db1", "db2"]);
-        assert_eq!(s.tables, vec!["*"]);
+        let s = Selector::parse(Some("db1,db2:*")).unwrap();
+        assert!(s.matches_db("db1"));
+        assert!(s.matches_db("db2"));
+        assert!(s.matches_table("anything"));
     }
 
     #[test]
     fn parse_db_only() {
         let s = Selector::parse(Some("db1")).unwrap();
-        assert_eq!(s.dbs, vec!["db1"]);
-        assert_eq!(s.tables, vec!["*"]);
+        assert!(s.matches_db("db1"));
+        assert!(s.matches_table("anything"));
     }
 
     #[test]
     fn parse_tables() {
-        let s = Selector::parse(Some("mydb.users,orders")).unwrap();
-        assert_eq!(s.dbs, vec!["mydb"]);
-        assert_eq!(s.tables, vec!["users", "orders"]);
+        let s = Selector::parse(Some("mydb:users,orders")).unwrap();
+        assert!(s.matches_db("mydb"));
+        assert!(s.matches_table("users"));
+        assert!(s.matches_table("orders"));
+        assert!(!s.matches_table("other"));
     }
 
     #[test]
@@ -245,12 +260,29 @@ mod tests {
 
     #[test]
     fn parse_qualified_wildcards() {
-        // "db1.*,db2.*" muss beide DBs liefern (Tabellen-Wildcard)
-        let s = Selector::parse(Some("db1.*,db2.*")).unwrap();
-        assert_eq!(s.dbs, vec!["db1", "db2"]);
-        assert_eq!(s.tables, vec!["*"]);
+        let s = Selector::parse(Some("db1:*,db2:*")).unwrap();
         assert!(s.matches_db("db1"));
         assert!(s.matches_db("db2"));
+    }
+
+    #[test]
+    fn regex_slash() {
+        // /.../ patterns are treated as regex
+        let s = Selector::parse(Some("db1*/:test.*/")).unwrap();
+        assert!(s.matches_table("test"));
+        assert!(s.matches_table("test_foo"));
+    }
+
+    #[test]
+    fn glob_uses_regex_conversion() {
+        let p: Pattern = "db*".parse().unwrap();
+        assert!(p.matches("db1"));
+        assert!(p.matches("db123"));
+        assert!(p.matches("db"));
+        assert!(!p.matches("abc"));
+        let p: Pattern = "*foo*".parse().unwrap();
+        assert!(p.matches("xfoo_y"));
+        assert!(!p.matches("xbar_y"));
     }
 
     #[test]
@@ -271,41 +303,46 @@ mod tests {
 
     #[test]
     fn glob_match_basic() {
-        assert!(glob_match("db*", "db1"));
-        assert!(glob_match("db*", "db123"));
-        assert!(glob_match("db*", "db"));
-        assert!(!glob_match("db*", "abc"));
-        assert!(glob_match("t*_foo", "test_foo"));
-        assert!(glob_match("t*_foo", "t_foo"));
-        assert!(!glob_match("t*_foo", "bar_foo"));
+        let p: Pattern = "db*".parse().unwrap();
+        assert!(p.matches("db1"));
+        assert!(p.matches("db123"));
+        assert!(p.matches("db"));
+        assert!(!p.matches("abc"));
+        let p: Pattern = "t*_foo".parse().unwrap();
+        assert!(p.matches("test_foo"));
+        assert!(p.matches("t_foo"));
+        assert!(!p.matches("bar_foo"));
     }
 
     #[test]
     fn glob_match_suffix() {
-        assert!(glob_match("*log", "error_log"));
-        assert!(glob_match("*log", "log"));
-        assert!(!glob_match("*log", "logs"));
+        let p: Pattern = "*log".parse().unwrap();
+        assert!(p.matches("error_log"));
+        assert!(p.matches("log"));
+        assert!(!p.matches("logs"));
     }
 
     #[test]
     fn glob_match_middle() {
-        assert!(glob_match("db*_t*", "db1_test"));
-        assert!(glob_match("db*_t*", "db_test"));
-        assert!(glob_match("db*_t*", "dbx_t")); // * matches zero chars
-        assert!(!glob_match("db*_t*", "dbx_x"));
+        let p: Pattern = "db*_t*".parse().unwrap();
+        assert!(p.matches("db1_test"));
+        assert!(p.matches("db_test"));
+        assert!(p.matches("dbx_t"));
+        assert!(!p.matches("dbx_x"));
     }
 
     #[test]
     fn glob_match_question() {
-        assert!(glob_match("db?", "db1"));
-        assert!(glob_match("db?", "dbX"));
-        assert!(!glob_match("db?", "db12"));
-        assert!(!glob_match("db?", "db"));
+        let p: Pattern = "db?".parse().unwrap();
+        assert!(p.matches("db1"));
+        assert!(p.matches("dbX"));
+        assert!(!p.matches("db12"));
+        assert!(!p.matches("db"));
     }
 
     #[test]
     fn glob_selector() {
-        let s = Selector::parse(Some("db*.t*")).unwrap();
+        let s = Selector::parse(Some("db*:t*")).unwrap();
         assert!(s.matches_db("db1"));
         assert!(s.matches_db("db_production"));
         assert!(!s.matches_db("abc"));
@@ -316,19 +353,17 @@ mod tests {
 
     #[test]
     fn glob_has_glob() {
-        let s = Selector::parse(Some("db*.t*")).unwrap();
+        let s = Selector::parse(Some("db*:t*")).unwrap();
         assert!(s.has_db_glob());
         assert!(s.has_table_glob());
-        let s2 = Selector::parse(Some("mydb.users")).unwrap();
+        let s2 = Selector::parse(Some("mydb:users")).unwrap();
         assert!(!s2.has_db_glob());
         assert!(!s2.has_table_glob());
     }
 
     #[test]
     fn trailing_commas() {
-        let s = Selector::parse(Some("db1*,db2*.foo*,bar*,")).unwrap();
-        assert_eq!(s.dbs, vec!["db1*", "db2*"]);
-        assert_eq!(s.tables, vec!["foo*", "bar*"]);
+        let s = Selector::parse(Some("db1*,db2*:foo*,bar*,")).unwrap();
         assert!(s.matches_db("db1"));
         assert!(s.matches_db("db123"));
         assert!(s.matches_db("db2x"));
@@ -341,8 +376,8 @@ mod tests {
 
     #[test]
     fn leading_commas() {
-        let s = Selector::parse(Some(",db1*.t1*,")).unwrap();
-        assert_eq!(s.dbs, vec!["db1*"]);
-        assert_eq!(s.tables, vec!["t1*"]);
+        let s = Selector::parse(Some(",db1*:t1*,")).unwrap();
+        assert!(s.matches_db("db1"));
+        assert!(s.matches_table("t1"));
     }
 }

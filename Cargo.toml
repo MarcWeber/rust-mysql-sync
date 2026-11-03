@@ -50,6 +50,7 @@ rand = "0.9"
 log = "0.4"
 env_logger = "0.11"
 tempfile = "3"
+regex = "1.13.1"
 
 [patch.crates-io]
 mysql_async = { path = "vendor/mysql_async" }

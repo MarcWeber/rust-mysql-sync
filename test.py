@@ -762,7 +762,7 @@ async def _run_rust_case(cfg_json, case):
     out = _matrix_base(case)
     src_table, dst_table = case.table_names()
     src, dst = case.mysqls
-    selector = f"{MATRIX_DB}.{src_table}"
+    selector = f"{MATRIX_DB}:{src_table}"
     mode = case.tool_opts.mode
     flag = dict(RUST_MODES)[mode]
     base = [str(BIN), "-C", "-", "--no-progress"] + ([flag] if flag else [])
@@ -862,7 +862,7 @@ async def _run_pt_case(cfg_json, case):
     sync_ms, (_, _, _) = await _timed([*common, "--execute", src_dsn, dst_dsn], expected_rcs=(0, 2))
 
     await _timed(
-        [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{MATRIX_DB}.{src_table}"],
+        [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{MATRIX_DB}:{src_table}"],
         cfg_json.encode()
     )
     a = await src.scalar(_matrix_checksum_sql(case, src_table), quiet=True)
@@ -1310,14 +1310,14 @@ async def test_where_constraint():
 
             # Check
             ms, (_, _, rc) = await _timed(
-                [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
+                [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}:{table}"],
                 cfg_json.encode(), expected_rcs=(0, 1)
             )
             print(f"      Check: rc={rc} ({ms:.0f}ms)")
 
             # Sync
             ms, (_, _, _) = await _timed(
-                [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}.{table}"],
+                [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}:{table}"],
                 cfg_json.encode()
             )
             print(f"      Sync: ok ({ms:.0f}ms)")
@@ -1378,7 +1378,7 @@ async def test_parallel():
             await truncate_fill_table(dst, db, t, 0, 49)
 
         # Build config with all tables
-        selector = f"{db}.t0,t1,t2,t3,t4"
+        selector = f"{db}:t0,t1,t2,t3,t4"
         cfg = {
             "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
             "server": f"127.0.0.1:{src.server_port}",
@@ -1517,16 +1517,16 @@ sleep 2
 
 ```bash
 # Measure how fast the tool hashes and compares all chunks.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --benchmark __DB__.__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --benchmark __DB__:__SRC_TABLE__
 
 # Compare chunk hashes. Expected: exit code 1 (differences found).
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__.__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
 
 # Copy all differing chunks from source to target.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --sync __DB__.__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --sync __DB__:__SRC_TABLE__
 
 # Confirm all chunks match now. Expected: exit code 0 (no differences).
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__.__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
 ```
 
 ## Sync with WHERE filter
@@ -1544,8 +1544,8 @@ mysql -h 127.0.0.1 -P __SRC_PORT__ -uroot -p__ROOT_PW__ -e "DELETE FROM __DB__._
 # }
 
 # Sync and verify only the filtered rows.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --sync __DB__.__SRC_TABLE__
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__.__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --sync __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
 ```
 
 ## Cleanup
@@ -1592,7 +1592,7 @@ ROOT_PW = "__ROOT_PW__"
 DB = "__DB__"
 SRC_TABLE = "__SRC_TABLE__"
 DST_TABLE = "__DST_TABLE__"
-SELECTOR = f"{DB}.{SRC_TABLE}"
+SELECTOR = f"{DB}:{SRC_TABLE}"
 
 server_proc = None
 
@@ -1705,7 +1705,7 @@ async def step_7_sync_with_where():
     with open(SOURCE_CFG) as f:
         cfg = json.load(f)
     cfg["tables"] = {
-        SELECTOR: {
+        f"{DB}.{SRC_TABLE}": {
             "sync_where": "a >= 100",
             "check_where": "a >= 100",
         }
