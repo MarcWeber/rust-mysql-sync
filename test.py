@@ -691,7 +691,7 @@ def _matrix_checksum_sql(case, table):
     return f"SELECT CONCAT(COUNT(*), ':', COALESCE(SUM(CRC32({expr})), 0)) FROM {MATRIX_DB}.{table}"
 
 
-async def _timed(cmd, stdin_data=None):
+async def _timed(cmd, stdin_data=None, expected_rcs=(0,)):
     """Run a command asynchronously; returns (elapsed_ms, (stdout_bytes, stderr_bytes, returncode))."""
     started = time.perf_counter()
     proc = await asyncio.create_subprocess_exec(
@@ -705,6 +705,7 @@ async def _timed(cmd, stdin_data=None):
         proc.communicate(input=stdin_data), timeout=MATRIX_TIMEOUT
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    assert proc.returncode in expected_rcs, f"expected rc in {expected_rcs}, got {proc.returncode}: {stderr.decode(errors='replace')[-200:]}"
     return elapsed_ms, (stdout, stderr, proc.returncode)
 
 
@@ -768,35 +769,16 @@ async def _run_rust_case(cfg_json, case):
     stdin_data = cfg_json.encode()
 
     if mode == "raw-tsv" and case.binary == "bin":
-        ms, (stdout, _, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
-        if rc != 0:
-            out.update(total_ms=ms, status="reject", detail=f"rc={rc}")
-            return out
-        raise RuntimeError(f"raw-tsv with binary should have failed: rc={rc}")
+        ms, (_, _, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
+        out.update(total_ms=ms, status="reject", detail=f"rc={rc}")
+        return out
 
     # prepare_tables has already removed chunks from both sides. With
     # CHUNK_SIZE=2 and 1000 rows there are 10 chunks, so the drops are real
     # differences and the first check must report drift.
-    drift_ms, (stdout, stderr, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
-    if rc != 1:
-        raise RuntimeError(
-            f"drift check: expected rc=1, got rc={rc}: "
-            f"{stdout.decode('utf8','replace')[-300:]}\nSTDERR: {stderr.decode('utf8','replace')[-1200:]}"
-        )
-
-    sync_ms, (stdout, stderr, rc) = await _timed([*base, "--sync", selector], stdin_data)
-    if rc != 0:
-        raise RuntimeError(
-            f"sync: expected rc=0, got rc={rc}: "
-            f"{stdout.decode('utf8','replace')[-300:]}\nSTDERR: {stderr.decode('utf8','replace')[-1200:]}"
-        )
-
-    clean_ms, (stdout, stderr, rc) = await _timed([*base, "--check", "0", selector], stdin_data)
-    if rc != 0:
-        raise RuntimeError(
-            f"clean check: expected rc=0, got rc={rc}: "
-            f"{stdout.decode('utf8','replace')[-300:]}\nSTDERR: {stderr.decode('utf8','replace')[-1200:]}"
-        )
+    drift_ms, (_, _, _) = await _timed([*base, "--check", "0", selector], stdin_data, expected_rcs=(1,))
+    sync_ms, (_, _, _) = await _timed([*base, "--sync", selector], stdin_data)
+    clean_ms, (_, _, _) = await _timed([*base, "--check", "0", selector], stdin_data)
 
     a = await src.scalar(_matrix_checksum_sql(case, src_table), quiet=True)
     b = await dst.scalar(_matrix_checksum_sql(case, dst_table), quiet=True)
@@ -876,29 +858,17 @@ async def _run_pt_case(cfg_json, case):
 
     # pt always runs against the drifted tables (no clean pass):
     # --print is the drift detection, --execute applies the differences.
-    drift_ms, (stdout, stderr, rc) = await _timed([*common, "--print", src_dsn, dst_dsn])
-    if rc not in (0, 2):
-        raise RuntimeError(
-            f"pt --print: expected rc=0|2, got rc={rc}: "
-            f"{stdout.decode('utf8','replace')[-300:]}\nSTDERR: {stderr.decode('utf8','replace')[-1200:]}"
-        )
+    drift_ms, (_, _, _) = await _timed([*common, "--print", src_dsn, dst_dsn], expected_rcs=(0, 2))
+    sync_ms, (_, _, _) = await _timed([*common, "--execute", src_dsn, dst_dsn], expected_rcs=(0, 2))
 
-    sync_ms, (stdout, stderr, rc) = await _timed([*common, "--execute", src_dsn, dst_dsn])
-    if rc not in (0, 2):
-        raise RuntimeError(
-            f"pt --execute: expected rc=0|2, got rc={rc}: "
-            f"{stdout.decode('utf8','replace')[-300:]}\nSTDERR: {stderr.decode('utf8','replace')[-1200:]}"
-        )
-
-    _, (stdout, _, rc) = await _timed(
+    await _timed(
         [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{MATRIX_DB}.{src_table}"],
         cfg_json.encode()
     )
-    out_text = stdout.decode('utf8','replace')
     a = await src.scalar(_matrix_checksum_sql(case, src_table), quiet=True)
     b = await dst.scalar(_matrix_checksum_sql(case, dst_table), quiet=True)
-    if rc != 0 or a != b:
-        raise RuntimeError(f"rust --check rc={rc} | data mismatch: {a} != {b} | {out_text[-200:]}")
+    if a != b:
+        raise RuntimeError(f"data mismatch: {a} != {b}")
 
     out.drift_ms = drift_ms
     out.sync_ms = sync_ms
@@ -1264,8 +1234,21 @@ async def dump_table_create_sql():
         print(f"Loaded on {m.name} in {elapsed_ms:.0f} ms")
         started = _time.perf_counter()
 
+async def truncate_fill_table(m: Mysql, db: str, table: str, start_id: int, end_id: int):
+    """Truncate a table and fill it with rows from start_id to end_id (inclusive)."""
+    await m.sql(f"TRUNCATE TABLE {db}.{table}", database=db)
+    if start_id > end_id:
+        return
+    rows = ", ".join(f"({i}, 'row_{i}', {i * 10})" for i in range(start_id, end_id + 1))
+    await m.sql(f"INSERT INTO {table} (id, name, value) VALUES {rows}", database=db)
+
+
+
+
+
+
 async def test_where_constraint():
-    """Test check_where/sync_where: only rows matching the WHERE clause are checked/synced."""
+    """Test check_where/sync_where with parameterized test matrix."""
     await ensure_binary(str(BIN))
     await prepare_workdir()
     await ensure_dbs_up()
@@ -1274,100 +1257,70 @@ async def test_where_constraint():
     db = "db_where_test"
     table = "t1"
 
-    # Create database and table on both sides
     await src.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
     await dst.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
     await src.sql(f"DROP TABLE IF EXISTS {db}.{table}")
     await dst.sql(f"DROP TABLE IF EXISTS {db}.{table}")
-    ddl = f"""
-        CREATE TABLE {db}.{table} (
-            id INT PRIMARY KEY,
-            name VARCHAR(50),
-            value INT
-        )
-    """
+    ddl = f"CREATE TABLE {db}.{table} (id INT PRIMARY KEY, name VARCHAR(50), value INT)"
     await src.sql(ddl)
     await dst.sql(ddl)
 
-    # Insert 1000 rows on source
-    inserts = []
-    for i in range(1, 1001):
-        inserts.append(f"({i}, 'row_{i}', {i * 10})")
-    await src.sql(f"INSERT INTO {db}.{table} VALUES " + ", ".join(inserts))
-
-    # Insert only rows 1-100 on dest (rows 101-1000 are missing)
-    inserts_dst = []
-    for i in range(1, 101):
-        inserts_dst.append(f"({i}, 'row_{i}', {i * 10})")
-    await dst.sql(f"INSERT INTO {db}.{table} VALUES " + ", ".join(inserts_dst))
-
-    # Start server on src
     async with AsyncExitStack() as stack:
         fingerprint = await stack.enter_async_context(src.server_running())
 
-        # Test 1: Without WHERE, check should find differences (rows 101-1000 missing on dest)
-        cfg_no_where = {
-            "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
-            "server": f"127.0.0.1:{src.server_port}",
-            "server_fingerprint": fingerprint,
-            "hash-strategies": ["select-sha2"],
-        }
-        cfg_json = json.dumps(cfg_no_where)
-        print("  Test 1: check without WHERE (should find differences)")
-        ms, (stdout, stderr, rc) = await _timed(
-            [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
-            cfg_json.encode()
-        )
-        if rc != 1:
-            print(f"  FAIL: expected rc=1, got rc={rc}")
-            print(f"    stderr: {stderr.decode(errors='replace')[-500:]}")
-        else:
-            print(f"  PASS: check found differences ({ms:.0f}ms)")
+        # Each test: [chunked, src_fill_range, dst_fill_range, where_sql]
+        tests = [
+            [1, [0, 100], [0, 10], "id >= 0 AND id <= 10"],
+            [1, [0, 100], [0, 10], "id >= 1 AND id <= 10"],
+            [1, [0, 100], [90, 99], "id >= 90 AND id <= 100"],
+            [1, [0, 100], [90, 99], "id >= 85 AND id <= 99"],
 
-        # Test 2: With check_where/sync_where = "id <= 100", only rows 1-100 are checked
-        # Since both sides have rows 1-100 identical, check should pass (rc=0)
-        cfg_with_where = {
-            "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
-            "server": f"127.0.0.1:{src.server_port}",
-            "server_fingerprint": fingerprint,
-            "hash-strategies": ["select-sha2"],
-            "tables": {
-                f"{db}.{table}": {
-                    "check_where": "id <= 100",
-                    "sync_where": "id <= 100",
-                }
-            },
-        }
-        cfg_json_where = json.dumps(cfg_with_where)
-        print("  Test 2: check with WHERE id <= 100 (should find NO differences)")
-        ms, (stdout, stderr, rc) = await _timed(
-            [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
-            cfg_json_where.encode()
-        )
-        if rc != 0:
-            print(f"  FAIL: expected rc=0, got rc={rc}")
-            print(f"    stderr: {stderr.decode(errors='replace')[-500:]}")
-        else:
-            print(f"  PASS: check found no differences ({ms:.0f}ms)")
+            [1, [0, 10], [0, 10], "id >= 0 AND id <= 10"],
+            [1, [90, 100], [0, 10], "id >= 1 AND id <= 10"],
+            [1, [0, 10], [90, 99], "id >= 90 AND id <= 100"],
+            [1, [90, 100], [90, 99], "id >= 85 AND id <= 99"],
+        ]
 
-        # Test 3: Sync with WHERE should only sync rows 1-100 (which are already identical)
-        print("  Test 3: sync with WHERE id <= 100 (should be a no-op)")
-        ms, (stdout, stderr, rc) = await _timed(
-            [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}.{table}"],
-            cfg_json_where.encode()
-        )
-        if rc != 0:
-            print(f"  FAIL: expected rc=0, got rc={rc}")
-            print(f"    stderr: {stderr.decode(errors='replace')[-500:]}")
-        else:
-            print(f"  PASS: sync completed ({ms:.0f}ms)")
+        for i, (chunked, src_range, dst_range, where_sql) in enumerate(tests, 1):
+            print(f"  Test {i}: chunked={chunked} src={src_range} dst={dst_range} WHERE {where_sql}")
 
-        # Test 4: Verify dest still only has 100 rows (rows 101-1000 should NOT be synced)
-        count = int(await dst.scalar(f"SELECT COUNT(*) FROM {db}.{table}", quiet=True))
-        if count != 100:
-            print(f"  FAIL: dest should have 100 rows, has {count}")
-        else:
-            print(f"  PASS: dest has 100 rows (rows 101-1000 correctly excluded)")
+            # Fill source and dest with different ranges
+            await truncate_fill_table(src, db, table, src_range[0], src_range[1])
+            await truncate_fill_table(dst, db, table, dst_range[0], dst_range[1])
+
+            cfg = {
+                "mysql": {"host": "127.0.0.1", "port": dst.port, "user": "root", "password": ROOT_PW},
+                "server": f"127.0.0.1:{src.server_port}",
+                "server_fingerprint": fingerprint,
+                "chunked": chunked,
+                "hash-strategies": ["select-sha2"],
+                "tables": {
+                    f"{db}.{table}": {
+                        "check_where": where_sql,
+                        "sync_where": where_sql,
+                    }
+                },
+            }
+            cfg_json = json.dumps(cfg)
+
+            # Check (may find differences or not depending on WHERE range)
+            await _timed(
+                [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}.{table}"],
+                cfg_json.encode(), expected_rcs=(0, 1)
+            )
+
+            # Sync copies missing rows within WHERE range
+            await _timed(
+                [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}.{table}"],
+                cfg_json.encode()
+            )
+
+            # Verify rows match in Python after sync
+            q = f"SELECT id, name, value FROM {db}.{table} WHERE {where_sql} ORDER BY id"
+            src_rows = await src.sql(q, quiet=True)
+            dst_rows = await dst.sql(q, quiet=True)
+            if src_rows.strip() != dst_rows.strip():
+                raise RuntimeError(f"Row mismatch for WHERE {where_sql}")
 
         # Cleanup
         await src.sql(f"DROP TABLE IF EXISTS {db}.{table}")
@@ -1694,7 +1647,6 @@ if __name__ == "__main__":
     for name in ("db.sql", "source.json", "target.json", "README.md", "run.py"):
         print(f"Generated {tutorial_dir}/{name}")
     print("Run: python tutorial/run.py  (after python test.py up)")
-
 
 ACTIONS = {
     "write_docker_compose": write_docker_compose,

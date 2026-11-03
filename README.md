@@ -74,12 +74,13 @@ Examples: `db1.*`, `db1,db2.*`, `db1.t1,t2`, `db1,db2.t1,t2`
 | `--log-level LVL` | `error|warn|info|debug|trace` |
 
 ## tutorial
-python test.py tutorial_up
-python test.py step_1
-python test.py step_2
-python test.py tutorial_down
+See ./tutorial/README.md
 
-For shell usage eg see demo/tutorial.sh
+or (cd ./tutorial/README.md; python run.py)
+-> See TESTING.md
+
+Potential shell usage eg see demo/tutorial.sh
+(TODO update)
 
 ## old immutable data
 most projects have old and an auto increment field which no longer changes.
