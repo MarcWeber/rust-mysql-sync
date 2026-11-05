@@ -392,6 +392,16 @@ where
     Ok(())
 }
 
+/// Kanonische TIME-Darstellung wie `hash::value_to_pk_component`:
+/// `[-]DD HH:MM:SS.ffffff`.
+pub fn time_component_expr(col: &str) -> String {
+    let secs = format!("TIME_TO_SEC({col})");
+    let abs_secs = format!("ABS({secs})");
+    format!(
+        "CONCAT(IF({col} < 0, '-', ''),          LPAD(FLOOR({abs_secs} / 86400), 2, '0'), ' ',          LPAD(FLOOR(MOD({abs_secs}, 86400) / 3600), 2, '0'), ':',          LPAD(FLOOR(MOD({abs_secs}, 3600) / 60), 2, '0'), ':',          LPAD(MOD(FLOOR({abs_secs}), 60), 2, '0'), '.',          LPAD(MICROSECOND(ABS({col})), 6, '0'))"
+    )
+}
+
 /// WHERE-Klausel für eine Menge von Buckets (alter Modus, Drill-Down).
 pub fn bucket_where(pks: &[PkCol], chunked: u32, buckets: &[String]) -> Result<String> {
     if pks.is_empty() {
@@ -413,6 +423,8 @@ pub fn bucket_where(pks: &[PkCol], chunked: u32, buckets: &[String]) -> Result<S
         let ct = last.column_type.to_ascii_lowercase();
         let expr = if ct == "date" {
             format!("DATE_FORMAT({col}, '%Y-%m-%d')")
+        } else if ct == "time" {
+            time_component_expr(&col)
         } else if ct.starts_with("datetime") || ct.starts_with("timestamp") {
             format!("DATE_FORMAT({col}, '%Y-%m-%d %H:%i:%s.%f')")
         } else {

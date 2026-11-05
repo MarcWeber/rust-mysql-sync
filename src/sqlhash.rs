@@ -28,14 +28,6 @@ fn numeric_mod_expr(col: &str, chunked: u32) -> String {
     )
 }
 
-fn time_component_expr(col: &str) -> String {
-    let secs = format!("TIME_TO_SEC({col})");
-    let abs_secs = format!("ABS({secs})");
-    format!(
-        "CONCAT(IF({col} < 0, '-', ''),          LPAD(FLOOR({abs_secs} / 86400), 2, '0'), ' ',          LPAD(FLOOR(MOD({abs_secs}, 86400) / 3600), 2, '0'), ':',          LPAD(FLOOR(MOD({abs_secs}, 3600) / 60), 2, '0'), ':',          LPAD(MOD(FLOOR({abs_secs}), 60), 2, '0'), '.',          LPAD(MICROSECOND(ABS({col})), 6, '0'))"
-    )
-}
-
 fn date_expr(col: &str, column_type: &str) -> Option<String> {
     let ct = column_type.to_ascii_lowercase();
     if ct == "date" {
@@ -55,7 +47,7 @@ fn pk_component_expr(pk: &PkCol) -> String {
     if ct == "date" {
         format!("DATE_FORMAT({col}, '%Y-%m-%d')")
     } else if ct == "time" {
-        time_component_expr(&col)
+        mysqlutil::time_component_expr(&col)
     } else if ct.starts_with("datetime") || ct.starts_with("timestamp") {
         format!("DATE_FORMAT({col}, '%Y-%m-%d %H:%i:%s.%f')")
     } else {
@@ -107,7 +99,7 @@ pub fn bucket_expr(pks: &[PkCol], mode: ChunkMode, chunked: u32) -> Result<Strin
             } else if pk.column_type.eq_ignore_ascii_case("time") {
                 Ok(text_expr(&format!(
                     "RIGHT({}, {n})",
-                    time_component_expr(&col)
+                    mysqlutil::time_component_expr(&col)
                 )))
             } else if let Some(expr) = date_expr(&col, &pk.column_type) {
                 Ok(text_expr(&expr.replace("{N}", &n.to_string())))

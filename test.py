@@ -12,8 +12,10 @@ Actions:
   matrix : run the comparison matrix (rust modes vs pt-table-sync)
   down   : stop/remove the containers
   clean  : stop/remove the containers and their volumes
+  test_time_pk_chunk : create a TIME-PK table and verify chunk-key/drill-down agree
 
 python3 test.py up matrix
+python3 test.py up test_time_pk_chunk
 Exit 0 = all executed actions passed.
 """
 
@@ -1427,6 +1429,127 @@ async def test_parallel():
     print("  test_parallel: OK")
 
 
+async def test_time_pk_chunk():
+    """Regression test: Rust chunk key and SQL drill-down must agree for TIME PKs.
+
+    Rust buckets a TIME PK by the last N chars of the canonical form
+    ``"DD HH:MM:SS.ffffff"``. For whole-second values the last two chars are
+    always ``"00"``. ``mysqlutil::bucket_where()`` however uses
+    ``RIGHT(col, N)`` on MySQL's TIME text, so ``12:34:56`` maps to ``"56"``.
+    The chunk hash points at bucket ``"00"`` but the drill-down never fetches
+    rows whose seconds are not ``00``, so those rows are never synced.
+
+    The ``select-*`` path uses ``sqlhash::bucket_expr()`` which has a special
+    case for TIME and is therefore the control.
+    """
+    await ensure_binary(str(BIN))
+    await prepare_workdir()
+    await ensure_dbs_up()
+
+    src, dst = MYSQL_INSTANCES["mysql80"], MYSQL_INSTANCES["mysql97"]
+    db, table = "db_timepk_test", "t1"
+    chunked = 2
+
+    source_rows = [
+        ("00:00:00", "midnight"),
+        ("01:02:03", "missing-on-dst"),
+        ("12:00:00", "full-hour"),
+        ("12:34:56", "wrong-on-dst"),
+        ("23:59:59", "late"),
+    ]
+    dst_rows = [("12:34:56", "WRONG")]
+
+    await src.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
+    await dst.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
+    ddl = (
+        f"CREATE TABLE {db}.{table} ("
+        "t TIME NOT NULL PRIMARY KEY, "
+        "v VARCHAR(32) NOT NULL"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    )
+
+    async def reset_tables(rows_src, rows_dst):
+        for m in (src, dst):
+            await m.sql(f"DROP TABLE IF EXISTS {db}.{table}", quiet=True)
+            await m.sql(ddl)
+        await src.sql(
+            f"INSERT INTO {db}.{table} (t, v) VALUES "
+            + ", ".join(f"('{t}', '{v}')" for t, v in rows_src)
+        )
+        await dst.sql(
+            f"INSERT INTO {db}.{table} (t, v) VALUES "
+            + ", ".join(f"('{t}', '{v}')" for t, v in rows_dst)
+        )
+
+    failures = []
+    async with AsyncExitStack() as stack:
+        fingerprint = await stack.enter_async_context(src.server_running())
+
+        for mode, flag in (
+            ("select-sha2", "--hash-select-sha2"),
+            ("raw-binary-vec", "--hash-raw-binary-row-vec"),
+        ):
+            print(f"  Mode {mode}:")
+            await reset_tables(source_rows, dst_rows)
+
+            cfg = {
+                "mysql": {"host": "127.0.0.1", "port": dst.port,
+                          "user": "root", "password": ROOT_PW},
+                "server": f"127.0.0.1:{src.server_port}",
+                "server_fingerprint": fingerprint,
+                "chunked": chunked,
+            }
+            cfg_json = json.dumps(cfg)
+            selector = f"{db}:{table}"
+
+            print("      Rust bucket for whole-second TIME rows: '00'")
+
+            await _timed(
+                [str(BIN), "-C", "-", "--no-progress", flag,
+                 "--check", "0", selector],
+                cfg_json.encode(), expected_rcs=(1,),
+            )
+            print("      check before sync: diff found")
+
+            await _timed(
+                [str(BIN), "-C", "-", "--no-progress", flag,
+                 "--sync", selector],
+                cfg_json.encode(),
+            )
+
+            _, (_, _, rc) = await _timed(
+                [str(BIN), "-C", "-", "--no-progress", flag,
+                 "--check", "0", selector],
+                cfg_json.encode(), expected_rcs=(0, 1),
+            )
+
+            q = f"SELECT t, v FROM {db}.{table} ORDER BY t"
+            src_out = (await src.sql(q, quiet=True)).strip()
+            dst_out = (await dst.sql(q, quiet=True)).strip()
+
+            if rc == 0 and src_out == dst_out:
+                print("      final check: rc=0, rows match — PASS")
+            else:
+                print(f"      final check: rc={rc}, "
+                      f"rows match={src_out == dst_out} — FAIL")
+                if src_out != dst_out:
+                    print("      source:\n" + src_out)
+                    print("      target:\n" + dst_out)
+                failures.append(mode)
+
+    for m in (src, dst):
+        await m.sql(f"DROP TABLE IF EXISTS {db}.{table}", quiet=True)
+        await m.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+
+    assert not failures, (
+        "chunk-key/drill-down mismatch for TIME PK in modes: "
+        + ", ".join(failures)
+        + " (Rust bucket uses the canonical 'DD HH:MM:SS.ffffff' form; "
+          "bucket_where uses RIGHT(col, N) on the TIME text)"
+    )
+    print("  test_time_pk_chunk: OK")
+
+
 async def write_tutorial_files():
     """Generate tutorial/ with db.sql, source.json, target.json, README.md, run.py."""
     await ensure_binary(str(BIN))
@@ -1768,6 +1891,7 @@ ACTIONS = {
     "dump-table-create-sql": dump_table_create_sql,
     "test_where_constraint": test_where_constraint,
     "test_parallel": test_parallel,
+    "test_time_pk_chunk": test_time_pk_chunk,
     "tutorial": write_tutorial_files,
 }
 
