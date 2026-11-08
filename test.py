@@ -1623,6 +1623,14 @@ async def benchmark_shards():
     print(f"  shard_min_rows={shard_min_rows}, repetitions={repetitions}")
     print(f"  {'rows':>8} {'shards':>7} {'effective':>10} {'median_ms':>11} {'rows/s':>10}  note")
 
+    async def run_client(*args):
+        proc = await asyncio.create_subprocess_exec(
+            str(BIN), *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
     async with dst.server_running() as fingerprint:
         cfg.write_text(json.dumps({
             "mysql": {"user": "root", "password": ROOT_PW,
@@ -1647,25 +1655,30 @@ async def benchmark_shards():
                 for _ in range(repetitions):
                     await dst.sql(f"TRUNCATE TABLE {db}.{table}")
                     started = time.perf_counter()
-                    proc = await asyncio.create_subprocess_exec(
-                        str(BIN), *CLIENT, "-C", str(cfg), "--sync",
+                    rc, out, err = await run_client(
+                        *CLIENT, "-C", str(cfg), "--sync",
                         f"{db}:{table}", "--shards", str(shards), "--no-progress",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
                     )
-                    out, err = await proc.communicate()
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
-                    if proc.returncode != 0:
+                    if rc != 0:
                         raise RuntimeError(
                             f"shard benchmark sync failed rows={rows} shards={shards}:\n"
-                            f"{out.decode(errors='replace')[-1000:]}\n"
-                            f"{err.decode(errors='replace')[-1000:]}"
+                            f"{out[-1000:]}\n{err[-1000:]}"
                         )
                     got = await dst.scalar(f"SELECT COUNT(*) FROM {db}.{table}")
                     if got != str(rows):
                         raise RuntimeError(
                             f"shard benchmark row count rows={rows} shards={shards}: "
                             f"{got} != {rows}"
+                        )
+                    rc, out, err = await run_client(
+                        *CLIENT, "-C", str(cfg), "--check", "0", f"{db}:{table}",
+                        "--shards", str(shards), "--shard-min-rows", "0", "--no-progress",
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"shard benchmark check failed rows={rows} shards={shards}:\n"
+                            f"{out[-1000:]}\n{err[-1000:]}"
                         )
                     times.append(elapsed_ms)
 
@@ -1759,6 +1772,22 @@ async def test_two_servers():
             if rc != 0:
                 raise RuntimeError(
                     f"two-server sync {label} failed (rc={rc}):\n{out[-1000:]}\n{err[-2000:]}"
+                )
+
+        res_ab, res_ba = await asyncio.gather(
+            run_client(
+                "--client", "-C", str(cfg_ab), "--check", "0", f"{db}:{table_ab}",
+                "--shards", "4", "--shard-min-rows", "0", "--no-progress",
+            ),
+            run_client(
+                "--client", "-C", str(cfg_ba), "--check", "0", f"{db}:{table_ba}",
+                "--shards", "4", "--shard-min-rows", "0", "--no-progress",
+            ),
+        )
+        for label, (rc, out, err) in (("A->B", res_ab), ("B->A", res_ba)):
+            if rc != 0:
+                raise RuntimeError(
+                    f"two-server check {label} failed (rc={rc}):\n{out[-1000:]}\n{err[-2000:]}"
                 )
 
         for label, table in (("A->B", table_ab), ("B->A", table_ba)):

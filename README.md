@@ -330,11 +330,8 @@ for large tables and remote targets; measure before enabling it everywhere.
 
 ### Sharding benchmark
 
-The Docker benchmark creates a source table with 1k/10k/100k rows, copies it
-into an empty target with `--shards 1,4,8,20`, and reports the median of three
-runs:
-
 ```bash
+# 1k/10k/100k rows `--shards 1,4,8,20`
 python test.py up benchmark_shards down
 ```
 
@@ -346,23 +343,21 @@ name VARCHAR(50), value INT)`, with `chunked=3`, `select-sha2`, and
 
 | rows | shards | effective | median ms | rows/s |
 |---:|---:|---:|---:|---:|
-| 1,000 | 1 | 1 | 41.0 | 24,401 |
-| 1,000 | 4 | 1 | 44.6 | 22,425 |
-| 1,000 | 8 | 1 | 44.5 | 22,496 |
-| 1,000 | 20 | 1 | 44.9 | 22,267 |
-| 10,000 | 1 | 1 | 125.3 | 79,838 |
-| 10,000 | 4 | 4 | 211.1 | 47,374 |
-| 10,000 | 8 | 8 | 303.5 | 32,944 |
-| 10,000 | 20 | 20 | 566.6 | 17,648 |
-| 100,000 | 1 | 1 | 1,150.6 | 86,909 |
-| 100,000 | 4 | 4 | 1,281.9 | 78,011 |
-| 100,000 | 8 | 8 | 2,004.6 | 49,886 |
-| 100,000 | 20 | 20 | 4,544.5 | 22,005 |
+| 1,000 | 1 | 1 | 45.7 | 21,866 |
+| 1,000 | 4 | 1 | 70.5 | 14,180 |
+| 1,000 | 8 | 1 | 43.1 | 23,185 |
+| 1,000 | 20 | 1 | 49.2 | 20,306 |
+| 10,000 | 1 | 1 | 140.5 | 71,199 |
+| 10,000 | 4 | 4 | 201.3 | 49,675 |
+| 10,000 | 8 | 8 | 326.9 | 30,588 |
+| 10,000 | 20 | 20 | 558.7 | 17,899 |
+| 100,000 | 1 | 1 | 1,054.3 | 94,851 |
+| 100,000 | 4 | 4 | 1,361.3 | 73,457 |
+| 100,000 | 8 | 8 | 2,015.2 | 49,623 |
+| 100,000 | 20 | 20 | 4,323.5 | 23,129 |
 
-The 1,000-row runs stay single-shard because they are below
-`shard_min_rows=10000`. On this host and workload, extra per-shard queries and
-streams outweighed parallelism; sharding did not improve full-copy time. Use it
-for large tables or high-latency/remote targets, and measure both settings.
+Notice that `rows/s` *decreases* as the shard count rises on this workload indicating
+that eventually inserting the rows and accessing the index or such is the bottle neck.
 
 ## SYNC ALGORITHM — TARGET DESIGN
 
