@@ -2,6 +2,7 @@
 //!
 //! Haupt-Einstiegspunkt: CLI parsen, Config laden, Server- oder Client-Modus.
 
+mod auth;
 mod benchmark;
 mod client;
 mod config;
@@ -17,6 +18,7 @@ mod selector;
 mod server;
 mod sqlhash;
 mod sync;
+mod task;
 mod testing;
 mod tls;
 mod transport;
@@ -31,7 +33,7 @@ use std::process::ExitCode;
     name = "mysql-sync",
     version,
     about = "MySQL-Tabellen differentiell über QUIC synchronisieren",
-    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Server:  ./mysql-sync -C server.json\n  Client:  ./mysql-sync -C client.json --sync db1:*\n           ./mysql-sync -C client.json --sync db1:* db2:*\n           ./mysql-sync -C client.json --force --sync db1:*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1:*\n           ./mysql-sync -C client.json --benchmark db_bench:big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1:*\n\nSelectoren: A:B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
+    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Daemon:  ./mysql-sync --daemon -f -C server.json\n  Client:  ./mysql-sync --client -C client.json --sync db1:*\n           ./mysql-sync --client -C client.json --connect 10.0.0.5:4433 --sync db1:*\n           ./mysql-sync --client -C client.json --task job.json\n           ./mysql-sync -C client.json --sync db1:* --shards 8\n           ./mysql-sync -C client.json --force --sync db1:*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1:*\n           ./mysql-sync -C client.json --benchmark db_bench:big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1:*\n\nSelectoren: A:B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
     /// JSON-Konfigurationsdatei ("-" liest von stdin); mehrfach angebbar, wird rekursiv gemerged
@@ -120,6 +122,30 @@ struct Cli {
     /// Diff-/Check-Hashes über rohe `mysql --batch`-TSV-Zeilen berechnen
     #[arg(long = "hash-raw-tsv", alias = "hash-via-raw-tsv", alias = "check-raw-tsv", conflicts_with_all = ["hash_via_dump", "hash_via_raw_binary", "hash_via_raw_binary_vec"])]
     hash_via_raw_tsv: bool,
+
+    /// Daemon/Server-Modus (bleibt im Vordergrund, siehe -f)
+    #[arg(long)]
+    daemon: bool,
+
+    /// Vordergrund (Daemon laeuft immer im Vordergrund; Flag fuer systemd/Container)
+    #[arg(short = 'f', long = "foreground")]
+    foreground: bool,
+
+    /// Client-Modus: Sync-Job gegen den Daemon starten
+    #[arg(long)]
+    client: bool,
+
+    /// Task-JSON-Datei ("-" = stdin); impliziert Client-Modus
+    #[arg(long, value_name = "FILE")]
+    task: Option<PathBuf>,
+
+    /// Server-Adresse ueberschreiben (host:port)
+    #[arg(long, value_name = "ADDR")]
+    connect: Option<String>,
+
+    /// Tabellen in N MIN/MAX-Bereiche zerlegen (ueberschreibt config.shards)
+    #[arg(long, value_name = "N")]
+    shards: Option<usize>,
 }
 
 #[tokio::main]
@@ -150,13 +176,23 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cfg = match config::load_many(&cli.config) {
+    let mut cfg = match config::load_many(&cli.config) {
         Ok(c) => c,
         Err(e) => {
             log::error!("Config-Fehler: {e:#}");
             return ExitCode::from(2);
         }
     };
+    if let Some(addr) = &cli.connect {
+        cfg.server = Some(addr.clone());
+    }
+    if let Some(n) = cli.shards {
+        if n == 0 || n > 1024 {
+            log::error!("--shards muss zwischen 1 und 1024 liegen");
+            return ExitCode::from(2);
+        }
+        cfg.shards = n;
+    }
 
     let selector_str = if cli.selectors.is_empty() {
         None
@@ -164,11 +200,22 @@ async fn main() -> ExitCode {
         Some(cli.selectors.join(","))
     };
 
-    let is_client = cli.force
+    let action_requested = cli.force
         || cli.sync
         || cli.force_schema
         || cli.check.is_some()
-        || cli.testing_drop_chunks.is_some();
+        || cli.testing_drop_chunks.is_some()
+        || cli.benchmark;
+    if (cli.daemon || cli.foreground) && (cli.client || cli.task.is_some() || action_requested) {
+        log::error!("--daemon/-f kann nicht mit Client-Aktionen oder --task kombiniert werden");
+        return ExitCode::from(2);
+    }
+    if cli.task.is_some() && action_requested {
+        log::error!("--task kann nicht mit --sync/--check/--force/--benchmark kombiniert werden");
+        return ExitCode::from(2);
+    }
+    let is_client = cli.client || cli.task.is_some() || action_requested;
+    let sync = cli.sync || (cli.client && !action_requested && cli.task.is_none());
 
     let bench_modes: Vec<hash::HashVia> = if cli.hash_via_raw_tsv {
         vec![hash::HashVia::RawTsv]
@@ -190,11 +237,25 @@ async fn main() -> ExitCode {
         testing::run(&cfg, selector_str.as_deref(), start).await
     } else if cli.benchmark {
         benchmark::run(&cfg, selector_str.as_deref(), &bench_modes).await
+    } else if let Some(path) = &cli.task {
+        match task::load(path) {
+            Ok(spec) => {
+                if let Err(e) = spec.apply_cfg(&mut cfg) {
+                    Err(e)
+                } else {
+                    match spec.into_client_args(cfg, cli.no_progress) {
+                        Ok(args) => client::run(args).await,
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
     } else if is_client {
         client::run(client::ClientArgs {
             cfg,
             force: cli.force,
-            sync: cli.sync,
+            sync,
             force_schema: cli.force_schema,
             check: cli.check,
             selector: selector_str,

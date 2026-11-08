@@ -8,7 +8,6 @@ use crate::config::{Config, ALPN};
 use crate::proto::{self, Framing, Request};
 use crate::tls;
 use anyhow::{bail, Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -21,7 +20,7 @@ enum Kind {
     Quic {
         conn: quinn::Connection,
         endpoint: quinn::Endpoint,
-        hello_done: AtomicBool,
+        hello_done: tokio::sync::OnceCell<()>,
     },
     Tcp {
         addr: std::net::SocketAddr,
@@ -90,7 +89,7 @@ impl Session {
             kind: Kind::Quic {
                 conn,
                 endpoint,
-                hello_done: AtomicBool::new(false),
+                hello_done: tokio::sync::OnceCell::new(),
             },
         })
     }
@@ -101,9 +100,9 @@ impl Session {
                 conn, hello_done, ..
             } => {
                 let (mut send, mut recv) = conn.open_bi().await.context("QUIC-Stream öffnen")?;
-                if !hello_done.swap(true, Ordering::SeqCst) {
-                    hello(&mut send, &mut recv, cfg).await?;
-                }
+                hello_done
+                    .get_or_try_init(|| hello(&mut send, &mut recv, cfg))
+                    .await?;
                 Ok((Box::new(send), Box::new(recv)))
             }
             Kind::Tcp { addr, timeout } => {
@@ -132,28 +131,50 @@ where
     R: AsyncRead + Unpin + ?Sized,
 {
     let f = Framing::from_cfg(cfg);
-    proto::write_request(
-        send,
-        &Request::Hello {
-            version: proto::version(),
-            token: cfg.auth_token.clone(),
-            hash_algo: Some(cfg.hash_algo.to_string()),
-        },
-        &f,
-    )
-    .await?;
-    let buf = match proto::read_response_bytes(recv, &f).await? {
-        Some(buf) => buf,
-        None => bail!("Keine Handshake-Antwort"),
-    };
-    match proto::access_response(&buf)? {
-        proto::ArchivedResponse::Ok { .. } => {
-            log::debug!("Server-Handshake ok");
-            Ok(())
+    let client_nonce = cfg.auth_key.as_ref().map(|_| crate::auth::random_hex(32));
+    let mut proof: Option<String> = None;
+
+    for _attempt in 0..2 {
+        proto::write_request(
+            send,
+            &Request::Hello {
+                version: proto::version(),
+                token: cfg.auth_token.clone(),
+                hash_algo: Some(cfg.hash_algo.to_string()),
+                client_nonce: client_nonce.clone(),
+                proof: proof.clone(),
+            },
+            &f,
+        )
+        .await?;
+        let buf = match proto::read_response_bytes(recv, &f).await? {
+            Some(buf) => buf,
+            None => bail!("Keine Handshake-Antwort"),
+        };
+        match proto::access_response(&buf)? {
+            proto::ArchivedResponse::Ok { .. } => {
+                if cfg.auth_key.is_some() && proof.is_none() {
+                    bail!("Server hat den Auth-Challenge übersprungen (Config-Mismatch)");
+                }
+                log::debug!("Server-Handshake ok");
+                return Ok(());
+            }
+            proto::ArchivedResponse::Challenge { nonce, proof: server_proof } => {
+                let (Some(key), Some(client_nonce)) = (&cfg.auth_key, &client_nonce) else {
+                    bail!("Unerwartete Auth-Challenge vom Server");
+                };
+                let nonce = nonce.as_str();
+                let expected = crate::auth::server_proof(key, client_nonce, nonce);
+                if !crate::auth::ct_eq(expected.as_bytes(), server_proof.as_str().as_bytes()) {
+                    bail!("Server-Auth-Proof ungültig");
+                }
+                proof = Some(crate::auth::client_proof(key, client_nonce, nonce));
+            }
+            proto::ArchivedResponse::Err { message } => {
+                bail!("Server lehnt ab: {}", message.as_str())
+            }
+            _ => bail!("Unerwartete Handshake-Antwort"),
         }
-        proto::ArchivedResponse::Err { message } => {
-            bail!("Server lehnt ab: {}", message.as_str())
-        }
-        _ => bail!("Unerwartete Handshake-Antwort"),
     }
+    bail!("Auth-Handshake nicht abgeschlossen")
 }

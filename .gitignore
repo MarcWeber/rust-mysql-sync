@@ -9,3 +9,4 @@
 /docker-compose.yml
 __pycache__/
 .venv/
+/log.txt

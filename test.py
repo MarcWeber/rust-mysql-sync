@@ -13,6 +13,7 @@ Actions:
   down   : stop/remove the containers
   clean  : stop/remove the containers and their volumes
   test_time_pk_chunk : create a TIME-PK table and verify chunk-key/drill-down agree
+  test_two_servers   : both sides daemon; sync A->B and B->A on different tables
 
 python3 test.py up matrix
 python3 test.py up test_time_pk_chunk
@@ -44,6 +45,7 @@ from yachalk import chalk
 
 # Add bundled 3rd-party libs to path
 HERE = Path(__file__).resolve().parent
+assert Path("src/main.rs").is_file(), "run test.py from the repository root"
 sys.path.insert(0, str(HERE / "3rd"))
 
 from u_asyncio import run_show_out_tail_on_error, task
@@ -93,6 +95,7 @@ TABLE_SCHEMA_CASES = {
 
 
 WORK = HERE / ".test-run"
+MYSQL_CLI = os.environ.get("MSYNC_MYSQL_CLI", str(WORK / "bin" / "mysql"))
 
 
 def _cargo_target_dir():
@@ -119,6 +122,9 @@ if os.environ.get("MSYNC_BIN"):
     BIN = Path(os.environ["MSYNC_BIN"]).expanduser().resolve()
 else:
     BIN = _default_bin()
+
+CLIENT = ["--client"]
+SERVER = ["--daemon", "-f"]
 
 _TLS = None
 
@@ -266,7 +272,7 @@ class Mysql:
 
     async def sql(self, *queries, database=None, check=True, quiet=False):
         """SQL auf die MySQL-Instanz dieses Objekts ausführen."""
-        cli = os.environ.get("MSYNC_MYSQL_CLI", "/usr/bin/mysql")
+        cli = MYSQL_CLI
         base = [cli, "-h", "127.0.0.1", "-P", str(self.port), "-uroot"]
         if ROOT_PW:
             base.append(f"-p{ROOT_PW}")
@@ -300,10 +306,10 @@ class Mysql:
     def server_port(self):
         return self.port + SERVER_PORT_OFFSET
 
-    def server_config(self):
+    def server_config(self, auth_key=None, auth_key_hash=None):
         cert_pem, key_pem, fingerprint = tls_material()
         cfg = WORK / f"config-server-{self.name}.json"
-        cfg.write_text(json.dumps({
+        data = {
             "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": self.port},
             "listen": "127.0.0.1",
             "port": self.server_port,
@@ -312,7 +318,11 @@ class Mysql:
             "tls_cert_pem": cert_pem,
             "tls_key_pem": key_pem,
             "server_fingerprint": fingerprint,
-        }, indent=2))
+        }
+        if auth_key is not None:
+            data["auth_key"] = auth_key
+            data["auth_key_hash"] = auth_key_hash
+        cfg.write_text(json.dumps(data, indent=2))
         return cfg
 
     @property
@@ -320,14 +330,14 @@ class Mysql:
         return self.server_port + 1
 
     @asynccontextmanager
-    async def server_running(self):
-        cfg = self.server_config()
+    async def server_running(self, auth_key=None, auth_key_hash=None):
+        cfg = self.server_config(auth_key, auth_key_hash)
         fingerprint = json.loads(cfg.read_text())["server_fingerprint"]
         log = open(WORK / f"server-{self.name}.log", "w")
         env = os.environ.copy()
         env["RUST_LOG"] = "warn"
         proc = await asyncio.create_subprocess_exec(
-            str(BIN), "-C", str(cfg), stdout=log, stderr=log, env=env
+            str(BIN), *SERVER, "-C", str(cfg), stdout=log, stderr=log, env=env
         )
         log.close()
         try:
@@ -410,7 +420,7 @@ async def ensure_binary(bin):
 
 
 def mysql_sync(args, expect_rc=0, label=""):
-    r = subprocess.run([str(BIN), *args], text=True, capture_output=True, cwd=WORK)
+    r = subprocess.run([str(BIN), *CLIENT, *args], text=True, capture_output=True, cwd=WORK)
     tail = (r.stdout + r.stderr).strip().splitlines()
     tail_str = "\n    ".join(tail[-6:])
     ok = r.returncode == expect_rc
@@ -420,7 +430,7 @@ def mysql_sync(args, expect_rc=0, label=""):
 
 
 def run_bin(args):
-    r = subprocess.run([str(BIN), *args], text=True, capture_output=True, cwd=WORK)
+    r = subprocess.run([str(BIN), *CLIENT, *args], text=True, capture_output=True, cwd=WORK)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -767,7 +777,7 @@ async def _run_rust_case(cfg_json, case):
     selector = f"{MATRIX_DB}:{src_table}"
     mode = case.tool_opts.mode
     flag = dict(RUST_MODES)[mode]
-    base = [str(BIN), "-C", "-", "--no-progress"] + ([flag] if flag else [])
+    base = [str(BIN), *CLIENT, "-C", "-", "--no-progress"] + ([flag] if flag else [])
     stdin_data = cfg_json.encode()
 
     if mode == "raw-tsv" and case.binary == "bin":
@@ -864,7 +874,7 @@ async def _run_pt_case(cfg_json, case):
     sync_ms, (_, _, _) = await _timed([*common, "--execute", src_dsn, dst_dsn], expected_rcs=(0, 2))
 
     await _timed(
-        [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{MATRIX_DB}:{src_table}"],
+        [str(BIN), *CLIENT, "-C", "-", "--no-progress", "--check", "0", f"{MATRIX_DB}:{src_table}"],
         cfg_json.encode()
     )
     a = await src.scalar(_matrix_checksum_sql(case, src_table), quiet=True)
@@ -885,7 +895,7 @@ async def _prepare_matrix_table(m, case, table):
 
 
 async def _drop_matrix_chunks(m, table, start):
-    cmd = [str(BIN), "-C", "-", f"--testing-drop-chunks={start}",
+    cmd = [str(BIN), *CLIENT, "-C", "-", f"--testing-drop-chunks={start}",
             f"{MATRIX_DB}:{table}"]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE,
@@ -1143,7 +1153,7 @@ def print_env():
 def start_server(server_cfg, log_name):
     fingerprint = json.loads(Path(server_cfg).read_text())["server_fingerprint"]
     log = open(WORK / log_name, "w")
-    proc = subprocess.Popen([str(BIN), "-C", str(server_cfg)], stdout=log, stderr=log)
+    proc = subprocess.Popen([str(BIN), *SERVER, "-C", str(server_cfg)], stdout=log, stderr=log)
     return proc, fingerprint
 
 
@@ -1312,14 +1322,14 @@ async def test_where_constraint():
 
             # Check
             ms, (_, _, rc) = await _timed(
-                [str(BIN), "-C", "-", "--no-progress", "--check", "0", f"{db}:{table}"],
+                [str(BIN), *CLIENT, "-C", "-", "--no-progress", "--check", "0", f"{db}:{table}"],
                 cfg_json.encode(), expected_rcs=(0, 1)
             )
             print(f"      Check: rc={rc} ({ms:.0f}ms)")
 
             # Sync
             ms, (_, _, _) = await _timed(
-                [str(BIN), "-C", "-", "--no-progress", "--sync", f"{db}:{table}"],
+                [str(BIN), *CLIENT, "-C", "-", "--no-progress", "--sync", f"{db}:{table}"],
                 cfg_json.encode()
             )
             print(f"      Sync: ok ({ms:.0f}ms)")
@@ -1392,14 +1402,14 @@ async def test_parallel():
 
         # Check — should find differences on all tables
         ms, (_, _, rc) = await _timed(
-            [str(BIN), "-C", "-", "--no-progress", "--check", "0", selector],
+            [str(BIN), *CLIENT, "-C", "-", "--no-progress", "--check", "0", selector],
             cfg_json.encode(), expected_rcs=(1,)
         )
         print(f"  Check: rc={rc} ({ms:.0f}ms)")
 
         # Sync all tables in parallel
         ms, (_, _, _) = await _timed(
-            [str(BIN), "-C", "-", "--no-progress", "--sync", selector],
+            [str(BIN), *CLIENT, "-C", "-", "--no-progress", "--sync", selector],
             cfg_json.encode()
         )
         print(f"  Sync: ok ({ms:.0f}ms)")
@@ -1414,7 +1424,7 @@ async def test_parallel():
 
         # Check again — should find no differences
         ms, (_, _, rc) = await _timed(
-            [str(BIN), "-C", "-", "--no-progress", "--check", "0", selector],
+            [str(BIN), *CLIENT, "-C", "-", "--no-progress", "--check", "0", selector],
             cfg_json.encode(), expected_rcs=(0,)
         )
         print(f"  Final check: rc={rc} ({ms:.0f}ms)")
@@ -1505,20 +1515,20 @@ async def test_time_pk_chunk():
             print("      Rust bucket for whole-second TIME rows: '00'")
 
             await _timed(
-                [str(BIN), "-C", "-", "--no-progress", flag,
+                [str(BIN), *CLIENT, "-C", "-", "--no-progress", flag,
                  "--check", "0", selector],
                 cfg_json.encode(), expected_rcs=(1,),
             )
             print("      check before sync: diff found")
 
             await _timed(
-                [str(BIN), "-C", "-", "--no-progress", flag,
+                [str(BIN), *CLIENT, "-C", "-", "--no-progress", flag,
                  "--sync", selector],
                 cfg_json.encode(),
             )
 
             _, (_, _, rc) = await _timed(
-                [str(BIN), "-C", "-", "--no-progress", flag,
+                [str(BIN), *CLIENT, "-C", "-", "--no-progress", flag,
                  "--check", "0", selector],
                 cfg_json.encode(), expected_rcs=(0, 1),
             )
@@ -1548,6 +1558,109 @@ async def test_time_pk_chunk():
           "bucket_where uses RIGHT(col, N) on the TIME text)"
     )
     print("  test_time_pk_chunk: OK")
+
+
+async def _wait_tcp(port, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            _r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.close()
+            await w.wait_closed()
+            return
+        except OSError:
+            await asyncio.sleep(0.1)
+    raise RuntimeError(f"server port {port} not listening after {timeout}s")
+
+
+async def test_two_servers():
+    """Both sides run as daemons; each side sends one sync job to the other."""
+    await ensure_binary(str(BIN))
+    await prepare_workdir()
+    await ensure_dbs_up()
+
+    src, dst = MYSQL_INSTANCES["mysql80"], MYSQL_INSTANCES["mysql97"]
+    db = "db_twoservers"
+    table_ab = "t_ab"
+    table_ba = "t_ba"
+    schema = TABLE_SCHEMAS["TC102"]
+
+    for m in (src, dst):
+        await m.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+        await m.sql(f"CREATE DATABASE {db}")
+    await src.sql(*schema.drop_recreate_sql(f"{db}.{table_ab}", 60))
+    await dst.sql(*schema.drop_recreate_sql(f"{db}.{table_ab}", 0))
+    await src.sql(*schema.drop_recreate_sql(f"{db}.{table_ba}", 0))
+    await dst.sql(*schema.drop_recreate_sql(f"{db}.{table_ba}", 40))
+
+    auth_key = os.urandom(32).hex()
+    auth_key_hash = "sha256:" + hashlib.sha256(auth_key.encode()).hexdigest()
+    cfg_ab = WORK / "config-bidir-a-to-b.json"
+    cfg_ba = WORK / "config-bidir-b-to-a.json"
+    task_ab = WORK / "task-a-to-b.json"
+
+    async with AsyncExitStack() as stack:
+        fp_ab = await stack.enter_async_context(src.server_running(auth_key, auth_key_hash))
+        fp_ba = await stack.enter_async_context(dst.server_running(auth_key, auth_key_hash))
+        await asyncio.gather(_wait_tcp(src.tcp_server_port), _wait_tcp(dst.tcp_server_port))
+
+        cfg_ab.write_text(json.dumps({
+            "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": src.port},
+            "server": f"127.0.0.1:{dst.server_port}",
+            "server_fingerprint": fp_ba,
+            "auth_key": auth_key,
+            "auth_key_hash": auth_key_hash,
+        }, indent=2))
+        cfg_ba.write_text(json.dumps({
+            "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": dst.port},
+            "server": f"127.0.0.1:{src.server_port}",
+            "server_fingerprint": fp_ab,
+            "auth_key": auth_key,
+            "auth_key_hash": auth_key_hash,
+        }, indent=2))
+        task_ab.write_text(json.dumps({
+            "mode": "sync",
+            "selectors": [f"{db}:{table_ab}"],
+            "shards": 4,
+            "hash_via": "select-sha2",
+            "no_progress": True,
+            "connect": f"127.0.0.1:{dst.server_port}",
+        }, indent=2))
+
+        async def run_client(*args):
+            proc = await asyncio.create_subprocess_exec(
+                str(BIN), *args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+            return proc.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+        res_ab, res_ba = await asyncio.gather(
+            run_client("--client", "-C", str(cfg_ab), "--task", str(task_ab)),
+            run_client(
+                "--client", "-C", str(cfg_ba), "--connect", f"127.0.0.1:{src.server_port}",
+                "--sync", f"{db}:{table_ba}", "--shards", "4", "--no-progress",
+            ),
+        )
+        for label, (rc, out, err) in (("A->B", res_ab), ("B->A", res_ba)):
+            if rc != 0:
+                raise RuntimeError(
+                    f"two-server sync {label} failed (rc={rc}):\n{out[-1000:]}\n{err[-2000:]}"
+                )
+
+        for label, table in (("A->B", table_ab), ("B->A", table_ba)):
+            a = await src.scalar(
+                f"SELECT COUNT(*), COALESCE(SUM(b),0), COALESCE(SUM(LENGTH(a)),0) FROM {db}.{table}"
+            )
+            b = await dst.scalar(
+                f"SELECT COUNT(*), COALESCE(SUM(b),0), COALESCE(SUM(LENGTH(a)),0) FROM {db}.{table}"
+            )
+            if a != b:
+                raise RuntimeError(f"two-server sync {label}: data mismatch {a!r} != {b!r}")
+
+    for m in (src, dst):
+        await m.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+    print("  test_two_servers: OK")
 
 
 async def write_tutorial_files():
@@ -1632,7 +1745,7 @@ echo "DELETE FROM __DB__.__DST_TABLE__ WHERE RAND() < 0.5" | mysql -h 127.0.0.1 
 ```bash
 # Client = source (__SRC_PORT__), server = target (__DST_PORT__).
 # target.json already contains inline TLS cert/key + fingerprint; source.json pins it.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/target.json &
+${CARGO_TARGET_DIR}/release/mysql-sync --daemon -f -C tutorial/target.json &
 sleep 2
 ```
 
@@ -1640,16 +1753,16 @@ sleep 2
 
 ```bash
 # Measure how fast the tool hashes and compares all chunks.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --benchmark __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync --client -C tutorial/source.json --benchmark __DB__:__SRC_TABLE__
 
 # Compare chunk hashes. Expected: exit code 1 (differences found).
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync --client -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
 
 # Copy all differing chunks from source to target.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --sync __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync --client -C tutorial/source.json --sync __DB__:__SRC_TABLE__
 
 # Confirm all chunks match now. Expected: exit code 0 (no differences).
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync --client -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
 ```
 
 ## Sync with WHERE filter
@@ -1667,15 +1780,15 @@ mysql -h 127.0.0.1 -P __SRC_PORT__ -uroot -p__ROOT_PW__ -e "DELETE FROM __DB__._
 # }
 
 # Sync and verify only the filtered rows.
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --sync __DB__:__SRC_TABLE__
-${CARGO_TARGET_DIR}/release/mysql-sync -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync --client -C tutorial/source.json --sync __DB__:__SRC_TABLE__
+${CARGO_TARGET_DIR}/release/mysql-sync --client -C tutorial/source.json --check 0 __DB__:__SRC_TABLE__
 ```
 
 ## Cleanup
 
 ```bash
 # Stop the background server from Step 1, then stop the containers.
-pkill -f 'mysql-sync -C tutorial/target.json'
+pkill -f 'mysql-sync.*tutorial/target.json'
 python test.py down
 ```
 """
@@ -1774,7 +1887,7 @@ async def step_2_start_server():
     log = open(SERVER_LOG, "wb")
     try:
         server_proc = await asyncio.create_subprocess_exec(
-            BIN, "-C", TARGET_CFG, stdout=log, stderr=log
+            BIN, "--daemon", "-f", "-C", TARGET_CFG, stdout=log, stderr=log
         )
     finally:
         log.close()
@@ -1793,26 +1906,26 @@ async def step_2_start_server():
 async def step_3_benchmark():
     """Run --benchmark to measure hash speed."""
     info("Step 3: Benchmark — measure hash and compare speed")
-    await run_show_out_tail_on_error([BIN, "-C", SOURCE_CFG, "--benchmark", SELECTOR])
+    await run_show_out_tail_on_error([BIN, "--client", "-C", SOURCE_CFG, "--benchmark", SELECTOR])
 
 
 async def step_4_check():
     """Run --check to detect differences."""
     info("Step 4: Check — detect differences (expected: exit code 1)")
-    await run_show_out_tail_on_error([BIN, "-C", SOURCE_CFG, "--check", "0", SELECTOR], valid_return_codes=[1])
+    await run_show_out_tail_on_error([BIN, "--client", "-C", SOURCE_CFG, "--check", "0", SELECTOR], valid_return_codes=[1])
     print("  EXPECTED: differences detected (exit code 1)")
 
 
 async def step_5_sync():
     """Run --sync to copy all data."""
     info("Step 5: Sync — copy all differing chunks")
-    await run_show_out_tail_on_error([BIN, "-C", SOURCE_CFG, "--sync", SELECTOR])
+    await run_show_out_tail_on_error([BIN, "--client", "-C", SOURCE_CFG, "--sync", SELECTOR])
 
 
 async def step_6_verify():
     """Run --check again to verify sync was complete."""
     info("Step 6: Verify — confirm no differences remain")
-    await run_show_out_tail_on_error([BIN, "-C", SOURCE_CFG, "--check", "0", SELECTOR])
+    await run_show_out_tail_on_error([BIN, "--client", "-C", SOURCE_CFG, "--check", "0", SELECTOR])
     print("  SUCCESS: tables are identical")
 
 
@@ -1838,14 +1951,14 @@ async def step_7_sync_with_where():
         f.write("\n")
     print("  source.json updated with sync_where/check_where: a >= 100")
 
-    await run_show_out_tail_on_error([BIN, "-C", SOURCE_CFG, "--sync", SELECTOR])
+    await run_show_out_tail_on_error([BIN, "--client", "-C", SOURCE_CFG, "--sync", SELECTOR])
     print("  Synced only rows with a >= 100")
 
 
 async def step_8_final_check():
     """Final check — no problems expected."""
     info("Step 8: Final check — all filtered chunks should match")
-    await run_show_out_tail_on_error([BIN, "-C", SOURCE_CFG, "--check", "0", SELECTOR])
+    await run_show_out_tail_on_error([BIN, "--client", "-C", SOURCE_CFG, "--check", "0", SELECTOR])
     print("  SUCCESS: tutorial complete")
 
 
@@ -1892,6 +2005,7 @@ ACTIONS = {
     "test_where_constraint": test_where_constraint,
     "test_parallel": test_parallel,
     "test_time_pk_chunk": test_time_pk_chunk,
+    "test_two_servers": test_two_servers,
     "tutorial": write_tutorial_files,
 }
 

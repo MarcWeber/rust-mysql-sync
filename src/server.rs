@@ -5,6 +5,7 @@
 //!   Dump:   DumpBegin (JSON) → BIN-Frames → DumpEnd (JSON) → Ausführen
 //!   Csv:    CsvBegin (JSON) → BIN-Frames → CsvEnd (JSON) → Import
 
+use crate::auth;
 use crate::config::Config;
 use crate::export;
 use crate::hash;
@@ -185,6 +186,7 @@ async fn handle_stream(
 ) -> Result<()> {
     let f = Framing::from_cfg(&state.cfg);
     let mut mode = Mode::Normal;
+    let mut pending_auth: Option<PendingAuth> = None;
     let mut trigger_backup: HashMap<(String, String), Vec<import::TriggerDef>> = HashMap::new();
 
     while let Some(frame) = proto::read_request_bytes(&mut recv, &f).await? {
@@ -325,16 +327,32 @@ async fn handle_stream(
                 version,
                 token,
                 hash_algo,
+                client_nonce,
+                proof,
             } => {
                 let token = token.as_ref().map(|s| s.as_str());
                 let hash_algo = hash_algo.as_ref().map(|s| s.as_str());
-                let r = handle_hello(state.as_ref(), version.to_native(), token, hash_algo).await;
+                let client_nonce = client_nonce.as_ref().map(|s| s.as_str());
+                let proof = proof.as_ref().map(|s| s.as_str());
+                let r = handle_hello(
+                    state.as_ref(),
+                    version.to_native(),
+                    token,
+                    hash_algo,
+                    client_nonce,
+                    proof,
+                    &mut pending_auth,
+                )
+                .await;
                 if matches!(r, Response::Ok { .. }) {
                     hello_done.store(true, Ordering::SeqCst);
                 }
                 r
             }
             ArchivedRequest::MysqlVersion {} => handle_mysql_version(state.as_ref()).await,
+            ArchivedRequest::MinMax { db, table, column } => {
+                handle_min_max(state.as_ref(), db.as_str(), table.as_str(), column.as_str()).await
+            }
             ArchivedRequest::DescribeCount { db, table } => {
                 handle_describe_count(state.as_ref(), db.as_str(), table.as_str()).await
             }
@@ -521,11 +539,20 @@ async fn send_response(send: &mut SendHalf, resp: Response, f: &Framing) -> Resu
     Ok(())
 }
 
+struct PendingAuth {
+    client_nonce: String,
+    server_nonce: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_hello(
     state: &ServerState,
     version: u32,
     token: Option<&str>,
     hash_algo: Option<&str>,
+    client_nonce: Option<&str>,
+    proof: Option<&str>,
+    pending_auth: &mut Option<PendingAuth>,
 ) -> Response {
     if version != proto::version() {
         return Response::err(format!(
@@ -547,6 +574,42 @@ async fn handle_hello(
             ));
         }
     }
+    if let Some(key) = &state.cfg.auth_key {
+        return match proof {
+            Some(proof) => {
+                let Some(pending) = pending_auth.take() else {
+                    return Response::err("Auth-Challenge fehlt");
+                };
+                if client_nonce != Some(pending.client_nonce.as_str()) {
+                    return Response::err("Auth-Client-Nonce ungültig");
+                }
+                let expected =
+                    auth::client_proof(key, &pending.client_nonce, &pending.server_nonce);
+                if !auth::ct_eq(expected.as_bytes(), proof.as_bytes()) {
+                    return Response::err("Auth-Proof ungültig");
+                }
+                Response::ok("welcome")
+            }
+            None => {
+                let Some(client_nonce) = client_nonce else {
+                    return Response::err("Auth-Client-Nonce fehlt");
+                };
+                let server_nonce = auth::random_hex(32);
+                *pending_auth = Some(PendingAuth {
+                    client_nonce: client_nonce.to_string(),
+                    server_nonce: server_nonce.clone(),
+                });
+                let proof = auth::server_proof(key, client_nonce, &server_nonce);
+                Response::Challenge {
+                    nonce: server_nonce,
+                    proof,
+                }
+            }
+        };
+    }
+    if client_nonce.is_some() || proof.is_some() {
+        return Response::err("Server erwartet keinen Auth-Key (Config-Mismatch)");
+    }
     Response::ok("welcome")
 }
 
@@ -559,6 +622,29 @@ async fn handle_describe_count(state: &ServerState, db: &str, table: &str) -> Re
                 count: info.count,
             },
             Err(e) => Response::err(format!("{e:#}")),
+        },
+        Err(e) => Response::err(format!("{e:#}")),
+    }
+}
+
+async fn handle_min_max(state: &ServerState, db: &str, table: &str, column: &str) -> Response {
+    let mut conn = match mysqlutil::session_conn(&state.pool).await {
+        Ok(c) => c,
+        Err(e) => return Response::err(format!("{e:#}")),
+    };
+    let col = mysqlutil::quote_ident(column);
+    let q = format!(
+        "SELECT CAST(MIN({col}) AS CHAR), CAST(MAX({col}) AS CHAR) FROM {}",
+        qualified(db, table)
+    );
+    match conn
+        .query_first::<(Option<String>, Option<String>), _>(q)
+        .await
+    {
+        Ok(Some((min, max))) => Response::MinMax { min, max },
+        Ok(None) => Response::MinMax {
+            min: None,
+            max: None,
         },
         Err(e) => Response::err(format!("{e:#}")),
     }

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub const DEFAULT_SERVER_PORT: u16 = 4433;
-pub const PROTOCOL_VERSION: u32 = 7;
-pub const ALPN: &[u8] = b"mysql-sync/7";
+pub const PROTOCOL_VERSION: u32 = 8;
+pub const ALPN: &[u8] = b"mysql-sync/8";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MysqlCfg {
@@ -45,6 +45,9 @@ fn d_chunk_stream_buffer() -> usize {
 }
 fn d_concurrent() -> usize {
     3
+}
+fn d_shards() -> usize {
+    1
 }
 fn d_connect_timeout() -> u64 {
     30
@@ -310,6 +313,11 @@ pub struct Config {
     #[serde(default = "d_concurrent", alias = "concurrent_processes")]
     pub concurrent_processes: usize,
 
+    /// Zusaetzliche Zerlegung grosser Tabellen in MIN/MAX-Bereiche.
+    /// 1 = aus; nur bei einzelnem numerischen PK und ohne Schema-Force.
+    #[serde(default = "d_shards", alias = "shard_count", alias = "shards_per_table")]
+    pub shards: usize,
+
     /// Ab diesem Prozentanteil differierender Buckets: Vollkopie statt Drill-Down
     #[serde(
         default = "d_percent10",
@@ -337,6 +345,15 @@ pub struct Config {
     /// Optionaler gemeinsamer Auth-Token (Hello-Handshake)
     #[serde(default, alias = "auth_token")]
     pub auth_token: Option<String>,
+
+    /// Gemeinsamer Schlüssel für den Challenge/Response-Handshake.
+    /// `auth_key` und `auth_key_hash` müssen gemeinsam gesetzt sein.
+    #[serde(default)]
+    pub auth_key: Option<String>,
+
+    /// Nicht-geheimer Fingerprint von `auth_key` ("sha256:<hex>").
+    #[serde(default, alias = "auth_key_sha256")]
+    pub auth_key_hash: Option<String>,
 
     /// Server-Identität als PEM-Inhalt (aus `--generate-configs`).
     #[serde(default)]
@@ -546,6 +563,8 @@ pub fn generate_configs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         .with_context(|| format!("Verzeichnis anlegen: {}", dir.display()))?;
 
     let (cert_pem, key_pem, fp) = crate::tls::generate_identity()?;
+    let auth_key = crate::auth::random_key();
+    let auth_key_hash = crate::auth::key_fingerprint(&auth_key);
     let server = serde_json::json!({
         "mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "password": ""},
         "listen": "127.0.0.1",
@@ -553,12 +572,16 @@ pub fn generate_configs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         "tls_cert_pem": cert_pem,
         "tls_key_pem": key_pem,
         "server_fingerprint": fp,
+        "auth_key": auth_key,
+        "auth_key_hash": auth_key_hash,
     });
     let client = serde_json::json!({
         "mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "password": ""},
         "server": format!("127.0.0.1:{DEFAULT_SERVER_PORT}"),
         "quic_port": DEFAULT_SERVER_PORT,
         "server_fingerprint": fp,
+        "auth_key": auth_key,
+        "auth_key_hash": auth_key_hash,
     });
     write_private_json(&server_path, &server)?;
     write_private_json(&client_path, &client)?;
@@ -595,6 +618,9 @@ impl Config {
         if self.concurrent_processes == 0 {
             anyhow::bail!("\"concurrent_processes\" muss >= 1 sein");
         }
+        if self.shards == 0 || self.shards > 1024 {
+            anyhow::bail!("\"shards\" muss zwischen 1 und 1024 liegen");
+        }
         if self.chunk_stream_buffer == 0 || self.chunk_stream_buffer > 100_000 {
             anyhow::bail!("\"chunk_stream_buffer\" muss zwischen 1 und 100000 liegen");
         }
@@ -627,6 +653,11 @@ impl Config {
                 "hash_algo \"{algo}\" ist in diesem Build nicht einkompiliert \
                  (Cargo-Features: xxhash, blake3, md5, sha2)"
             );
+        }
+        match (&self.auth_key, &self.auth_key_hash) {
+            (Some(key), Some(hash)) => crate::auth::verify_key_fingerprint(key, hash)?,
+            (None, None) => {}
+            _ => bail!("auth_key und auth_key_hash müssen gemeinsam gesetzt sein"),
         }
         for s in &self.hash_strategies {
             s.parse::<crate::hash::HashVia>()

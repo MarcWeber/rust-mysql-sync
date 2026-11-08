@@ -176,9 +176,19 @@ pub enum Request {
         version: u32,
         token: Option<String>,
         hash_algo: Option<String>,
+        /// Client nonce for the challenge/response auth (when a shared key is configured).
+        client_nonce: Option<String>,
+        /// Proof over `auth_key` + both nonces; absent on the first Hello.
+        proof: Option<String>,
     },
     /// Server MySQL version/profile. Used to gate byte-oriented raw hashing.
     MysqlVersion {},
+    /// MIN/MAX of a numeric primary-key column, used for shard planning.
+    MinMax {
+        db: String,
+        table: String,
+        column: String,
+    },
     DescribeCount {
         db: String,
         table: String,
@@ -261,6 +271,16 @@ pub enum Response {
     MysqlVersion {
         version: String,
         profile: MysqlProfile,
+    },
+    /// Auth challenge: server nonce plus the server's own proof.
+    Challenge {
+        nonce: String,
+        proof: String,
+    },
+    /// MIN/MAX result for shard planning. Both are decimal strings.
+    MinMax {
+        min: Option<String>,
+        max: Option<String>,
     },
     ChunkHashes {
         items: Vec<ChunkHash>,

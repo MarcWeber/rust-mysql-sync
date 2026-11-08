@@ -43,6 +43,8 @@ pub async fn run(cfg: &Config, selector: Option<&str>, modes: &[HashVia]) -> Res
             local_table: table.clone(),
             remote_db: db.clone(),
             remote_table: table.clone(),
+            extra_where: None,
+            shard: None,
         };
         for &via in modes {
             match sync::benchmark_table(cfg, &pool, &task, via).await {

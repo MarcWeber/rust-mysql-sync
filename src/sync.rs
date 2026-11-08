@@ -487,6 +487,10 @@ pub struct TableTask {
     pub local_table: String,
     pub remote_db: String,
     pub remote_table: String,
+    /// Shard-local WHERE clause (see `shards`); merged with table overrides.
+    pub extra_where: Option<String>,
+    /// (current, total) when this task is one shard of a larger table.
+    pub shard: Option<(usize, usize)>,
 }
 
 pub struct TableResult {
@@ -660,7 +664,10 @@ async fn run_inner(
     progress: &Progress,
     forced_via: Option<HashVia>,
 ) -> Result<SyncStats> {
-    let label = format!("{}.{}", task.local_db, task.local_table);
+    let label = match task.shard {
+        Some((i, n)) => format!("{}.{} [shard {i}/{n}]", task.local_db, task.local_table),
+        None => format!("{}.{}", task.local_db, task.local_table),
+    };
     let (mut send, mut recv) = session.open(cfg).await?;
     let f = Framing::from_cfg(cfg);
     let bar = progress.bar(&label, 0);
@@ -679,7 +686,7 @@ async fn run_inner(
         mysqlutil::table_info(&mut local_conn, &task.local_db, &task.local_table).await?;
     let column_meta =
         mysqlutil::column_meta(&mut local_conn, &task.local_db, &task.local_table).await?;
-    let plan = plan_table(
+    let mut plan = plan_table(
         cfg,
         &task.local_db,
         &task.local_table,
@@ -689,7 +696,18 @@ async fn run_inner(
         mode,
     )?;
     let field_opts = plan.field_opts.clone();
-    let extra_where = plan.extra_where.clone();
+    let extra_where = match (&plan.extra_where, &task.extra_where) {
+        (Some(a), Some(b)) => Some(format!("({a}) AND ({b})")),
+        (Some(a), None) => Some(a.clone()),
+        (None, Some(b)) => Some(b.clone()),
+        (None, None) => None,
+    };
+    if extra_where.is_some() && plan.candidates.contains(&HashVia::Dump) {
+        plan.candidates.retain(|v| *v != HashVia::Dump);
+        if plan.candidates.is_empty() {
+            bail!("{label}: WHERE is set but dump mode cannot filter rows");
+        }
+    }
     if let Some(pattern) = &plan.matched {
         log::info!("[{label}] tables-Selektor {pattern:?} passt");
     }
