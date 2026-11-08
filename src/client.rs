@@ -98,6 +98,23 @@ async fn local_min_max(
     }
 }
 
+async fn has_at_least_rows(
+    conn: &mut mysql_async::Conn,
+    db: &str,
+    table: &str,
+    min_rows: usize,
+) -> Result<bool> {
+    if min_rows == 0 {
+        return Ok(true);
+    }
+    let q = format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM {} LIMIT {min_rows}) AS x",
+        mysqlutil::qualified(db, table)
+    );
+    let row: Option<(u64,)> = conn.query_first(q).await?;
+    Ok(row.map(|(n,)| n).unwrap_or(0) >= min_rows as u64)
+}
+
 async fn shard_clauses(
     cfg: &Config,
     session: &crate::transport::Session,
@@ -113,6 +130,13 @@ async fn shard_clauses(
     let pks = mysqlutil::pk_columns(conn, db, table).await?;
     if pks.len() != 1 || !matches!(pks[0].kind, mysqlutil::PkKind::Int | mysqlutil::PkKind::UInt)
     {
+        return Ok(vec![None]);
+    }
+    if !has_at_least_rows(conn, db, table, cfg.shard_min_rows).await? {
+        log::info!(
+            "[{db}.{table}] Sharding uebersprungen: weniger als {} Zeilen",
+            cfg.shard_min_rows
+        );
         return Ok(vec![None]);
     }
     let column = &pks[0].name;

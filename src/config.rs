@@ -49,6 +49,9 @@ fn d_concurrent() -> usize {
 fn d_shards() -> usize {
     1
 }
+fn d_shard_min_rows() -> usize {
+    10_000
+}
 fn d_connect_timeout() -> u64 {
     30
 }
@@ -317,6 +320,14 @@ pub struct Config {
     /// 1 = aus; nur bei einzelnem numerischen PK und ohne Schema-Force.
     #[serde(default = "d_shards", alias = "shard_count", alias = "shards_per_table")]
     pub shards: usize,
+
+    /// Erst ab dieser Zeilenzahl in Shards zerlegen. 0 = immer zerlegen.
+    #[serde(
+        default = "d_shard_min_rows",
+        alias = "shard_min_count",
+        alias = "min_shard_rows"
+    )]
+    pub shard_min_rows: usize,
 
     /// Ab diesem Prozentanteil differierender Buckets: Vollkopie statt Drill-Down
     #[serde(
@@ -717,6 +728,14 @@ mod tests {
             assert_eq!(cfg.hash_algo.to_string(), algo);
             assert_eq!(cfg.diff_threshold_percent, 42.0);
         }
+    }
+
+    #[test]
+    fn shard_min_rows_default_and_override() {
+        let cfg = parse(r#"{"mysql":{"user":"u"}}"#, "test").unwrap();
+        assert_eq!(cfg.shard_min_rows, 10_000);
+        let cfg = parse(r#"{"mysql":{"user":"u"},"shard-min-count":0}"#, "test").unwrap();
+        assert_eq!(cfg.shard_min_rows, 0);
     }
 
     #[test]

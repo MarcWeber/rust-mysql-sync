@@ -14,6 +14,7 @@ Actions:
   clean  : stop/remove the containers and their volumes
   test_time_pk_chunk : create a TIME-PK table and verify chunk-key/drill-down agree
   test_two_servers   : both sides daemon; sync A->B and B->A on different tables
+  benchmark_shards   : time full syncs for 1k/10k/100k rows and 1/4/8/20 shards
 
 python3 test.py up matrix
 python3 test.py up test_time_pk_chunk
@@ -1246,6 +1247,29 @@ async def dump_table_create_sql():
         print(f"Loaded on {m.name} in {elapsed_ms:.0f} ms")
         started = _time.perf_counter()
 
+async def fill_numeric_table(m: Mysql, db: str, table: str, rows: int):
+    """Fill id/name/value with 1..rows using a digit cross-join, not argv."""
+    await m.sql(f"TRUNCATE TABLE {db}.{table}")
+    if rows <= 0:
+        return
+    digits = max(1, len(str(rows - 1)))
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    factors = ", ".join(
+        "(SELECT 0 AS N UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4"
+        " UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9)"
+        f" {letters[i]}"
+        for i in range(digits)
+    )
+    terms = " + ".join(f"{letters[i]}.N * {10 ** i}" for i in range(digits)) + " + 1"
+    await m.sql(
+        f"INSERT INTO {table} (id, name, value) "
+        f"SELECT n, CONCAT('row_', n), n * 10 FROM ("
+        f"SELECT {terms} AS n FROM {factors}"
+        f") nums WHERE n <= {rows}",
+        database=db,
+    )
+
+
 async def truncate_fill_table(m: Mysql, db: str, table: str, start_id: int, end_id: int):
     """Truncate a table and fill it with rows from start_id to end_id (inclusive)."""
     await m.sql(f"TRUNCATE TABLE {db}.{table}", database=db)
@@ -1573,6 +1597,92 @@ async def _wait_tcp(port, timeout=15.0):
     raise RuntimeError(f"server port {port} not listening after {timeout}s")
 
 
+async def benchmark_shards():
+    """Time full syncs for 1k/10k/100k rows with different shard counts."""
+    await ensure_binary(str(BIN))
+    await prepare_workdir()
+    await ensure_dbs_up()
+
+    src, dst = MYSQL_INSTANCES["mysql80"], MYSQL_INSTANCES["mysql97"]
+    db = "db_shard_bench"
+    table = "t_shard"
+    row_counts = (1_000, 10_000, 100_000)
+    shard_counts = (1, 4, 8, 20)
+    repetitions = 3
+    shard_min_rows = 10_000
+    ddl = (
+        f"CREATE TABLE {db}.{table} ("
+        "id INT PRIMARY KEY, name VARCHAR(50), value INT"
+        ") ENGINE=InnoDB"
+    )
+    cfg = WORK / "config-shard-bench.json"
+
+    await src.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
+    await dst.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
+
+    print(f"  shard_min_rows={shard_min_rows}, repetitions={repetitions}")
+    print(f"  {'rows':>8} {'shards':>7} {'effective':>10} {'median_ms':>11} {'rows/s':>10}  note")
+
+    async with dst.server_running() as fingerprint:
+        cfg.write_text(json.dumps({
+            "mysql": {"user": "root", "password": ROOT_PW,
+                      "host": "127.0.0.1", "port": src.port},
+            "server": f"127.0.0.1:{dst.server_port}",
+            "server_fingerprint": fingerprint,
+            "chunked": 3,
+            "concurrent_processes": max(shard_counts),
+            "shard_min_rows": shard_min_rows,
+            "hash_strategies": ["select-sha2"],
+        }, indent=2))
+
+        for rows in row_counts:
+            await src.sql(f"DROP TABLE IF EXISTS {db}.{table}", quiet=True)
+            await dst.sql(f"DROP TABLE IF EXISTS {db}.{table}", quiet=True)
+            await src.sql(ddl)
+            await dst.sql(ddl)
+            await fill_numeric_table(src, db, table, rows)
+
+            for shards in shard_counts:
+                times = []
+                for _ in range(repetitions):
+                    await dst.sql(f"TRUNCATE TABLE {db}.{table}")
+                    started = time.perf_counter()
+                    proc = await asyncio.create_subprocess_exec(
+                        str(BIN), *CLIENT, "-C", str(cfg), "--sync",
+                        f"{db}:{table}", "--shards", str(shards), "--no-progress",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    out, err = await proc.communicate()
+                    elapsed_ms = (time.perf_counter() - started) * 1000.0
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"shard benchmark sync failed rows={rows} shards={shards}:\n"
+                            f"{out.decode(errors='replace')[-1000:]}\n"
+                            f"{err.decode(errors='replace')[-1000:]}"
+                        )
+                    got = await dst.scalar(f"SELECT COUNT(*) FROM {db}.{table}")
+                    if got != str(rows):
+                        raise RuntimeError(
+                            f"shard benchmark row count rows={rows} shards={shards}: "
+                            f"{got} != {rows}"
+                        )
+                    times.append(elapsed_ms)
+
+                times.sort()
+                median_ms = times[len(times) // 2]
+                effective = min(shards, rows) if rows >= shard_min_rows else 1
+                note = "" if rows >= shard_min_rows else f"below shard_min_rows={shard_min_rows}"
+                print(
+                    f"  {rows:>8} {shards:>7} {effective:>10} {median_ms:>11.1f} "
+                    f"{rows / (median_ms / 1000.0):>10.0f}  {note}"
+                )
+
+    await src.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+    await dst.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
+    print("  benchmark_shards: OK")
+
+
 async def test_two_servers():
     """Both sides run as daemons; each side sends one sync job to the other."""
     await ensure_binary(str(BIN))
@@ -1583,7 +1693,7 @@ async def test_two_servers():
     db = "db_twoservers"
     table_ab = "t_ab"
     table_ba = "t_ba"
-    schema = TABLE_SCHEMAS["TC102"]
+    schema = TABLE_SCHEMAS["TC101"]
 
     for m in (src, dst):
         await m.sql(f"DROP DATABASE IF EXISTS {db}", quiet=True)
@@ -1610,6 +1720,7 @@ async def test_two_servers():
             "server_fingerprint": fp_ba,
             "auth_key": auth_key,
             "auth_key_hash": auth_key_hash,
+            "shard_min_rows": 0,
         }, indent=2))
         cfg_ba.write_text(json.dumps({
             "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": dst.port},
@@ -1617,11 +1728,13 @@ async def test_two_servers():
             "server_fingerprint": fp_ab,
             "auth_key": auth_key,
             "auth_key_hash": auth_key_hash,
+            "shard_min_rows": 0,
         }, indent=2))
         task_ab.write_text(json.dumps({
             "mode": "sync",
             "selectors": [f"{db}:{table_ab}"],
             "shards": 4,
+            "shard_min_rows": 0,
             "hash_via": "select-sha2",
             "no_progress": True,
             "connect": f"127.0.0.1:{dst.server_port}",
@@ -1650,10 +1763,10 @@ async def test_two_servers():
 
         for label, table in (("A->B", table_ab), ("B->A", table_ba)):
             a = await src.scalar(
-                f"SELECT COUNT(*), COALESCE(SUM(b),0), COALESCE(SUM(LENGTH(a)),0) FROM {db}.{table}"
+                f"SELECT COUNT(*), COALESCE(SUM(a),0), COALESCE(SUM(LENGTH(b)),0) FROM {db}.{table}"
             )
             b = await dst.scalar(
-                f"SELECT COUNT(*), COALESCE(SUM(b),0), COALESCE(SUM(LENGTH(a)),0) FROM {db}.{table}"
+                f"SELECT COUNT(*), COALESCE(SUM(a),0), COALESCE(SUM(LENGTH(b)),0) FROM {db}.{table}"
             )
             if a != b:
                 raise RuntimeError(f"two-server sync {label}: data mismatch {a!r} != {b!r}")
@@ -2006,6 +2119,7 @@ ACTIONS = {
     "test_parallel": test_parallel,
     "test_time_pk_chunk": test_time_pk_chunk,
     "test_two_servers": test_two_servers,
+    "benchmark_shards": benchmark_shards,
     "tutorial": write_tutorial_files,
 }
 

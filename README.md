@@ -119,6 +119,8 @@ Multiple selectors cane be given such as A.* B.* C.foo C.bar
 | `--hash-raw-tsv` | Hash raw `mysql --batch` TSV lines - no binary columns (alias: `--check-raw-tsv`) |
 -> Should try fastest automatically
 
+| `--shards N` | Split large tables into up to N numeric-PK ranges |
+| `--shard-min-rows N` | Only shard when the source has at least N rows (0 = always) |
 | `--no-progress` | No progress bars (cron/CI) |
 | `--log-level LVL` | `error|warn|info|debug|trace` |
 
@@ -296,6 +298,72 @@ The row-count threshold heuristic therefore only applies to mod; range mode
 always drills down to exact row hashes after a chunk mismatch. (The target
 design drops this heuristic entirely — see *SYNC ALGORITHM — TARGET DESIGN*.)
 
+## SHARDING
+
+`shards` splits a single table into up to N contiguous numeric primary-key
+ranges and runs those ranges as parallel client tasks. It requires one
+`INT`/`BIGINT` (or unsigned) primary-key column and applies to `--sync` and
+`--check` only; `--force` and `--force-schema` bypass it.
+
+Sharding is enabled only when the source table has at least `shard_min_rows`
+rows (default **10000**). The check uses `SELECT COUNT(*) FROM (SELECT 1 FROM
+table LIMIT shard_min_rows)`, so small tables do not pay for a full count.
+Set `shard_min_rows` to `0` to shard whenever `shards > 1`.
+
+```json
+{
+  "shards": 8,
+  "shard_min_rows": 10000,
+  "concurrent_processes": 8
+}
+```
+
+```bash
+mysql-sync --client -C client.json --sync db1:orders --shards 8 --shard-min-rows 10000
+```
+
+`concurrent_processes` must be at least `shards`; otherwise tasks queue behind
+the client semaphore. Range boundaries are equal PK spans, not chunk-aligned,
+so a chunk at a range boundary may be split between two tasks. This is correct
+but costs one extra partial chunk hash per boundary. Sharding is most useful
+for large tables and remote targets; measure before enabling it everywhere.
+
+### Sharding benchmark
+
+The Docker benchmark creates a source table with 1k/10k/100k rows, copies it
+into an empty target with `--shards 1,4,8,20`, and reports the median of three
+runs:
+
+```bash
+python test.py up benchmark_shards down
+```
+
+Environment: **Apple M1 Ultra**, 20 logical CPUs (16 performance + 4
+efficiency), 64 GiB unified memory, macOS arm64, release build, Docker MySQL
+8.0 source and 9.7 target, data on tmpfs. The table is `(id INT PRIMARY KEY,
+name VARCHAR(50), value INT)`, with `chunked=3`, `select-sha2`, and
+`concurrent_processes=20`. This is a full copy into an empty target.
+
+| rows | shards | effective | median ms | rows/s |
+|---:|---:|---:|---:|---:|
+| 1,000 | 1 | 1 | 41.0 | 24,401 |
+| 1,000 | 4 | 1 | 44.6 | 22,425 |
+| 1,000 | 8 | 1 | 44.5 | 22,496 |
+| 1,000 | 20 | 1 | 44.9 | 22,267 |
+| 10,000 | 1 | 1 | 125.3 | 79,838 |
+| 10,000 | 4 | 4 | 211.1 | 47,374 |
+| 10,000 | 8 | 8 | 303.5 | 32,944 |
+| 10,000 | 20 | 20 | 566.6 | 17,648 |
+| 100,000 | 1 | 1 | 1,150.6 | 86,909 |
+| 100,000 | 4 | 4 | 1,281.9 | 78,011 |
+| 100,000 | 8 | 8 | 2,004.6 | 49,886 |
+| 100,000 | 20 | 20 | 4,544.5 | 22,005 |
+
+The 1,000-row runs stay single-shard because they are below
+`shard_min_rows=10000`. On this host and workload, extra per-shard queries and
+streams outweighed parallelism; sharding did not improve full-copy time. Use it
+for large tables or high-latency/remote targets, and measure both settings.
+
 ## SYNC ALGORITHM — TARGET DESIGN
 
 This section describes how `--sync` is supposed to work.
@@ -428,6 +496,8 @@ implementation; it is not duplicated per strategy.
   "transfer_batch_rows": 1000,
   "chunked": 4,
   "concurrent_processes": 3,
+  "shards": 8,
+  "shard_min_rows": 10000,
   "diff_threshold_percent": 10,
   "disable_triggers": false,
   "database_mappings": { "db_old": "db_new" }
@@ -444,7 +514,7 @@ checked. Always set it in production — together with `server_fingerprint`
 Other keys: `transport` (`quic`/`tcp`), `allow_plaintext`, `compression`
 (`none`/`zstd`), `compression_level` (1–22), `max_frame`, `max_decompressed`,
 `allow_csv` (`false` = SQL REPLACE dumps), `dump_strategies` (ordered with
-fallback), `transfer_batch_rows` (alias `dump_threshold`), `chunked` (1–6), `concurrent_processes`,
+fallback), `transfer_batch_rows` (alias `dump_threshold`), `chunked` (1–6), `concurrent_processes`, `shards`, `shard_min_rows`,
 `diff_threshold_percent`, `disable_triggers`, `database_mappings`,
 `database_table_mappings`, `hash_strategies`, `float_precision`, `tables`.
 Chunk mode is automatic and is not a config key.
@@ -672,6 +742,12 @@ The server eventually should have ways to limit access to databases
 
 Maybe concurrent processing within a table in case if all data are in
 RAM that would be even faster.
+
+- sharding_min_rows might not be best option.
+- Could be multiple of MB (estimated from data structure) or mutliple of chunk size.
+  -> eventually would allow to track which shards are *DONE* in case of
+  -> connection interruption
+  -> would require additional progress / resumable work which shards are done
 
 ## SEE ALSO
 

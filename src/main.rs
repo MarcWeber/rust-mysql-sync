@@ -33,7 +33,7 @@ use std::process::ExitCode;
     name = "mysql-sync",
     version,
     about = "MySQL-Tabellen differentiell über QUIC synchronisieren",
-    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Daemon:  ./mysql-sync --daemon -f -C server.json\n  Client:  ./mysql-sync --client -C client.json --sync db1:*\n           ./mysql-sync --client -C client.json --connect 10.0.0.5:4433 --sync db1:*\n           ./mysql-sync --client -C client.json --task job.json\n           ./mysql-sync -C client.json --sync db1:* --shards 8\n           ./mysql-sync -C client.json --force --sync db1:*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1:*\n           ./mysql-sync -C client.json --benchmark db_bench:big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1:*\n\nSelectoren: A:B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
+    after_help = "Beispiele:\n  Konfigs: ./mysql-sync --generate-configs out/\n  Daemon:  ./mysql-sync --daemon -f -C server.json\n  Client:  ./mysql-sync --client -C client.json --sync db1:*\n           ./mysql-sync --client -C client.json --connect 10.0.0.5:4433 --sync db1:*\n           ./mysql-sync --client -C client.json --task job.json\n           ./mysql-sync -C client.json --sync db1:* --shards 8 --shard-min-rows 10000\n           ./mysql-sync -C client.json --force --sync db1:*\n           ./mysql-sync -C client.json --force-schema db1,db2\n           ./mysql-sync -C client.json --check 10 db1:*\n           ./mysql-sync -C client.json --benchmark db_bench:big\n  Merge:   ./mysql-sync -C base.json -C local-overrides.json --sync db1:*\n\nSelectoren: A:B — A = DB-Liste (kommasepariert) oder *, B = Tabellen-Liste oder *\nMehrere Selectoren als Positional-Argumente angebar.\nExit-Codes: force/sync: 0=ok 1=Fehler | check: 0=gleich 1=unterschiedlich 2=Fehler"
 )]
 struct Cli {
     /// JSON-Konfigurationsdatei ("-" liest von stdin); mehrfach angebbar, wird rekursiv gemerged
@@ -146,6 +146,10 @@ struct Cli {
     /// Tabellen in N MIN/MAX-Bereiche zerlegen (ueberschreibt config.shards)
     #[arg(long, value_name = "N")]
     shards: Option<usize>,
+
+    /// Sharding erst ab N Zeilen (0 = immer; ueberschreibt config.shard_min_rows)
+    #[arg(long, value_name = "N")]
+    shard_min_rows: Option<usize>,
 }
 
 #[tokio::main]
@@ -192,6 +196,9 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         cfg.shards = n;
+    }
+    if let Some(n) = cli.shard_min_rows {
+        cfg.shard_min_rows = n;
     }
 
     let selector_str = if cli.selectors.is_empty() {
