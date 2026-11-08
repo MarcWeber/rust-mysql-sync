@@ -3,7 +3,7 @@
 use crate::config::MysqlCfg;
 use anyhow::{bail, Context, Result};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Pool, Value};
+use mysql_async::{Conn, Opts, OptsBuilder, Pool};
 
 pub const SYSTEM_DBS: &[&str] = &["information_schema", "mysql", "performance_schema", "sys"];
 
@@ -155,10 +155,8 @@ pub async fn table_info(conn: &mut Conn, db: &str, table: &str) -> Result<TableI
 }
 
 pub async fn column_names(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<String>> {
-    let q = format!(
-        "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
-    );
+    let q = "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
     let rows: Vec<String> = conn.exec(q, (db, table)).await?;
     Ok(rows)
 }
@@ -316,10 +314,8 @@ pub fn validate_range_pk(pks: &[PkCol], db: &str, table: &str) -> Result<()> {
 
 /// Spalten, die binär sind und hex-kodiert übertragen werden.
 pub async fn binary_column_indexes(conn: &mut Conn, db: &str, table: &str) -> Result<Vec<usize>> {
-    let q = format!(
-        "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
-    );
+    let q = "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
     let rows: Vec<(String, String)> = conn.exec(q, (db, table)).await?;
     const BIN_TYPES: &[&str] = &[
         "binary",
@@ -343,6 +339,39 @@ pub async fn binary_column_indexes(conn: &mut Conn, db: &str, table: &str) -> Re
     Ok(idx)
 }
 
+/// Export strategies for a table: binary columns force `mysqldump`, otherwise
+/// prefer parser strategies (no `select-stream`).
+pub async fn export_strategies(
+    conn: &mut Conn,
+    db: &str,
+    table: &str,
+    configured: Vec<String>,
+) -> Result<Vec<String>> {
+    let bin = binary_column_indexes(conn, db, table).await?;
+    if !bin.is_empty() {
+        let mut out = vec!["mysqldump".to_string()];
+        for s in configured {
+            if !out.iter().any(|x| x == &s) {
+                out.push(s);
+            }
+        }
+        return Ok(out);
+    }
+    let parsing: Vec<String> = configured
+        .iter()
+        .filter(|s| {
+            let t = s.to_lowercase();
+            t != "select-stream" && t != "select_stream" && t != "stream"
+        })
+        .cloned()
+        .collect();
+    if parsing.is_empty() {
+        Ok(configured)
+    } else {
+        Ok(parsing)
+    }
+}
+
 /// Sortier-Klausel nach PK.
 pub fn order_by(pks: &[PkCol]) -> String {
     if pks.is_empty() {
@@ -351,45 +380,6 @@ pub fn order_by(pks: &[PkCol]) -> String {
         let cols: Vec<String> = pks.iter().map(|p| quote_ident(&p.name)).collect();
         format!(" ORDER BY {}", cols.join(", "))
     }
-}
-
-/// Streaming-Pass über eine Tabelle (Text-Protokoll) mit async-Callback pro Zeile.
-/// `f` liefert false, um den Scan abzubrechen.
-pub async fn scan_table<F, Fut>(
-    conn: &mut Conn,
-    db: &str,
-    table: &str,
-    where_clause: Option<&str>,
-    order: bool,
-    pks: &[PkCol],
-    mut f: F,
-) -> Result<()>
-where
-    F: FnMut(Vec<Value>) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let mut sql = format!("SELECT * FROM {}", qualified(db, table));
-    if let Some(w) = where_clause {
-        if !w.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(w);
-        }
-    }
-    if order {
-        sql.push_str(&order_by(pks));
-    }
-    let result = conn
-        .query_iter(sql)
-        .await
-        .context("SELECT fehlgeschlagen")?;
-    let mut result = result;
-    while let Some(row) = result.next().await.context("Fehler beim Zeilen-Lesen")? {
-        let values: Vec<Value> = row.unwrap();
-        if !f(values).await {
-            break;
-        }
-    }
-    Ok(())
 }
 
 /// Kanonische TIME-Darstellung wie `hash::value_to_pk_component`:
@@ -464,7 +454,7 @@ pub fn chunk_where(
     let mut vals: Vec<String> = Vec::with_capacity(keys.len());
     match pk.kind {
         PkKind::Int | PkKind::UInt => {
-            let width = 10i128.pow(chunked.min(6) as u32);
+            let width = 10i128.pow(chunked.min(6));
             for k in keys {
                 if !crate::hash::is_valid_int_literal(k) {
                     bail!("Ungültiger numerischer Chunk-Key: {k}");
@@ -543,7 +533,7 @@ fn next_binary_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
 fn pk_component_literal(pk: &PkCol, part: &str, out: &mut Vec<u8>) -> Result<()> {
     match pk.kind {
         PkKind::Binary => {
-            if !part.chars().all(|c| c.is_ascii_hexdigit()) || part.len() % 2 != 0 {
+            if !part.chars().all(|c| c.is_ascii_hexdigit()) || !part.len().is_multiple_of(2) {
                 bail!("BINARY-PK ist nicht hex-kodiert: {part:?}");
             }
             out.extend_from_slice(b"0x");
@@ -605,34 +595,6 @@ pub fn pk_in_where<S: AsRef<str> + std::fmt::Debug>(
         let cols: Vec<String> = pks.iter().map(|p| quote_ident(&p.name)).collect();
         Ok(format!("({}) IN ({})", cols.join(","), tuples.join(", ")))
     }
-}
-
-/// Keyset-Paginierung: WHERE (k1,k2,…) > (letzte PK-Werte) für die nächste Page.
-pub fn pk_gt_where(pks: &[PkCol], parts: &[String]) -> Result<String> {
-    if pks.is_empty() {
-        bail!("Tabelle hat keinen Primary Key");
-    }
-    if parts.len() != pks.len() {
-        bail!(
-            "PK-Komponentenanzahl {} passt nicht zu {} Spalten: {parts:?}",
-            parts.len(),
-            pks.len()
-        );
-    }
-    let mut buf = Vec::new();
-    let mut vals = Vec::with_capacity(parts.len());
-    for (i, part) in parts.iter().enumerate() {
-        buf.clear();
-        pk_component_literal(&pks[i], part, &mut buf)?;
-        vals.push(String::from_utf8_lossy(&buf).to_string());
-    }
-    let cols: Vec<String> = pks.iter().map(|p| quote_ident(&p.name)).collect();
-    Ok(format!("({}) > ({})", cols.join(","), vals.join(",")))
-}
-
-/// Kanonische PK-Komponenten eines Zeilenwerts via PK-Metadaten.
-pub fn pk_of_row(values: &[Value], pk_indexes: &[usize], pks: &[PkCol]) -> Vec<String> {
-    crate::hash::pk_components(values, pk_indexes, pks)
 }
 
 /// SHOW CREATE TABLE normalisieren (für Schema-Vergleich).

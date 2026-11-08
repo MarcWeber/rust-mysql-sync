@@ -7,7 +7,8 @@
 use crate::config::Config;
 use crate::mysqlutil;
 use crate::selector::{map_remote, Selector};
-use crate::sync::{self, HashVia, Mode, TableResult, TableTask};
+use crate::hash::HashVia;
+use crate::sync::{self, Mode, TableResult, TableTask};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -240,8 +241,6 @@ pub async fn run(args: ClientArgs) -> Result<std::process::ExitCode> {
                 ok: false,
                 mode: Mode::Sync,
                 message: format!("Task-Panik: {e}"),
-                rows_sent: 0,
-                rows_deleted: 0,
                 differ_count: None,
                 examples: vec![],
             }),

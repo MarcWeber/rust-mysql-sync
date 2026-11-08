@@ -5,12 +5,95 @@
 //! sind Hashes unabhängig von der gewählten Export-Strategie identisch.
 
 use crate::mysqlutil::{PkCol, PkKind};
+use crate::sqlhash;
 use anyhow::{anyhow, bail, Context, Result};
 use digest::Digest;
 use mysql_async::Value;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HashVia {
+    SelectSha2,
+    SelectCrc32,
+    Dump,
+    RawBinary,
+    RawBinaryVec,
+    RawTsv,
+}
+
+impl HashVia {
+    pub const ALL: [HashVia; 6] = [
+        HashVia::SelectSha2,
+        HashVia::SelectCrc32,
+        HashVia::Dump,
+        HashVia::RawBinary,
+        HashVia::RawBinaryVec,
+        HashVia::RawTsv,
+    ];
+
+    pub fn parse(raw: Option<&str>) -> Result<Self> {
+        raw.unwrap_or("select-sha2").parse()
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HashVia::SelectSha2 => "select-sha2",
+            HashVia::SelectCrc32 => "select-crc32",
+            HashVia::Dump => "dump",
+            HashVia::RawBinary => "raw-binary",
+            HashVia::RawBinaryVec => "raw-binary-vec",
+            HashVia::RawTsv => "raw-tsv",
+        }
+    }
+
+    pub(crate) fn is_raw(self) -> bool {
+        matches!(
+            self,
+            HashVia::RawBinary | HashVia::RawBinaryVec | HashVia::RawTsv
+        )
+    }
+
+    /// Ob der Weg dekodierte `Value`s sieht und damit Feld-Overrides anwenden
+    /// kann. Byte-Pfade (`raw-binary`, `raw-tsv`) koennen das nicht.
+    pub fn supports_field_opts(self) -> bool {
+        matches!(
+            self,
+            HashVia::SelectSha2 | HashVia::SelectCrc32 | HashVia::Dump | HashVia::RawBinaryVec
+        )
+    }
+
+    pub(crate) fn sql_hash_algo(self) -> Option<sqlhash::SqlHashAlgo> {
+        match self {
+            HashVia::SelectSha2 => Some(sqlhash::SqlHashAlgo::Sha2),
+            HashVia::SelectCrc32 => Some(sqlhash::SqlHashAlgo::Crc32),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for HashVia {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let t = s.trim().to_ascii_lowercase().replace('_', "-");
+        match t.as_str() {
+            "" | "select" | "sql" | "select-sha2" => Ok(HashVia::SelectSha2),
+            "select-crc32" => Ok(HashVia::SelectCrc32),
+            "dump" | "export" => Ok(HashVia::Dump),
+            "binary" | "raw-binary" | "raw-binary-row" | "packet" => Ok(HashVia::RawBinary),
+            "binary-vec" | "raw-binary-vec" | "raw-binary-row-vec" | "vec" => {
+                Ok(HashVia::RawBinaryVec)
+            }
+            "raw-tsv" | "tsv" => Ok(HashVia::RawTsv),
+            _ => bail!(
+                "Unbekannter Hash-Weg {s:?} (erlaubt: select-sha2, select-crc32, dump, raw-binary, \
+                 raw-binary-vec, raw-tsv)"
+            ),
+        }
+    }
+}
 
 /// Automatisch gewaehlter Chunk-Modus (keine User-Konfiguration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,20 +113,15 @@ pub fn chunk_mode_for_pk(pks: &[PkCol]) -> ChunkMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HashAlgo {
+    #[default]
     Xxh3,
     Xxh64,
     Blake3,
     Md5,
     Sha256,
-}
-
-impl Default for HashAlgo {
-    fn default() -> Self {
-        HashAlgo::Xxh3
-    }
 }
 
 impl HashAlgo {
@@ -287,6 +365,7 @@ pub fn hash_field_opts(h: &mut RowHasher, v: &Value, opt: Option<&crate::proto::
 }
 
 /// Hash einer einzelnen Zeile (Werte inkl. PK).
+#[cfg(test)]
 pub fn row_hash(values: &[Value], algo: HashAlgo) -> String {
     row_hash_opts(values, algo, &[])
 }
@@ -300,32 +379,11 @@ pub fn row_hash_opts(values: &[Value], algo: HashAlgo, opts: &[crate::proto::Fie
     h.finalize_hex()
 }
 
-pub fn row_hash_default(values: &[Value]) -> String {
-    row_hash(values, HashAlgo::default())
-}
-
 /// Hash arbitrary bytes with the configured row-hash algorithm.
 pub fn hash_bytes(data: &[u8], algo: HashAlgo) -> String {
     let mut h = RowHasher::new(algo);
     h.update(data);
     h.finalize_hex()
-}
-
-/// Add a row hash (hex) to a bucket accumulator.
-pub fn add_row_hash(
-    acc: &mut std::collections::HashMap<String, (RowHasher, u64)>,
-    algo: HashAlgo,
-    bucket: String,
-    rh: &str,
-) {
-    let e = acc
-        .entry(bucket)
-        .or_insert_with(|| (RowHasher::new(algo), 0));
-    match hex::decode(rh) {
-        Ok(bytes) => e.0.update(&bytes),
-        Err(_) => e.0.update(rh.as_bytes()),
-    }
-    e.1 += 1;
 }
 
 /// Running chunk hash for a stream whose rows arrive already grouped by bucket.
@@ -383,18 +441,6 @@ impl ChunkAccumulator {
             (bucket, count, hash)
         })
     }
-}
-
-/// Finalize per-bucket rolling hashes into `(count, hash)`.
-pub fn finish_chunks(
-    acc: std::collections::HashMap<String, (RowHasher, u64)>,
-) -> std::collections::HashMap<String, (u64, String)> {
-    acc.into_iter()
-        .map(|(b, (h, c))| {
-            let final_hash = finalize_chunk(&b, c, h);
-            (b, (c, final_hash))
-        })
-        .collect()
 }
 
 /// Finaler Bucket-Hash: laufender Zeilen-Hash-Hasher + Bucket + Count.
@@ -465,14 +511,6 @@ pub fn value_to_pk_component(v: &Value) -> String {
     }
 }
 
-/// Bucket = letzte N Zeichen der KANONISCHEN LETZTEN PK-Komponente.
-/// (Bei numerischen Keys wird das Vorzeichen nicht einbezogen.)
-pub fn bucket_of(pk_components: &[String], n: u32) -> String {
-    let last = pk_components.last().map(String::as_str).unwrap_or("");
-    let s = last.strip_prefix('-').unwrap_or(last);
-    last_n_chars(s, n)
-}
-
 fn last_n_chars(s: &str, n: u32) -> String {
     let chars: Vec<char> = s.chars().collect();
     let start = chars.len().saturating_sub(n as usize);
@@ -521,7 +559,7 @@ fn numeric_component(v: &Value) -> Result<i128> {
         .map_err(|_| anyhow!("PK ist nicht als Ganzzahl lesbar: {text:?}"))
 }
 
-fn binary_component<'a>(v: &'a Value) -> Result<&'a [u8]> {
+fn binary_component(v: &Value) -> Result<&[u8]> {
     match v {
         Value::Bytes(b) => Ok(b),
         _ => bail!("BINARY-PK erwartet Bytes, bekam {v:?}"),
@@ -541,7 +579,7 @@ pub fn chunk_key_from_value(
     }
     match kind {
         PkKind::Int | PkKind::UInt => {
-            let width = 10i128.pow(chunked.min(6) as u32);
+            let width = 10i128.pow(chunked.min(6));
             let n = numeric_component(v)?;
             let low = n.div_euclid(width) * width;
             Ok(low.to_string())
@@ -572,7 +610,7 @@ pub fn chunk_key_from_component(
             chunked,
         )),
         (ChunkMode::Range, PkKind::Int | PkKind::UInt) => {
-            let width = 10i128.pow(chunked.min(6) as u32);
+            let width = 10i128.pow(chunked.min(6));
             let n = comp
                 .trim()
                 .parse::<i128>()

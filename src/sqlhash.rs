@@ -3,7 +3,6 @@ use crate::mysqlutil::{self, PkCol, PkKind};
 use anyhow::{Context, Result};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 pub struct SqlRowHash {
@@ -328,37 +327,6 @@ pub async fn stream_chunk_hashes(
         count += 1;
     }
     Ok(count)
-}
-
-pub async fn chunk_hashes(
-    conn: &mut Conn,
-    db: &str,
-    table: &str,
-    pks: &[PkCol],
-    opts: &[crate::proto::FieldOpt],
-    mode: ChunkMode,
-    chunked: u32,
-    algo: SqlHashAlgo,
-    extra_where: Option<&str>,
-) -> Result<HashMap<String, (u64, String)>> {
-    let columns = mysqlutil::column_names(conn, db, table).await?;
-    use_database(conn, db).await?;
-    let sql = group_query(db, table, pks, &columns, opts, mode, chunked, algo, extra_where)?;
-    log::warn!("SQL group hashes: {sql}");
-    let mut result = conn
-        .query_iter(&sql)
-        .await
-        .context("SQL-Gruppen-Hashes fehlgeschlagen")?;
-    let mut out = HashMap::new();
-    while let Some(row) = result
-        .next()
-        .await
-        .context("Fehler beim Lesen der Gruppen-Hashes")?
-    {
-        let (bucket, count, hash): (String, u64, String) = mysql_async::from_row(row);
-        out.insert(bucket, (count, hash));
-    }
-    Ok(out)
 }
 
 pub async fn row_hashes(

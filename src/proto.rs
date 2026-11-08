@@ -430,11 +430,6 @@ where
     Ok(())
 }
 
-/// True if the last response is a final Ok/Err.
-pub fn is_final(resp: &Response) -> bool {
-    matches!(resp, Response::Ok { .. } | Response::Err { .. })
-}
-
 pub fn version() -> u32 {
     PROTOCOL_VERSION
 }

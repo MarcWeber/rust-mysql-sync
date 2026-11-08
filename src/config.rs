@@ -98,17 +98,12 @@ fn d_hash_algo() -> String {
 /// `Off` = Rohwert, `Auto` = deklarierter DECIMAL-Anteil (`FLOAT(M,D)` → D,
 /// sonst aus), Zahl = feste Nachkommastellen. Gilt nie für DECIMAL/NUMERIC
 /// (exakt) und ist auf Binärpfaden immer aus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FloatPrecision {
     Off,
+    #[default]
     Auto,
     Fixed(u8),
-}
-
-impl Default for FloatPrecision {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl std::fmt::Display for FloatPrecision {
@@ -480,21 +475,15 @@ fn normalize_tables(v: &mut serde_json::Value) {
         let serde_json::Value::Object(ov) = override_value else {
             continue;
         };
-        if let Some(fields) = ov.get_mut("fields") {
-            if let serde_json::Value::Object(map) = fields {
-                for field_value in map.values_mut() {
-                    normalize_keys(field_value);
-                }
+        if let Some(serde_json::Value::Object(map)) = ov.get_mut("fields") {
+            for field_value in map.values_mut() {
+                normalize_keys(field_value);
             }
         }
         if let Some(strategies) = ov.get_mut("strategies") {
             normalize_keys(strategies);
         }
     }
-}
-
-pub fn load(path: &Path) -> Result<Config> {
-    load_many(&[path.to_path_buf()])
 }
 
 /// Lädt mehrere JSON-Configs und merged sie rekursiv (spätere Dateien gewinnen).
@@ -588,6 +577,7 @@ fn write_private_json(path: &Path, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn parse(raw: &str, source: &str) -> Result<Config> {
     let mut v: serde_json::Value =
         serde_json::from_str(raw).with_context(|| format!("JSON ungültig: {source}"))?;
@@ -639,7 +629,7 @@ impl Config {
             );
         }
         for s in &self.hash_strategies {
-            s.parse::<crate::sync::HashVia>()
+            s.parse::<crate::hash::HashVia>()
                 .map_err(|e| anyhow::anyhow!("hash_strategies: {e}"))?;
         }
         for (pattern, ov) in &self.tables {
@@ -654,7 +644,7 @@ impl Config {
                     bail!("tables[{pattern:?}].strategies darf nicht leer sein");
                 }
                 for s in list {
-                    s.parse::<crate::sync::HashVia>()
+                    s.parse::<crate::hash::HashVia>()
                         .map_err(|e| anyhow::anyhow!("tables[{pattern:?}].strategies: {e}"))?;
                 }
             }

@@ -7,7 +7,8 @@
 use crate::config::Config;
 use crate::mysqlutil;
 use crate::selector::Selector;
-use crate::sync::{self, HashVia, TableTask};
+use crate::hash::HashVia;
+use crate::sync::{self, TableTask};
 use anyhow::Result;
 use std::process::ExitCode;
 

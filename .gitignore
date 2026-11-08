@@ -6,3 +6,6 @@
 *-cert.pem
 *-key.pem
 *.deb
+/docker-compose.yml
+__pycache__/
+.venv/

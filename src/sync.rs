@@ -5,13 +5,13 @@
 //!  1. describe/count lokal + remote
 //!  2. force: Schema erzwingen (create / drop+create)
 //!  3. sync:  Chunk-Hashes beider Seiten → differierende Buckets
-//!            → diff% > diff_threshold_percent ? Vollkopie : Drill-Down
-//!            → Zeilen-Hashes → sende_csv / sende_dump + DeletePks
+//!     → diff% > diff_threshold_percent ? Vollkopie : Drill-Down
+//!     → Zeilen-Hashes → sende_csv / sende_dump + DeletePks
 //!  4. check: wie 3, aber ohne Schreibzugriffe → Report + Beispiel-IDs
 
 use crate::config::Config;
 use crate::export::{self, RowMsg};
-use crate::hash::{self, ChunkMode};
+use crate::hash::{self, ChunkMode, HashVia};
 use crate::mysqlutil::{self, PkCol};
 use crate::progress::Progress;
 use crate::proto::{self, ArchivedResponse, ChunkHash, Framing, Request};
@@ -24,82 +24,6 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
 const DIFF_BUCKET_BATCH: usize = 200;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HashVia {
-    SelectSha2,
-    SelectCrc32,
-    Dump,
-    RawBinary,
-    RawBinaryVec,
-    RawTsv,
-}
-
-impl HashVia {
-    pub const ALL: [HashVia; 6] = [
-        HashVia::SelectSha2,
-        HashVia::SelectCrc32,
-        HashVia::Dump,
-        HashVia::RawBinary,
-        HashVia::RawBinaryVec,
-        HashVia::RawTsv,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            HashVia::SelectSha2 => "select-sha2",
-            HashVia::SelectCrc32 => "select-crc32",
-            HashVia::Dump => "dump",
-            HashVia::RawBinary => "raw-binary",
-            HashVia::RawBinaryVec => "raw-binary-vec",
-            HashVia::RawTsv => "raw-tsv",
-        }
-    }
-
-    fn is_raw(self) -> bool {
-        matches!(
-            self,
-            HashVia::RawBinary | HashVia::RawBinaryVec | HashVia::RawTsv
-        )
-    }
-
-    /// Ob der Weg dekodierte `Value`s sieht und damit Feld-Overrides anwenden
-    /// kann. Byte-Pfade (`raw-binary`, `raw-tsv`) koennen das nicht.
-    pub fn supports_field_opts(self) -> bool {
-        matches!(
-            self,
-            HashVia::SelectSha2 | HashVia::SelectCrc32 | HashVia::Dump | HashVia::RawBinaryVec
-        )
-    }
-
-    fn sql_hash_algo(self) -> Option<sqlhash::SqlHashAlgo> {
-        match self {
-            HashVia::SelectSha2 => Some(sqlhash::SqlHashAlgo::Sha2),
-            HashVia::SelectCrc32 => Some(sqlhash::SqlHashAlgo::Crc32),
-            _ => None,
-        }
-    }
-}
-
-impl std::str::FromStr for HashVia {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        let t = s.trim().to_ascii_lowercase().replace('_', "-");
-        match t.as_str() {
-            "select" | "sql" | "select-sha2" => Ok(HashVia::SelectSha2),
-            "select-crc32" => Ok(HashVia::SelectCrc32),
-            "dump" | "export" => Ok(HashVia::Dump),
-            "raw-binary" | "raw-binary-row" | "packet" => Ok(HashVia::RawBinary),
-            "raw-binary-vec" | "raw-binary-row-vec" | "vec" => Ok(HashVia::RawBinaryVec),
-            "raw-tsv" | "tsv" => Ok(HashVia::RawTsv),
-            _ => bail!(
-                "Unbekannter Hash-Weg {s:?} (erlaubt: select-sha2, select-crc32, dump, raw-binary, \
-                 raw-binary-vec, raw-tsv)"
-            ),
-        }
-    }
-}
 
 /// Ergebnis der Config-Aufloesung fuer eine Tabelle.
 #[derive(Debug, Clone)]
@@ -570,8 +494,6 @@ pub struct TableResult {
     pub ok: bool,
     pub mode: Mode,
     pub message: String,
-    pub rows_sent: u64,
-    pub rows_deleted: u64,
     pub differ_count: Option<u64>,
     pub examples: Vec<String>,
 }
@@ -710,8 +632,6 @@ pub async fn run_table_task(
             } else {
                 format!("{sent} gesendet, {deleted} gelöscht")
             },
-            rows_sent: sent,
-            rows_deleted: deleted,
             differ_count: differ,
             examples,
         },
@@ -720,8 +640,6 @@ pub async fn run_table_task(
             ok: false,
             mode,
             message: format!("{e:#}"),
-            rows_sent: 0,
-            rows_deleted: 0,
             differ_count: None,
             examples: vec![],
         },
@@ -1227,51 +1145,6 @@ fn pk_indexes_for(conn_names: &[String], pk_names: &[String]) -> Result<Vec<usiz
     Ok(idx)
 }
 
-fn push_row_hash_to_bucket(
-    acc: &mut HashMap<String, (hash::RowHasher, u64)>,
-    algo: crate::hash::HashAlgo,
-    bucket: String,
-    rh: &str,
-) {
-    let e = acc
-        .entry(bucket)
-        .or_insert_with(|| (hash::RowHasher::new(algo), 0));
-    match hex::decode(rh) {
-        Ok(bytes) => e.0.update(&bytes),
-        Err(_) => e.0.update(rh.as_bytes()),
-    }
-    e.1 += 1;
-}
-
-fn finish_chunks(acc: HashMap<String, (hash::RowHasher, u64)>) -> HashMap<String, (u64, String)> {
-    acc.into_iter()
-        .map(|(b, (h, c))| {
-            let final_hash = hash::finalize_chunk(&b, c, h);
-            (b, (c, final_hash))
-        })
-        .collect()
-}
-
-async fn compute_chunk_hashes(
-    conn: &mut Conn,
-    db: &str,
-    table: &str,
-    pks: &[PkCol],
-    mode: ChunkMode,
-    chunked: u32,
-    opts: &[proto::FieldOpt],
-    algo: sqlhash::SqlHashAlgo,
-    bar: Option<&crate::progress::TableBar>,
-    extra_where: Option<&str>,
-) -> Result<HashMap<String, (u64, String)>> {
-    let out = sqlhash::chunk_hashes(conn, db, table, pks, opts, mode, chunked, algo, extra_where).await?;
-    if let Some(b) = bar {
-        b.set_total(out.len() as u64, "Lokale SQL-Gruppen-Hashes");
-        b.inc(out.len() as u64);
-    }
-    Ok(out)
-}
-
 async fn compute_row_hashes(
     conn: &mut Conn,
     db: &str,
@@ -1293,49 +1166,6 @@ async fn compute_row_hashes(
         b.inc(out.len() as u64);
     }
     Ok(out)
-}
-
-/// Wie compute_chunk_hashes, aber die Zeilen kommen aus dem Export-/Parser-Pfad
-/// (select-stream, to_file, mysql-e, mysqldump) statt direkt aus SELECT *.
-async fn compute_chunk_hashes_via_export(
-    cfg: &Config,
-    conn: &mut Conn,
-    task: &TableTask,
-    pks: &[PkCol],
-    pk_names: &[String],
-    mode: ChunkMode,
-    chunked: u32,
-    opts: &[proto::FieldOpt],
-    bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, (u64, String)>> {
-    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
-    let pk_indexes = pk_indexes_for(&names, pk_names)?;
-    let algo = cfg.hash_algo();
-    let strategies = check_export_strategies(cfg, conn, &task.local_db, &task.local_table).await?;
-    let mut rx = export::spawn_fetch_with_strategies(
-        cfg,
-        task.local_db.clone(),
-        task.local_table.clone(),
-        None,
-        Some(mysqlutil::order_by(pks)),
-        strategies,
-    );
-    let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            RowMsg::Row(values) => {
-                let bucket = hash::chunk_key_for_row(&values, &pk_indexes, pks, mode, chunked)?;
-                let rh = hash::row_hash_opts(&values, algo, opts);
-                push_row_hash_to_bucket(&mut acc, algo, bucket, &rh);
-                if let Some(b) = bar {
-                    b.inc(1);
-                }
-            }
-            RowMsg::Err(e) => bail!("Export/Parser-Fehler: {e}"),
-            RowMsg::Done => break,
-        }
-    }
-    Ok(finish_chunks(acc))
 }
 
 /// Wie compute_row_hashes, aber über den Export-/Parser-Pfad.
@@ -1385,36 +1215,6 @@ async fn compute_row_hashes_via_export(
         }
     }
     Ok(out)
-}
-
-async fn compute_chunk_hashes_raw_binary(
-    conn: &mut Conn,
-    task: &TableTask,
-    pks: &[PkCol],
-    pk_names: &[String],
-    mode: ChunkMode,
-    chunked: u32,
-    algo: hash::HashAlgo,
-    bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, (u64, String)>> {
-    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
-    let pk_indexes = pk_indexes_for(&names, pk_names)?;
-    hash_binary::chunk_hashes(
-        conn,
-        &task.local_db,
-        &task.local_table,
-        pks,
-        &pk_indexes,
-        mode,
-        chunked,
-        algo,
-        || {
-            if let Some(b) = bar {
-                b.inc(1);
-            }
-        },
-    )
-    .await
 }
 
 async fn compute_row_hashes_raw_binary(
@@ -1479,35 +1279,6 @@ async fn compute_row_hashes_raw_binary_vec(
         b.inc(items.len() as u64);
     }
     Ok(items.into_iter().map(|r| (r.pk, r.hash)).collect())
-}
-
-async fn compute_chunk_hashes_raw_tsv(
-    cfg: &Config,
-    conn: &mut Conn,
-    task: &TableTask,
-    pks: &[PkCol],
-    pk_names: &[String],
-    mode: ChunkMode,
-    chunked: u32,
-    bar: Option<&crate::progress::TableBar>,
-) -> Result<HashMap<String, (u64, String)>> {
-    let names = mysqlutil::column_names(conn, &task.local_db, &task.local_table).await?;
-    let pk_indexes = pk_indexes_for(&names, pk_names)?;
-    hash_tsv::chunk_hashes(
-        cfg,
-        &task.local_db,
-        &task.local_table,
-        pks,
-        &pk_indexes,
-        mode,
-        chunked,
-        || {
-            if let Some(b) = bar {
-                b.inc(1);
-            }
-        },
-    )
-    .await
 }
 
 async fn compute_row_hashes_raw_tsv(
@@ -1903,30 +1674,7 @@ pub async fn check_export_strategies(
     db: &str,
     table: &str,
 ) -> Result<Vec<String>> {
-    let bin = mysqlutil::binary_column_indexes(conn, db, table).await?;
-    let configured = cfg.strategies();
-    if !bin.is_empty() {
-        let mut v = vec!["mysqldump".to_string()];
-        for s in configured {
-            if !v.iter().any(|x| x == &s) {
-                v.push(s);
-            }
-        }
-        return Ok(v);
-    }
-    let parsing: Vec<String> = configured
-        .iter()
-        .filter(|s| {
-            let t = s.to_lowercase();
-            t != "select-stream" && t != "select_stream" && t != "stream"
-        })
-        .cloned()
-        .collect();
-    if parsing.is_empty() {
-        Ok(configured)
-    } else {
-        Ok(parsing)
-    }
+    mysqlutil::export_strategies(conn, db, table, cfg.strategies()).await
 }
 
 /// Alle Zeilen senden (optional mit WHERE) — CSV- oder Dump-Modus.
@@ -2185,13 +1933,6 @@ async fn send_changed_rows(
     Ok(sent)
 }
 
-pub struct DiffReport {
-    pub differ: u64,
-    pub to_send: u64,
-    pub to_delete: u64,
-    pub examples: Vec<String>,
-}
-
 /// check-Modus: Diffs ermitteln ohne Schreibzugriffe. Gibt (differ, examples) zurück.
 #[allow(clippy::too_many_arguments)]
 async fn diff_and_report(
@@ -2327,7 +2068,7 @@ async fn diff_and_report(
                     field_opts,
                     raw_profile.clone(),
                     schema_hash.clone(),
-                    extra_where.as_deref(),
+                    extra_where,
                     bar,
                     check_examples,
                 )
@@ -2362,7 +2103,7 @@ async fn diff_and_report(
                 field_opts,
                 raw_profile,
                 schema_hash,
-                extra_where.as_deref(),
+                extra_where,
                 bar,
                 check_examples,
             )

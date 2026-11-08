@@ -170,20 +170,20 @@ async fn main() -> ExitCode {
         || cli.check.is_some()
         || cli.testing_drop_chunks.is_some();
 
-    let bench_modes: Vec<sync::HashVia> = if cli.hash_via_raw_tsv {
-        vec![sync::HashVia::RawTsv]
+    let bench_modes: Vec<hash::HashVia> = if cli.hash_via_raw_tsv {
+        vec![hash::HashVia::RawTsv]
     } else if cli.hash_via_raw_binary_vec {
-        vec![sync::HashVia::RawBinaryVec]
+        vec![hash::HashVia::RawBinaryVec]
     } else if cli.hash_via_raw_binary {
-        vec![sync::HashVia::RawBinary]
+        vec![hash::HashVia::RawBinary]
     } else if cli.hash_via_dump {
-        vec![sync::HashVia::Dump]
+        vec![hash::HashVia::Dump]
     } else if cli.hash_via_select_crc32 {
-        vec![sync::HashVia::SelectCrc32]
+        vec![hash::HashVia::SelectCrc32]
     } else if cli.hash_via_select_sha2 {
-        vec![sync::HashVia::SelectSha2]
+        vec![hash::HashVia::SelectSha2]
     } else {
-        sync::HashVia::ALL.to_vec()
+        hash::HashVia::ALL.to_vec()
     };
 
     let result = if let Some(start) = cli.testing_drop_chunks {
@@ -212,7 +212,7 @@ async fn main() -> ExitCode {
     };
 
     match result {
-        Ok(code) => ExitCode::from(code),
+        Ok(code) => code,
         Err(e) => {
             log::error!("{e:#}");
             ExitCode::from(2)

@@ -309,10 +309,8 @@ pub async fn snapshot_and_drop_triggers(
     db: &str,
     table: &str,
 ) -> Result<Vec<TriggerDef>> {
-    let q = format!(
-        "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS \
-         WHERE TRIGGER_SCHEMA = ? AND EVENT_OBJECT_TABLE = ?"
-    );
+    let q = "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS \
+         WHERE TRIGGER_SCHEMA = ? AND EVENT_OBJECT_TABLE = ?";
     let names: Vec<String> = conn.exec(q, (db, table)).await?;
     let mut defs = Vec::new();
     for name in names {

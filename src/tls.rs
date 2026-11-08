@@ -85,15 +85,16 @@ fn parse_pem(
 #[derive(Debug)]
 pub struct PinVerifier {
     pub pinned: Option<[u8; 32]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl PinVerifier {
-    pub fn new(cfg: &Config) -> Result<Self> {
+    pub fn new(cfg: &Config, provider: Arc<rustls::crypto::CryptoProvider>) -> Result<Self> {
         let pinned = match &cfg.server_fingerprint {
             Some(fp) => Some(parse_fingerprint(fp)?),
             None => None,
         };
-        Ok(Self { pinned })
+        Ok(Self { pinned, provider })
     }
 }
 
@@ -134,32 +135,36 @@ impl ServerCertVerifier for PinVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        use rustls::SignatureScheme as S;
-        vec![
-            S::ED25519,
-            S::ECDSA_NISTP256_SHA256,
-            S::RSA_PSS_SHA256,
-            S::RSA_PKCS1_SHA256,
-            S::RSA_PKCS1_SHA384,
-            S::RSA_PKCS1_SHA512,
-        ]
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

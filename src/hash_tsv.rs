@@ -13,7 +13,7 @@ use crate::mysqlutil::{self, PkCol};
 use crate::proto::RowHash;
 use anyhow::{bail, Context, Result};
 use mysql_async::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use tokio::sync::mpsc;
 
@@ -112,44 +112,6 @@ pub async fn stream_chunk_hashes(
         total += 1;
     }
     Ok(total)
-}
-
-pub async fn chunk_hashes<F>(
-    cfg: &Config,
-    db: &str,
-    table: &str,
-    pks: &[PkCol],
-    pk_indexes: &[usize],
-    mode: ChunkMode,
-    chunked: u32,
-    mut on_row: F,
-) -> Result<HashMap<String, (u64, String)>>
-where
-    F: FnMut(),
-{
-    let algo = cfg.hash_algo();
-    let mut rx = export::spawn_raw_tsv(
-        cfg,
-        db.to_string(),
-        table.to_string(),
-        None,
-        Some(mysqlutil::order_by(pks)),
-    );
-    let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            RawMsg::Line(line) => {
-                let pk_values = pk_values_from_line(&line, pk_indexes)?;
-                let bucket = hash::chunk_key_for_pk_values(&pk_values, pks, mode, chunked)?;
-                let rh = hash::hash_bytes(&line, algo);
-                hash::add_row_hash(&mut acc, algo, bucket, &rh);
-                on_row();
-            }
-            RawMsg::Err(e) => bail!("raw-tsv Export-Fehler: {e}"),
-            RawMsg::Done => break,
-        }
-    }
-    Ok(hash::finish_chunks(acc))
 }
 
 #[allow(clippy::too_many_arguments)]

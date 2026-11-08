@@ -60,8 +60,8 @@ impl Session {
         }
 
         let server_addr = cfg.server_addr().await?;
-        let verifier = tls::PinVerifier::new(cfg)?;
         let provider = tls::ring_provider();
+        let verifier = tls::PinVerifier::new(cfg, provider.clone())?;
         let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .dangerous()

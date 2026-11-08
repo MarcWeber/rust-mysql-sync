@@ -104,15 +104,4 @@ impl TableBar {
             }
         }
     }
-
-    pub fn fail(&self, msg: &str) {
-        match &self.pb {
-            Some(pb) => pb.abandon_with_message(format!("FEHLER: {msg}")),
-            None => {
-                if self.quiet_log {
-                    log::error!("[{}] {msg}", self.label);
-                }
-            }
-        }
-    }
 }

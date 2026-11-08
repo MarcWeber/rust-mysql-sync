@@ -71,7 +71,7 @@ async fn run_strategy(
 ) {
     let res = match strategy {
         Strategy::SelectStream => {
-            let r = mysqlutil::new_pool(&mysql, None).and_then(|p| Ok(p));
+            let r = mysqlutil::new_pool(&mysql, None);
             match r {
                 Ok(pool) => {
                     fetch_stream(

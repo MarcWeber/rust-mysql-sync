@@ -114,7 +114,7 @@ async fn drop_chunks(
         let Some(key) = buckets.get(index) else {
             break;
         };
-        let cond = mysqlutil::chunk_where(&pks, mode, cfg.chunked, &[key.clone()])?;
+        let cond = mysqlutil::chunk_where(&pks, mode, cfg.chunked, std::slice::from_ref(key))?;
         let sql = match pattern {
             DropPattern::All => format!("DELETE FROM {qualified} WHERE {cond}"),
             DropPattern::First => format!(

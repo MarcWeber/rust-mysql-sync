@@ -18,7 +18,7 @@ use mysql_async::prelude::*;
 use mysql_async::{Column, Conn, Value};
 use mysql_common::io::ParseBuf;
 use mysql_common::value::{BinValue, ValueDeserializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use tokio::sync::mpsc;
 
@@ -34,24 +34,6 @@ fn row_sql(db: &str, table: &str, where_clause: Option<&str>, order_by: Option<&
         sql.push_str(o);
     }
     sql
-}
-
-async fn for_each_raw_sync<F>(conn: &mut Conn, sql: String, mut f: F) -> Result<()>
-where
-    F: FnMut(&[Column], &[u8]) -> Result<()>,
-{
-    let mut result = conn
-        .exec_iter(sql, ())
-        .await
-        .context("binäres SELECT fehlgeschlagen")?;
-    while let Some((columns, packet)) = result
-        .next_raw()
-        .await
-        .context("binäre Zeile lesen fehlgeschlagen")?
-    {
-        f(&columns, &packet)?;
-    }
-    Ok(())
 }
 
 fn null_bitmap_len(columns: usize) -> usize {
@@ -189,34 +171,6 @@ async fn send_chunk(
     tx.send(hash::ChunkHashEvent::Item(item))
         .await
         .map_err(|_| anyhow::anyhow!("Chunk-Hash-Empfänger geschlossen"))
-}
-
-pub async fn chunk_hashes<F>(
-    conn: &mut Conn,
-    db: &str,
-    table: &str,
-    pks: &[PkCol],
-    pk_indexes: &[usize],
-    mode: ChunkMode,
-    chunked: u32,
-    algo: hash::HashAlgo,
-    mut on_row: F,
-) -> Result<HashMap<String, (u64, String)>>
-where
-    F: FnMut(),
-{
-    let sql = row_sql(db, table, None, Some(&mysqlutil::order_by(pks)));
-    let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
-    for_each_raw_sync(conn, sql, |columns, packet| {
-        let pk_values = pk_values_from_packet(packet, columns, pk_indexes)?;
-        let bucket = hash::chunk_key_for_pk_values(&pk_values, pks, mode, chunked)?;
-        let rh = hash_packet(packet, columns.len(), algo)?;
-        hash::add_row_hash(&mut acc, algo, bucket, &rh);
-        on_row();
-        Ok(())
-    })
-    .await?;
-    Ok(hash::finish_chunks(acc))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -370,35 +324,6 @@ pub async fn stream_chunk_hashes_vec(
         total += 1;
     }
     Ok(total)
-}
-
-/// Collect bucket hashes from decoded binary-protocol rows.
-pub async fn chunk_hashes_vec<F>(
-    conn: &mut Conn,
-    db: &str,
-    table: &str,
-    pks: &[PkCol],
-    pk_indexes: &[usize],
-    mode: ChunkMode,
-    chunked: u32,
-    algo: hash::HashAlgo,
-    opts: &[crate::proto::FieldOpt],
-    mut on_row: F,
-) -> Result<HashMap<String, (u64, String)>>
-where
-    F: FnMut(),
-{
-    let sql = row_sql(db, table, None, Some(&mysqlutil::order_by(pks)));
-    let mut acc: HashMap<String, (hash::RowHasher, u64)> = HashMap::new();
-    for_each_value_sync(conn, sql, |values| {
-        let bucket = hash::chunk_key_for_row(&values, pk_indexes, pks, mode, chunked)?;
-        let rh = hash::row_hash_opts(&values, algo, opts);
-        hash::add_row_hash(&mut acc, algo, bucket, &rh);
-        on_row();
-        Ok(())
-    })
-    .await?;
-    Ok(hash::finish_chunks(acc))
 }
 
 /// Row hashes for selected buckets from decoded binary-protocol rows.
