@@ -2137,19 +2137,33 @@ if __name__ == "__main__":
         print(f"Generated {tutorial_dir}/{name}")
     print("Run: python tutorial/run.py  (after python test.py up)")
 
-ACTIONS = {
-    "write_docker_compose": write_docker_compose,
+COMMAND_ACTIONS = {
     "up": up,
-    "matrix": matrix,
     "down": down,
+    "write_docker_compose": write_docker_compose,
     "clean": clean,
+    "tutorial": write_tutorial_files,
     "dump-table-create-sql": dump_table_create_sql,
+}
+
+TEST_ACTIONS = {
+    "matrix": matrix,
     "test_where_constraint": test_where_constraint,
     "test_parallel": test_parallel,
     "test_time_pk_chunk": test_time_pk_chunk,
     "test_two_servers": test_two_servers,
     "benchmark_shards": benchmark_shards,
-    "tutorial": write_tutorial_files,
+}
+
+async def all_tests():
+    for name in TEST_ACTIONS:
+        print(f"==> STARTING ACTION {name}")
+        await TEST_ACTIONS[name]()
+
+ACTIONS = {
+    **COMMAND_ACTIONS,
+    **TEST_ACTIONS,
+    "all": all_tests
 }
 
 async def main():

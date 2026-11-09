@@ -2,7 +2,6 @@
 
 # mysql-sync(1)
 
-
 ${CARGO_TARGET_DIR}/release/mysql-sync
 
 Start mysql-sync on source and target server and tell which tables to
@@ -355,6 +354,7 @@ name VARCHAR(50), value INT)`, with `chunked=3`, `select-sha2`, and
 | 100,000 | 4 | 4 | 1,361.3 | 73,457 |
 | 100,000 | 8 | 8 | 2,015.2 | 49,623 |
 | 100,000 | 20 | 20 | 4,323.5 | 23,129 |
+
 
 Notice that `rows/s` *decreases* as the shard count rises on this workload indicating
 that eventually inserting the rows and accessing the index or such is the bottle neck.
