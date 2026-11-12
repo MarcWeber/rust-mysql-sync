@@ -27,6 +27,7 @@ from itertools import product
 from random import random
 import asyncio
 from asyncio import Semaphore, gather
+import contextvars
 import hashlib
 import json
 import os
@@ -97,6 +98,13 @@ TABLE_SCHEMA_CASES = {
 
 WORK = HERE / ".test-run"
 MYSQL_CLI = os.environ.get("MSYNC_MYSQL_CLI", str(WORK / "bin" / "mysql"))
+
+_work_dir = contextvars.ContextVar("work_dir", default=WORK)
+_port_offset = contextvars.ContextVar("port_offset", default=SERVER_PORT_OFFSET)
+
+
+def work_dir():
+    return _work_dir.get()
 
 
 def _cargo_target_dir():
@@ -305,11 +313,11 @@ class Mysql:
 
     @property
     def server_port(self):
-        return self.port + SERVER_PORT_OFFSET
+        return self.port + _port_offset.get()
 
     def server_config(self, auth_key=None, auth_key_hash=None):
         cert_pem, key_pem, fingerprint = tls_material()
-        cfg = WORK / f"config-server-{self.name}.json"
+        cfg = work_dir() / f"config-server-{self.name}.json"
         data = {
             "mysql": {"user": "root", "password": ROOT_PW, "host": "127.0.0.1", "port": self.port},
             "listen": "127.0.0.1",
@@ -334,7 +342,7 @@ class Mysql:
     async def server_running(self, auth_key=None, auth_key_hash=None):
         cfg = self.server_config(auth_key, auth_key_hash)
         fingerprint = json.loads(cfg.read_text())["server_fingerprint"]
-        log = open(WORK / f"server-{self.name}.log", "w")
+        log = open(work_dir() / f"server-{self.name}.log", "w")
         env = os.environ.copy()
         env["RUST_LOG"] = "warn"
         proc = await asyncio.create_subprocess_exec(
@@ -421,7 +429,7 @@ async def ensure_binary(bin):
 
 
 def mysql_sync(args, expect_rc=0, label=""):
-    r = subprocess.run([str(BIN), *CLIENT, *args], text=True, capture_output=True, cwd=WORK)
+    r = subprocess.run([str(BIN), *CLIENT, *args], text=True, capture_output=True, cwd=work_dir())
     tail = (r.stdout + r.stderr).strip().splitlines()
     tail_str = "\n    ".join(tail[-6:])
     ok = r.returncode == expect_rc
@@ -431,7 +439,7 @@ def mysql_sync(args, expect_rc=0, label=""):
 
 
 def run_bin(args):
-    r = subprocess.run([str(BIN), *CLIENT, *args], text=True, capture_output=True, cwd=WORK)
+    r = subprocess.run([str(BIN), *CLIENT, *args], text=True, capture_output=True, cwd=work_dir())
     return r.returncode, r.stdout + r.stderr
 
 
@@ -712,7 +720,7 @@ async def _timed(cmd, stdin_data=None, expected_rcs=(0,)):
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=WORK,
+        cwd=work_dir(),
     )
     stdout, stderr = await asyncio.wait_for(
         proc.communicate(input=stdin_data), timeout=MATRIX_TIMEOUT
@@ -901,7 +909,7 @@ async def _drop_matrix_chunks(m, table, start):
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        cwd=WORK
+        cwd=work_dir()
     )
     stdout, stderr = await proc.communicate(input=_matrix_mysql_json(m).encode())
     if proc.returncode != 0:
@@ -1133,7 +1141,7 @@ def make_client_cfg(case, fingerprint):
 
 
 def json_variant(base, filename, **changes):
-    path = WORK / filename
+    path = work_dir() / filename
     cfg = json.loads(Path(base).read_text())
     cfg.update(changes)
     path.write_text(json.dumps(cfg, indent=2))
@@ -1153,7 +1161,7 @@ def print_env():
 
 def start_server(server_cfg, log_name):
     fingerprint = json.loads(Path(server_cfg).read_text())["server_fingerprint"]
-    log = open(WORK / log_name, "w")
+    log = open(work_dir() / log_name, "w")
     proc = subprocess.Popen([str(BIN), *SERVER, "-C", str(server_cfg)], stdout=log, stderr=log)
     return proc, fingerprint
 
@@ -1615,7 +1623,7 @@ async def benchmark_shards():
         "id INT PRIMARY KEY, name VARCHAR(50), value INT"
         ") ENGINE=InnoDB"
     )
-    cfg = WORK / "config-shard-bench.json"
+    cfg = work_dir() / "config-shard-bench.json"
 
     await src.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
     await dst.sql(f"CREATE DATABASE IF NOT EXISTS {db}", quiet=True)
@@ -1718,9 +1726,9 @@ async def test_two_servers():
 
     auth_key = os.urandom(32).hex()
     auth_key_hash = "sha256:" + hashlib.sha256(auth_key.encode()).hexdigest()
-    cfg_ab = WORK / "config-bidir-a-to-b.json"
-    cfg_ba = WORK / "config-bidir-b-to-a.json"
-    task_ab = WORK / "task-a-to-b.json"
+    cfg_ab = work_dir() / "config-bidir-a-to-b.json"
+    cfg_ba = work_dir() / "config-bidir-b-to-a.json"
+    task_ab = work_dir() / "task-a-to-b.json"
 
     async with AsyncExitStack() as stack:
         fp_ab = await stack.enter_async_context(src.server_running(auth_key, auth_key_hash))
@@ -2156,9 +2164,26 @@ TEST_ACTIONS = {
 }
 
 async def all_tests():
-    for name in TEST_ACTIONS:
+    async def run(index, name):
+        _work_dir.set(WORK / "all" / name)
+        _port_offset.set(SERVER_PORT_OFFSET + index * 10)
+        work_dir().mkdir(parents=True, exist_ok=True)
         print(f"==> STARTING ACTION {name}")
         await TEST_ACTIONS[name]()
+
+    results = await gather(
+        *(run(i, name) for i, name in enumerate(TEST_ACTIONS)),
+        return_exceptions=True,
+    )
+    failures = [
+        (name, result)
+        for name, result in zip(TEST_ACTIONS, results)
+        if isinstance(result, BaseException)
+    ]
+    for name, result in failures:
+        print(f"FAILED {name}: {result!r}")
+    if failures:
+        raise failures[0][1]
 
 ACTIONS = {
     **COMMAND_ACTIONS,
